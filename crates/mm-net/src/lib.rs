@@ -11,4 +11,8 @@ pub mod ipam;
 pub use bootparam::ip_cmdline;
 pub use ipam::{Ipam, IpamError};
 
-// The bridge/TAP host plumbing (privileged, linux-only) is added in Task 9.
+// The bridge/TAP host plumbing (privileged, linux-only).
+#[cfg(target_os = "linux")]
+pub mod host;
+#[cfg(target_os = "linux")]
+pub use host::{create_tap, enable_nat, ensure_bridge, teardown_tap, HostNetError, Tap};
