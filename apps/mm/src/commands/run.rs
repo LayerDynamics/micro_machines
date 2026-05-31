@@ -45,6 +45,7 @@ pub fn build_vm_config(
     tap_name: String,
     mac: String,
     sandbox: bool,
+    authorized_key_hex: Option<&str>,
 ) -> VmConfig {
     let ip_param = mm_net::ip_cmdline(ip, gateway, mask, hostname, "eth0");
     let mode = if sandbox {
@@ -52,7 +53,11 @@ pub fn build_vm_config(
     } else {
         "mm.workload=/sbin/init".to_string()
     };
-    let kernel_cmdline = format!("console=ttyS0 reboot=k panic=1 {ip_param} {mode}");
+    let mut kernel_cmdline = format!("console=ttyS0 reboot=k panic=1 {ip_param} {mode}");
+    if let Some(hex) = authorized_key_hex {
+        // Hex-encoded (no spaces) so it survives the whitespace-split cmdline.
+        kernel_cmdline.push_str(&format!(" mm.authorized_key={hex}"));
+    }
     VmConfig {
         vcpus,
         memory_mib,
@@ -185,6 +190,8 @@ mod linux {
         link_or_copy(&rootfs, &jail_root.join("rootfs.ext4"))?;
 
         // 6. Worker VM config with chroot-relative paths; serialized for the child.
+        // Inject the managed SSH public key so `mm ssh` works with no in-guest setup.
+        let authorized_key_hex = ensure_ssh_key(&root)?;
         let worker_cfg = build_vm_config(
             args.cpus,
             args.memory,
@@ -197,6 +204,7 @@ mod linux {
             tap_name.clone(),
             mac_from_ip(ip),
             args.ssh,
+            authorized_key_hex.as_deref(),
         );
         worker_cfg.validate().context("validating VM config")?;
         let cfg_path = jail.join("config.json");
@@ -319,6 +327,45 @@ mod linux {
         Ok(fd)
     }
 
+    /// Ensure a managed SSH keypair exists at `<root>/ssh/id_ed25519` (generating
+    /// one with `ssh-keygen` if absent) and return its public key hex-encoded for
+    /// injection on the kernel cmdline. `mm ssh` uses the matching private key.
+    fn ensure_ssh_key(root: &Path) -> Result<Option<String>> {
+        let dir = root.join("ssh");
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let key = dir.join("id_ed25519");
+        let pubkey = dir.join("id_ed25519.pub");
+
+        if !pubkey.exists() {
+            let status = Command::new("ssh-keygen")
+                .args(["-t", "ed25519", "-N", "", "-C", "micromachines", "-f"])
+                .arg(&key)
+                .status()
+                .context("running ssh-keygen (is OpenSSH installed?)")?;
+            if !status.success() {
+                anyhow::bail!("ssh-keygen failed with {status}");
+            }
+        }
+        let contents =
+            std::fs::read(&pubkey).with_context(|| format!("reading {}", pubkey.display()))?;
+        // Trim a trailing newline so the injected key is exactly one line.
+        let trimmed = contents
+            .iter()
+            .rposition(|&b| b != b'\n' && b != b'\r')
+            .map(|i| &contents[..=i])
+            .unwrap_or(&contents);
+        Ok(Some(hex_encode(trimmed)))
+    }
+
+    /// Lowercase hex-encode bytes (for whitespace-safe cmdline transport).
+    fn hex_encode(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
     /// Hardlink `src` into `dst`, falling back to a copy across filesystems. A
     /// pre-existing `dst` is reused.
     fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
@@ -375,6 +422,7 @@ mod tests {
             "mm-web-1".to_string(),
             "02:00:00:0a:00:02".to_string(),
             false,
+            None,
         );
         assert_eq!(cfg.vcpus, 2);
         assert!(cfg
@@ -405,9 +453,29 @@ mod tests {
             "tap".to_string(),
             "02:00:00:0a:00:05".to_string(),
             true,
+            None,
         );
         assert!(cfg.kernel_cmdline.contains("mm.mode=sandbox"));
         assert!(!cfg.kernel_cmdline.contains("mm.workload"));
+    }
+
+    #[test]
+    fn authorized_key_is_injected_on_cmdline() {
+        let cfg = build_vm_config(
+            1,
+            256,
+            PathBuf::from("/k"),
+            PathBuf::from("/r"),
+            Ipv4Addr::new(10, 0, 0, 7),
+            Ipv4Addr::new(10, 0, 0, 1),
+            NETMASK,
+            "k",
+            "tap".to_string(),
+            "02:00:00:0a:00:07".to_string(),
+            false,
+            Some("deadbeef"),
+        );
+        assert!(cfg.kernel_cmdline.contains("mm.authorized_key=deadbeef"));
     }
 
     #[test]

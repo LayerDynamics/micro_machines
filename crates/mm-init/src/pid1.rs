@@ -34,10 +34,37 @@ pub fn run_pid1() -> ExitCode {
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
     let cfg = InitConfig::parse(&cmdline);
 
+    if let Some(key) = &cfg.authorized_key {
+        if let Err(e) = install_authorized_key(key) {
+            // Non-fatal: SSH may be unused; log and continue booting.
+            eprintln!("mm-init: installing authorized key failed: {e}");
+        }
+    }
+
     match cfg.mode {
         Mode::Workload => run_workload(&cfg),
         Mode::Sandbox => run_sandbox(&cfg),
     }
+}
+
+/// Write the injected SSH public key to `/root/.ssh/authorized_keys` with the
+/// permissions OpenSSH requires (dir 0700, file 0600), so `mm ssh` works with no
+/// in-guest setup (SPEC-1 FR-12). An in-guest sshd (from the image) still does the
+/// actual authentication.
+fn install_authorized_key(key: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all("/root/.ssh")?;
+    std::fs::set_permissions("/root/.ssh", std::fs::Permissions::from_mode(0o700))?;
+
+    let path = "/root/.ssh/authorized_keys";
+    let mut contents = key.to_string();
+    if !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    std::fs::write(path, contents)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 /// Replace the panic hook so an unwinding PID 1 powers the VM off instead of
