@@ -16,11 +16,13 @@
 //!   work on a vCPU thread is the cheap MMIO register write that pokes the eventfd.
 //! * [`Bus`] maps guest MMIO ranges (and the serial PIO ports) to devices and
 //!   implements [`IoDispatch`] so the vCPU run loop can route exits to it.
+mod balloon;
 mod block;
 mod net;
 mod serial;
 mod vsock;
 
+pub use balloon::Balloon;
 pub use block::Block;
 pub use net::Net;
 pub use serial::{EventFdTrigger, SerialDevice, COM1_BASE_PORT, COM1_IRQ};
@@ -38,6 +40,7 @@ use crate::machine::{IoDispatch, Result, VmmError};
 // --- virtio device type ids (virtio spec §5). ---
 pub const TYPE_NET: u32 = 1;
 pub const TYPE_BLOCK: u32 = 2;
+pub const TYPE_BALLOON: u32 = 5;
 pub const TYPE_VSOCK: u32 = 19;
 
 /// `VIRTIO_F_VERSION_1` — every device negotiates the modern (1.0) interface.

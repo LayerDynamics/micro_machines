@@ -18,8 +18,8 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::config::{ConfigError, VirtioDevice as ConfigDevice, VmConfig};
 use crate::devices::{
-    Block, Bus, Interrupt, MmioTransport, Net, SerialDevice, VirtioDevice, Vsock, VsockReady,
-    COM1_IRQ,
+    Balloon, Block, Bus, Interrupt, MmioTransport, Net, SerialDevice, VirtioDevice, Vsock,
+    VsockReady, COM1_IRQ,
 };
 use crate::vcpu::{Vcpu, VcpuRunExit};
 
@@ -261,10 +261,15 @@ impl Machine {
                 ConfigDevice::Vsock { .. } => {
                     // M1 uses the single boot vsock created above.
                 }
-                ConfigDevice::Balloon { .. } => {
-                    return Err(VmmError::Device(
-                        "balloon device is not supported in M1".to_string(),
-                    ));
+                ConfigDevice::Balloon { target_mib } => {
+                    let balloon = Balloon::new(*target_mib);
+                    self.attach_virtio(
+                        &mut bus,
+                        &mut mmio_cmdline,
+                        &mut next_mmio,
+                        &mut next_gsi,
+                        Box::new(balloon),
+                    )?;
                 }
             }
         }
