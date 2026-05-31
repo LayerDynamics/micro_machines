@@ -411,25 +411,19 @@ impl Bus {
 
 impl IoDispatch for Bus {
     fn pio_read(&self, port: u16, data: &mut [u8]) {
+        // Only COM1 is a real PIO device here; other ports (incl. the i8042 PS/2
+        // controller at 0x60/0x64) are left untouched, so the guest reads 0. We
+        // tried open-bus 0xff on the i8042 ports to make Linux's probe fail fast
+        // instead of timing out (~0.6s) — but it *regressed* the boot by ~0.6s on
+        // the fixture kernel (the fast `-ENODEV` path appears to trigger a deferred
+        // re-probe the slow path avoids), so it was reverted. Reaching NFR-P1's
+        // 125ms requires a guest kernel built without the legacy i8042 probe.
         if let Some(serial) = &self.serial {
             if (COM1_BASE_PORT..COM1_BASE_PORT + 8).contains(&port) && data.len() == 1 {
                 data[0] = serial
                     .lock()
                     .expect("serial mutex")
                     .read((port - COM1_BASE_PORT) as u8);
-                return;
-            }
-        }
-        // i8042 PS/2 controller (data 0x60, status 0x64): we emulate *no* controller.
-        // Returning open-bus 0xff makes Linux's i8042 probe flush a phantom buffer and
-        // report "No controller found" in microseconds, instead of busy-waiting on a
-        // status bit that never sets — a ~0.6s boot stall (NFR-P1). This is scoped to
-        // the i8042 ports on purpose: a blanket 0xff for every unmapped port breaks
-        // other legacy probes (the RTC reads the update-in-progress bit and would spin
-        // if it always read as set). Other unmapped ports are left untouched.
-        if port == 0x60 || port == 0x64 {
-            for b in data.iter_mut() {
-                *b = 0xff;
             }
         }
     }
@@ -472,23 +466,20 @@ mod tests {
     use crate::machine::IoDispatch;
 
     #[test]
-    fn i8042_ports_read_open_bus_others_untouched() {
+    fn unmapped_pio_ports_are_left_untouched() {
+        // Without a serial device installed, every port is unmapped and pio_read
+        // leaves the caller's buffer as-is (the guest reads 0). Notably we do *not*
+        // special-case the i8042 ports: returning open-bus 0xff there regressed boot
+        // time on the fixture kernel (see pio_read).
         let bus = Bus::new();
-        // i8042 status (0x64) + data (0x60) read all-ones so the probe fails fast.
-        let mut s = [0u8; 1];
-        bus.pio_read(0x64, &mut s);
-        assert_eq!(s, [0xff], "i8042 status must read open bus");
-        let mut d = [0u8; 1];
-        bus.pio_read(0x60, &mut d);
-        assert_eq!(d, [0xff], "i8042 data must read open bus");
-        // A non-i8042 unmapped port (e.g. RTC 0x71) is left untouched — a blanket
-        // 0xff there would make the RTC spin on its update-in-progress bit.
-        let mut other = [0u8; 1];
-        bus.pio_read(0x71, &mut other);
-        assert_eq!(
-            other,
-            [0x00],
-            "non-i8042 unmapped port must be left untouched"
-        );
+        for &port in &[0x60u16, 0x64, 0x71, 0x0cf8] {
+            let mut buf = [0u8; 1];
+            bus.pio_read(port, &mut buf);
+            assert_eq!(
+                buf,
+                [0x00],
+                "unmapped port {port:#x} must be left untouched"
+            );
+        }
     }
 }

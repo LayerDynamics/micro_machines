@@ -9,14 +9,18 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Kernel command-line arguments that skip device probes a microVM never needs, so
-/// the guest reaches userspace fast (SPEC-1 NFR-P1). On a virtio-mmio microVM there
-/// is no PS/2 controller and no PCI bus; the default i8042 probe alone blocks the
-/// boot for ~0.6 s on a timeout. These disable that probe (`i8042.*`), the PCI scan
-/// (`pci=off`), and extra 8250 UART ports (`8250.nr_uarts=1`, keeping COM1 for the
-/// console). Callers append this to the guest cmdline.
-pub const FAST_BOOT_ARGS: &str =
-    "i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd pci=off 8250.nr_uarts=1";
+/// Kernel command-line hygiene for a virtio-mmio microVM, which has no PCI bus and
+/// only the COM1 UART: `pci=off` skips the PCI scan and `8250.nr_uarts=1` avoids
+/// probing extra serial ports. Callers append this to the guest cmdline.
+///
+/// NOTE on NFR-P1 (125 ms boot): the dominant cost on the current fixture kernel is
+/// the i8042 PS/2 controller probe (~0.6 s timeout). It is *not* removable from
+/// userspace — the `i8042.*` cmdline flags do not stop the controller probe, and
+/// emulating the i8042 ports as an open bus so the probe fails fast measured *worse*
+/// (a deferred re-probe). Reaching 125 ms needs a guest kernel built without the
+/// legacy i8042 probe (the Firecracker-style minimal config); these args alone do
+/// not get there.
+pub const FAST_BOOT_ARGS: &str = "pci=off 8250.nr_uarts=1";
 
 /// Fully-resolved configuration for a single microVM (SPEC-1 FR-4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
