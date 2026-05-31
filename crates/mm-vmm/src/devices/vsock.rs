@@ -29,7 +29,10 @@ impl VsockReady {
     fn new() -> Result<Self> {
         Ok(Self {
             flag: AtomicBool::new(false),
-            evt: EventFd::new(0).map_err(VmmError::Io)?,
+            // Non-blocking: the boot path only `poll()`s this fd, never blocking-reads
+            // it, so a reader (or the unit test) checking an unsignalled fd gets
+            // `WouldBlock` instead of hanging.
+            evt: EventFd::new(libc::EFD_NONBLOCK).map_err(VmmError::Io)?,
         })
     }
 
