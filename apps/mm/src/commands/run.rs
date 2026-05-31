@@ -57,7 +57,11 @@ pub fn build_vm_config(
     } else {
         "mm.workload=/sbin/init".to_string()
     };
-    let mut kernel_cmdline = format!("console=ttyS0 reboot=k panic=1 {ip_param} {mode}");
+    // root=/dev/vda: the rootfs is the first virtio-mmio block device. init=/init:
+    // mm-init is PID 1 in the guest image. The rootfs is read-only in M1 (writes go
+    // to tmpfs mounts that mm-init sets up).
+    let mut kernel_cmdline =
+        format!("console=ttyS0 root=/dev/vda ro init=/init reboot=k panic=1 {ip_param} {mode}");
     if let Some(hex) = authorized_key_hex {
         // Hex-encoded (no spaces) so it survives the whitespace-split cmdline.
         kernel_cmdline.push_str(&format!(" mm.authorized_key={hex}"));

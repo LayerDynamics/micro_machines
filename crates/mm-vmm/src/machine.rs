@@ -206,9 +206,11 @@ impl Machine {
         // Serial console on COM1 (always present so `console=ttyS0` works).
         let serial_irq = EventFd::new(libc::EFD_NONBLOCK).map_err(VmmError::Io)?;
         self.vm.register_irqfd(&serial_irq, COM1_IRQ)?;
+        // Wrap stdout so every guest console byte is flushed immediately — block
+        // buffering (stdout -> pipe) otherwise swallows early kernel messages.
         let serial = Arc::new(Mutex::new(SerialDevice::new(
             serial_irq,
-            Box::new(std::io::stdout()),
+            Box::new(AutoFlush(std::io::stdout())),
         )));
         bus.set_serial(serial);
 
@@ -452,6 +454,22 @@ impl Machine {
     /// The configuration this machine was built from.
     pub fn config(&self) -> &VmConfig {
         &self.config
+    }
+}
+
+/// A `Write` adapter that flushes the inner writer after every write, so guest
+/// serial output reaches a block-buffered pipe (CI logs) immediately rather than
+/// sitting in an 8 KiB buffer that may never flush before the process exits.
+struct AutoFlush<W>(W);
+
+impl<W: std::io::Write> std::io::Write for AutoFlush<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = std::io::Write::write(&mut self.0, buf)?;
+        std::io::Write::flush(&mut self.0)?;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.0)
     }
 }
 

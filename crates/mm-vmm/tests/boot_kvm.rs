@@ -19,7 +19,11 @@ fn fixture_config() -> VmConfig {
         vcpus: 1,
         memory_mib: 128,
         kernel: "tests/fixtures/vmlinux".into(),
-        kernel_cmdline: format!("{GUEST_CONSOLE} reboot=k panic=1 mm.workload=/sbin/ready"),
+        // root=/dev/vda: the rootfs block device is the first virtio-mmio device.
+        // init=/init: mm-init is installed as /init in the fixture rootfs.
+        kernel_cmdline: format!(
+            "{GUEST_CONSOLE} root=/dev/vda ro init=/init reboot=k panic=1 mm.workload=/sbin/ready"
+        ),
         rootfs: BlockDevice {
             path: "tests/fixtures/rootfs.ext4".into(),
             read_only: true,
