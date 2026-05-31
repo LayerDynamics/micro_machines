@@ -16,7 +16,7 @@ use linux_loader::configurator::{BootConfigurator, BootParams};
 use linux_loader::loader::bootparam::boot_params;
 use linux_loader::loader::elf::Elf;
 use linux_loader::loader::{load_cmdline, KernelLoader};
-use vm_memory::{GuestAddress, GuestMemoryMmap};
+use vm_memory::{Address, GuestAddress, GuestMemoryMmap};
 
 use crate::machine::{Result, VmmError};
 
