@@ -247,6 +247,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mm-image"
+version = "0.0.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "mm-init"
 version = "0.0.0"
 dependencies = [

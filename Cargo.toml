@@ -6,6 +6,7 @@ members = [
     "crates/mm-net",
     "crates/mm-init",
     "crates/mm-sandbox",
+    "crates/mm-image",
 ]
 
 [workspace.package]
