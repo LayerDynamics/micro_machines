@@ -165,6 +165,10 @@ impl ImageStore {
         let rootfs = bundle.join("rootfs");
         // Inject mm-init as /init so the guest kernel's `init=/init` finds PID 1.
         inject_init(&rootfs, init_binary)?;
+        // Ensure the pseudo-filesystem mountpoints exist: the base is mounted
+        // read-only in the guest, so mm-init cannot create them itself, and a
+        // minimal (e.g. busybox / FROM scratch) image ships without them.
+        ensure_mountpoints(&rootfs)?;
         let size_bytes = ext4_image_size(&rootfs)?;
         // Build into a temp path, then rename for an atomic cache publish.
         let tmp_image = scratch.join("rootfs.ext4");
@@ -360,6 +364,23 @@ fn inject_init(rootfs: &Path, init_binary: &Path) -> Result<(), ImageError> {
         .map_err(|source| ImageError::Io { path: dst, source })
 }
 
+/// The pseudo-filesystem mountpoints mm-init mounts at boot. They must exist in the
+/// (read-only) base image since the guest cannot create them at runtime.
+/// `/sys/fs/cgroup` is omitted — sysfs provides it once `/sys` is mounted.
+const RUNTIME_MOUNTPOINTS: &[&str] = &["proc", "sys", "dev", "run", "tmp"];
+
+/// Create the runtime mountpoint directories in the unpacked rootfs (idempotent —
+/// directories the image already ships are left as they are).
+fn ensure_mountpoints(rootfs: &Path) -> Result<(), ImageError> {
+    for dir in RUNTIME_MOUNTPOINTS {
+        let path = rootfs.join(dir);
+        if !path.exists() {
+            create_dir_all(&path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Make a file readable by owner/group/other (0644) so an unprivileged jailed VMM
 /// can open the shared, read-only base image.
 fn set_world_readable(path: &Path) -> Result<(), ImageError> {
@@ -455,6 +476,21 @@ mod tests {
         assert_eq!(std::fs::read(&init).unwrap(), b"\x7fELF-fake-init");
         let mode = std::fs::metadata(&init).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755, "/init must be executable");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ensure_mountpoints_creates_missing_dirs_idempotently() {
+        let tmp = std::env::temp_dir().join(format!("mm-mp-{}", std::process::id()));
+        let rootfs = tmp.join("rootfs");
+        std::fs::create_dir_all(rootfs.join("proc")).unwrap(); // image already ships /proc
+
+        ensure_mountpoints(&rootfs).unwrap();
+        for dir in RUNTIME_MOUNTPOINTS {
+            assert!(rootfs.join(dir).is_dir(), "{dir} must exist");
+        }
+        // Idempotent: a second call over existing dirs is fine.
+        ensure_mountpoints(&rootfs).unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
