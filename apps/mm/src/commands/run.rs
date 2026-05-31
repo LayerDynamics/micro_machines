@@ -166,6 +166,16 @@ mod linux {
         hex_encode(argv.join("\0").as_bytes())
     }
 
+    /// Path to the static sshd injected as `/sbin/dropbear` (`MM_SSHD`, else
+    /// `<root>/dropbear`). Returns `None` when no sshd is provisioned, in which case
+    /// the guest simply boots without SSH (the rest of `mm run` is unaffected).
+    fn mm_sshd_path() -> Option<PathBuf> {
+        let path = std::env::var_os("MM_SSHD")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| crate::commands::state_root().join("dropbear"));
+        path.exists().then_some(path)
+    }
+
     /// Privileged `mm run`: build the rootfs, wire the bridge/TAP/NAT, open
     /// `/dev/kvm`, prepare a per-VM chroot, then spawn the jailed `mm __vmm-worker`
     /// child — passing it the KVM + TAP fds. The child confines itself
@@ -177,8 +187,9 @@ mod linux {
         // 1. OCI image -> read-only base rootfs (digest-cached), with mm-init
         //    injected as /init so the guest kernel's `init=/init` finds PID 1.
         let images = ImageStore::new(&root);
+        let sshd = mm_sshd_path();
         let rootfs = images
-            .build_base_rootfs(&args.image, &mm_init_path())
+            .build_base_rootfs(&args.image, &mm_init_path(), sshd.as_deref())
             .with_context(|| format!("building rootfs for {}", args.image))?;
 
         // 2. Name + IP (seed the pool from already-running machines).

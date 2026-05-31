@@ -111,21 +111,25 @@ impl ImageStore {
     }
 
     /// Build (or reuse the cached) read-only base ext4 image for `image_ref`, with
-    /// `init_binary` (the guest `mm-init`) injected as `/init`. Returns the path to
-    /// the ext4 image.
+    /// `init_binary` (the guest `mm-init`) injected as `/init` and, when provided,
+    /// `sshd_binary` (a static dropbear) injected as `/sbin/dropbear` so the guest
+    /// is SSH-reachable. Returns the path to the ext4 image.
     ///
     /// Pipeline (all rootless): resolve the manifest digest with `skopeo inspect`,
     /// short-circuit if already cached, otherwise `skopeo copy` into an OCI layout,
-    /// `umoci unpack` to a rootfs bundle, inject `mm-init` as `/init`, and `mke2fs
-    /// -d` to populate an ext4 image. The cache key folds in the init binary's hash
-    /// so changing `mm-init` rebuilds the base.
+    /// `umoci unpack` to a rootfs bundle, inject the MicroMachines binaries, and
+    /// `mke2fs -d` to populate an ext4 image. The cache key folds in the injected
+    /// binaries' hashes so changing `mm-init` (or the sshd) rebuilds the base.
     pub fn build_base_rootfs(
         &self,
         image_ref: &str,
         init_binary: &Path,
+        sshd_binary: Option<&Path>,
     ) -> Result<PathBuf, ImageError> {
         let digest = self.resolve_digest(image_ref)?;
-        let tag = init_tag(init_binary)?;
+        let mut payload: Vec<&Path> = vec![init_binary];
+        payload.extend(sshd_binary);
+        let tag = payload_tag(&payload)?;
         let target = self.base_image_path(&digest, &tag);
         if target.exists() {
             tracing::debug!("base rootfs for {image_ref} already cached at {target:?}");
@@ -165,6 +169,11 @@ impl ImageStore {
         let rootfs = bundle.join("rootfs");
         // Inject mm-init as /init so the guest kernel's `init=/init` finds PID 1.
         inject_init(&rootfs, init_binary)?;
+        // Inject the static sshd as /sbin/dropbear so the guest is SSH-reachable
+        // regardless of what the source image ships (FR-12).
+        if let Some(sshd) = sshd_binary {
+            inject_sshd(&rootfs, sshd)?;
+        }
         // Ensure the pseudo-filesystem mountpoints exist: the base is mounted
         // read-only in the guest, so mm-init cannot create them itself, and a
         // minimal (e.g. busybox / FROM scratch) image ships without them.
@@ -335,33 +344,48 @@ fn rename(from: &Path, to: &Path) -> Result<(), ImageError> {
     })
 }
 
-/// A short, deterministic content tag for the `mm-init` binary, used to key the
-/// base-image cache. Not cryptographic — only needs to change when the bytes do.
-fn init_tag(init_binary: &Path) -> Result<String, ImageError> {
+/// A short, deterministic content tag for the injected MicroMachines binaries (the
+/// `mm-init` and, when present, the sshd), used to key the base-image cache. Not
+/// cryptographic — it only needs to change when any injected binary's bytes do.
+fn payload_tag(files: &[&Path]) -> Result<String, ImageError> {
     use std::hash::{Hash, Hasher};
-    let bytes = std::fs::read(init_binary).map_err(|source| ImageError::Io {
-        path: init_binary.to_path_buf(),
-        source,
-    })?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    Ok(format!("init-{:016x}", hasher.finish()))
+    for file in files {
+        let bytes = std::fs::read(file).map_err(|source| ImageError::Io {
+            path: file.to_path_buf(),
+            source,
+        })?;
+        bytes.hash(&mut hasher);
+    }
+    Ok(format!("mm-{:016x}", hasher.finish()))
 }
 
-/// Copy `init_binary` into the unpacked rootfs as `/init` (0755) so the guest
-/// kernel's `init=/init` boots `mm-init` as PID 1. Overwrites any `/init` the image
-/// shipped — MicroMachines owns PID 1.
-fn inject_init(rootfs: &Path, init_binary: &Path) -> Result<(), ImageError> {
+/// Copy `binary` into the rootfs at `rel` (creating parent dirs) and mark it 0755.
+/// Overwrites any file the image shipped there.
+fn inject_executable(rootfs: &Path, rel: &str, binary: &Path) -> Result<(), ImageError> {
     use std::os::unix::fs::PermissionsExt;
-    let dst = rootfs.join("init");
-    // Remove any existing /init (e.g. a symlink) so we write a fresh regular file.
+    let dst = rootfs.join(rel);
+    if let Some(parent) = dst.parent() {
+        create_dir_all(parent)?;
+    }
+    // Remove any existing entry (e.g. a symlink) so we write a fresh regular file.
     let _ = std::fs::remove_file(&dst);
-    std::fs::copy(init_binary, &dst).map_err(|source| ImageError::Io {
+    std::fs::copy(binary, &dst).map_err(|source| ImageError::Io {
         path: dst.clone(),
         source,
     })?;
     std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))
         .map_err(|source| ImageError::Io { path: dst, source })
+}
+
+/// Inject `mm-init` as `/init` so the guest kernel's `init=/init` boots it as PID 1.
+fn inject_init(rootfs: &Path, init_binary: &Path) -> Result<(), ImageError> {
+    inject_executable(rootfs, "init", init_binary)
+}
+
+/// Inject the static sshd as `/sbin/dropbear` so the guest is SSH-reachable (FR-12).
+fn inject_sshd(rootfs: &Path, sshd_binary: &Path) -> Result<(), ImageError> {
+    inject_executable(rootfs, "sbin/dropbear", sshd_binary)
 }
 
 /// The pseudo-filesystem mountpoints mm-init mounts at boot. They must exist in the
@@ -496,21 +520,27 @@ mod tests {
     }
 
     #[test]
-    fn init_tag_is_deterministic_and_content_sensitive() {
+    fn payload_tag_is_deterministic_and_content_sensitive() {
         let tmp = std::env::temp_dir().join(format!("mm-tag-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let a = tmp.join("a");
         let b = tmp.join("b");
         std::fs::write(&a, b"one").unwrap();
         std::fs::write(&b, b"two").unwrap();
+        // Same inputs -> same tag; an extra (sshd) binary -> different tag.
         assert_eq!(
-            init_tag(&a).unwrap(),
-            init_tag(&a).unwrap(),
+            payload_tag(&[&a]).unwrap(),
+            payload_tag(&[&a]).unwrap(),
             "deterministic"
         );
         assert_ne!(
-            init_tag(&a).unwrap(),
-            init_tag(&b).unwrap(),
+            payload_tag(&[&a]).unwrap(),
+            payload_tag(&[&a, &b]).unwrap(),
+            "adding the sshd changes the cache key"
+        );
+        assert_ne!(
+            payload_tag(&[&a]).unwrap(),
+            payload_tag(&[&b]).unwrap(),
             "content-sensitive"
         );
         let _ = std::fs::remove_dir_all(&tmp);

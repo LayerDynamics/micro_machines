@@ -44,6 +44,11 @@ pub fn run_pid1() -> ExitCode {
         }
     }
 
+    // Start the in-guest sshd (if injected) so the machine is reachable over SSH in
+    // either mode — `mm ssh` works while a workload runs, and is the access path for
+    // sandbox mode. Best-effort: a missing/failed sshd never blocks the boot.
+    start_sshd();
+
     // Tell the host we reached userspace *before* handing off to the workload, so
     // boot readiness is observable for any image — not only the test fixtures whose
     // workload happens to signal. Best-effort: a failure must not block the boot.
@@ -52,6 +57,53 @@ pub fn run_pid1() -> ExitCode {
     match cfg.mode {
         Mode::Workload => run_workload(&cfg),
         Mode::Sandbox => run_sandbox(&cfg),
+    }
+}
+
+/// Start the injected static sshd (`/sbin/dropbear`) as a background daemon on
+/// port 22, so `mm ssh` can reach the guest with the key mm-init already installed.
+/// Best-effort and non-fatal: if no sshd was injected, or it fails to start, the
+/// guest simply boots without SSH.
+fn start_sshd() {
+    if !std::path::Path::new("/sbin/dropbear").exists() {
+        return;
+    }
+    // dropbear resolves the login user via /etc/passwd; a minimal image (busybox /
+    // FROM scratch) ships without one, so ensure a root account + group exist (the
+    // overlay root is writable).
+    ensure_account_files();
+    let _ = std::fs::create_dir_all("/etc/dropbear");
+    // -R: generate host keys on demand (into the writable /etc/dropbear); -p 22.
+    // dropbear daemonizes, so the foreground process exits immediately — wait on it
+    // to reap it, leaving the daemon serving in the background.
+    match Command::new("/sbin/dropbear")
+        .args(["-R", "-p", "22"])
+        .spawn()
+    {
+        Ok(mut child) => {
+            let _ = child.wait();
+        }
+        Err(e) => eprintln!("mm-init: starting sshd failed: {e}"),
+    }
+}
+
+/// Ensure `/etc/passwd` and `/etc/group` contain a `root` entry so sshd (and login
+/// shells) can resolve uid 0. Existing entries are left untouched.
+fn ensure_account_files() {
+    let _ = std::fs::create_dir_all("/etc");
+    ensure_account_line("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n");
+    ensure_account_line("/etc/group", "root:x:0:\n");
+}
+
+/// Append `line` to `path` if no line there already starts with `root:`.
+fn ensure_account_line(path: &str, line: &str) {
+    let mut content = std::fs::read_to_string(path).unwrap_or_default();
+    if content.lines().any(|l| l.starts_with("root:")) {
+        return;
+    }
+    content.push_str(line);
+    if let Err(e) = std::fs::write(path, content) {
+        eprintln!("mm-init: writing {path} failed: {e}");
     }
 }
 
@@ -340,29 +392,23 @@ fn run_workload(cfg: &InitConfig) -> ExitCode {
     }
 }
 
-/// Sandbox mode (M1 degraded form): drop the operator onto an interactive shell
-/// on the serial console so `mm ssh` has a usable session. The full vsock exec
-/// agent — the real Sandbox Mode — is implemented in M3; this keeps the boot path
-/// honest in the meantime rather than stubbing the branch out.
+/// Sandbox mode: the machine is an SSH-reachable box with no foreground workload,
+/// so PID 1 just stays alive (reaping orphaned children) while the sshd started
+/// above serves connections. The VM lives until the host tears it down (`mm stop`).
+/// Unlike workload mode, there is nothing whose exit should power the guest off.
 fn run_sandbox(_cfg: &InitConfig) -> ExitCode {
-    let mut shell = sandbox_shell_command();
-    match shell.status() {
-        Ok(_) => poweroff(),
-        Err(e) => {
-            eprintln!("mm-init: failed to exec sandbox shell: {e}");
-            poweroff();
-        }
-    }
+    reap_forever();
 }
 
-/// Pick an interactive shell for sandbox mode, preferring a real `/bin/sh` and
-/// falling back to busybox's applet form on a stripped rootfs.
-fn sandbox_shell_command() -> Command {
-    if std::path::Path::new("/bin/sh").exists() {
-        Command::new("/bin/sh")
-    } else {
-        let mut c = Command::new("/bin/busybox");
-        c.arg("sh");
-        c
+/// Keep PID 1 alive forever, reaping any orphaned children (e.g. finished sshd
+/// connection handlers) so they do not linger as zombies. Diverges.
+fn reap_forever() -> ! {
+    loop {
+        // SAFETY: waitpid(-1, ...) reaps any child; WNOHANG makes it non-blocking.
+        let reaped = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+        if reaped <= 0 {
+            // No child ready (0) or none exist (-1/ECHILD): sleep briefly and retry.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
     }
 }
