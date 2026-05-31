@@ -50,3 +50,20 @@ jobs:
             echo "kvm=unavailable (GitHub-hosted runners do not expose nested KVM)"
             echo "Host-virtualization integration runs on a self-hosted KVM runner."
           fi
+
+  # Real boot-to-userspace integration test. Runs on a self-hosted runner that
+  # exposes /dev/kvm; skipped automatically elsewhere because no such runner picks
+  # the job up. Fetches a test kernel + minimal rootfs, then runs the #[ignore]d
+  # mm-vmm KVM tests.
+  kvm-integration:
+    runs-on: [self-hosted, linux, kvm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: x86_64-unknown-linux-musl }
+      - name: Require /dev/kvm
+        run: test -e /dev/kvm
+      - name: Fetch test fixtures (kernel + rootfs)
+        run: ./scripts/fetch-test-fixtures.sh
+      - name: Run KVM boot integration test
+        run: cargo test -p mm-vmm --features kvm-integration -- --ignored
