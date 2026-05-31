@@ -1,0 +1,5 @@
+[build]
+# Keep default host target locally; CI cross-builds the musl guest targets explicitly.
+
+[target.'cfg(all())']
+rustflags = ["-Dwarnings"]
