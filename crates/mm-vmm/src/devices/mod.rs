@@ -417,7 +417,18 @@ impl IoDispatch for Bus {
                     .lock()
                     .expect("serial mutex")
                     .read((port - COM1_BASE_PORT) as u8);
+                return;
             }
+        }
+        // Unmapped port: emulate an open bus (all ones), as real hardware does for
+        // I/O with no device. This makes the guest's legacy probes — notably the
+        // i8042 PS/2 controller at 0x60/0x64 — fail *fast* (Linux reads 0xff, flushes
+        // the phantom buffer, and reports "No controller found") instead of
+        // busy-waiting on a status bit that never sets. That i8042 timeout alone
+        // otherwise stalls the boot ~0.6s (NFR-P1). Returning 0x00 (the previous
+        // behavior) is what triggered the stall.
+        for b in data.iter_mut() {
+            *b = 0xff;
         }
     }
 
@@ -450,5 +461,25 @@ impl IoDispatch for Bus {
                 .expect("transport mutex")
                 .write(addr - range.base, data);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::machine::IoDispatch;
+
+    #[test]
+    fn unmapped_pio_reads_as_open_bus() {
+        // No serial, no devices: every port is unmapped and must read all-ones, so
+        // legacy probes (e.g. the i8042 status port 0x64) fail fast instead of
+        // busy-waiting on a status bit that never sets.
+        let bus = Bus::new();
+        let mut status = [0u8; 1];
+        bus.pio_read(0x64, &mut status);
+        assert_eq!(status, [0xff], "i8042 status port must read as open bus");
+        let mut wide = [0u8; 4];
+        bus.pio_read(0x0cf8, &mut wide);
+        assert_eq!(wide, [0xff; 4], "wide unmapped read must be all-ones");
     }
 }
