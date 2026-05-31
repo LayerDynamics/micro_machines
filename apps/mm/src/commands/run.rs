@@ -186,8 +186,14 @@ mod linux {
         let jail_root = jail.join("root");
         std::fs::create_dir_all(&jail_root)
             .with_context(|| format!("creating jail {}", jail_root.display()))?;
-        link_or_copy(&kernel_path(), &jail_root.join("vmlinux"))?;
-        link_or_copy(&rootfs, &jail_root.join("rootfs.ext4"))?;
+        let jail_kernel = jail_root.join("vmlinux");
+        let jail_rootfs = jail_root.join("rootfs.ext4");
+        link_or_copy(&kernel_path(), &jail_kernel)?;
+        link_or_copy(&rootfs, &jail_rootfs)?;
+        // Make the jail traversable and the kernel/rootfs readable by the dropped
+        // (nobody) uid, failing loudly if a path is not — otherwise the confined
+        // worker would hit an opaque "permission denied" deep inside the boot.
+        prepare_jail_permissions(&jail, &jail_root, &[&jail_kernel, &jail_rootfs])?;
 
         // 6. Worker VM config with chroot-relative paths; serialized for the child.
         // Inject the managed SSH public key so `mm ssh` works with no in-guest setup.
@@ -364,6 +370,58 @@ mod linux {
             s.push_str(&format!("{b:02x}"));
         }
         s
+    }
+
+    /// Make the jail directories world-traversable (0755) and the kernel + rootfs
+    /// world-readable (0644), then verify the dropped uid can actually read them
+    /// and reach the chroot — failing loudly otherwise.
+    fn prepare_jail_permissions(jail: &Path, jail_root: &Path, files: &[&Path]) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The `<root>/jails` parent plus the per-VM dirs must be traversable.
+        for dir in [jail.parent().unwrap_or(jail), jail, jail_root] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("chmod 0755 {}", dir.display()))?;
+        }
+        for file in files {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644))
+                .with_context(|| format!("chmod 0644 {}", file.display()))?;
+            let mode = std::fs::metadata(file)
+                .with_context(|| format!("stat {}", file.display()))?
+                .permissions()
+                .mode();
+            if mode & 0o004 == 0 {
+                anyhow::bail!(
+                    "{} is not world-readable (mode {:o}); the jailed uid {WORKER_UID} cannot read it",
+                    file.display(),
+                    mode & 0o777
+                );
+            }
+        }
+        verify_path_traversable(jail_root)?;
+        Ok(())
+    }
+
+    /// Verify every directory from `path` up to the filesystem root is traversable
+    /// by "other" (the o+x bit), since the jailed uid must walk the whole path to
+    /// reach the chroot. Bails naming the first offending directory.
+    fn verify_path_traversable(path: &Path) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut current = Some(path);
+        while let Some(dir) = current {
+            if let Ok(meta) = std::fs::metadata(dir) {
+                let mode = meta.permissions().mode();
+                if meta.is_dir() && mode & 0o001 == 0 {
+                    anyhow::bail!(
+                        "directory {} is not world-traversable (mode {:o}); the jailed uid {WORKER_UID} cannot reach the chroot — `chmod o+x` it",
+                        dir.display(),
+                        mode & 0o777
+                    );
+                }
+            }
+            current = dir.parent();
+        }
+        Ok(())
     }
 
     /// Hardlink `src` into `dst`, falling back to a copy across filesystems. A

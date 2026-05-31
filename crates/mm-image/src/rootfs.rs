@@ -166,6 +166,9 @@ impl ImageStore {
             ],
         )?;
         rename(&tmp_image, &target)?;
+        // The base image is shared read-only and, under the jailer, opened by an
+        // unprivileged uid — make it world-readable so the dropped uid can read it.
+        set_world_readable(&target)?;
         let _ = std::fs::remove_dir_all(&scratch);
         Ok(target)
     }
@@ -262,6 +265,18 @@ fn rename(from: &Path, to: &Path) -> Result<(), ImageError> {
     std::fs::rename(from, to).map_err(|source| ImageError::Io {
         path: to.to_path_buf(),
         source,
+    })
+}
+
+/// Make a file readable by owner/group/other (0644) so an unprivileged jailed VMM
+/// can open the shared, read-only base image.
+fn set_world_readable(path: &Path) -> Result<(), ImageError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).map_err(|source| {
+        ImageError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
     })
 }
 
