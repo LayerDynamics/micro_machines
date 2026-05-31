@@ -366,8 +366,9 @@ fn inject_init(rootfs: &Path, init_binary: &Path) -> Result<(), ImageError> {
 
 /// The pseudo-filesystem mountpoints mm-init mounts at boot. They must exist in the
 /// (read-only) base image since the guest cannot create them at runtime.
-/// `/sys/fs/cgroup` is omitted — sysfs provides it once `/sys` is mounted.
-const RUNTIME_MOUNTPOINTS: &[&str] = &["proc", "sys", "dev", "run", "tmp"];
+/// `/sys/fs/cgroup` is omitted — sysfs provides it once `/sys` is mounted. `/mnt` is
+/// the mountpoint mm-init pivots into when it sets up the writable overlay root.
+const RUNTIME_MOUNTPOINTS: &[&str] = &["proc", "sys", "dev", "run", "tmp", "mnt"];
 
 /// Create the runtime mountpoint directories in the unpacked rootfs (idempotent —
 /// directories the image already ships are left as they are).

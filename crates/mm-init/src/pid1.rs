@@ -10,8 +10,9 @@
 //! guest should die rather than hang.
 use std::process::{Command, ExitCode};
 
-use nix::mount::{mount, MsFlags};
+use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sys::reboot::{reboot, RebootMode};
+use nix::unistd::{chdir, pivot_root};
 
 use crate::cmdline::{InitConfig, Mode};
 
@@ -19,6 +20,11 @@ use crate::cmdline::{InitConfig, Mode};
 /// power-off. The `ExitCode` return type exists only so `main` can name it.
 pub fn run_pid1() -> ExitCode {
     install_panic_hook();
+
+    // Turn the read-only base into a writable root via an ephemeral overlay, so the
+    // guest (and the workload) can write anywhere — not just the tmpfs mounts below.
+    // Best-effort: on failure we keep booting on the read-only base.
+    setup_overlay_root();
 
     // Best-effort; individual mount failures are logged, not fatal.
     mount_core_filesystems();
@@ -116,6 +122,75 @@ fn poweroff() -> ! {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
+}
+
+/// Replace the read-only base root with a writable **ephemeral overlay**: lower =
+/// the read-only base, upper+work = a fresh tmpfs, merged + pivoted into as the new
+/// `/`. After this the whole filesystem is writable and every change is discarded at
+/// shutdown — the container-style "writable layer over a shared read-only image".
+/// Best-effort: a clear message is logged on success or failure, and on failure the
+/// guest continues on the read-only base rather than failing to boot.
+fn setup_overlay_root() {
+    match try_setup_overlay_root() {
+        Ok(()) => eprintln!("mm-init: writable overlay root active"),
+        Err(e) => eprintln!("mm-init: writable overlay root unavailable, staying read-only: {e}"),
+    }
+}
+
+fn try_setup_overlay_root() -> Result<(), String> {
+    let m = |what: &str, r: nix::Result<()>| r.map_err(|e| format!("{what}: {e}"));
+    let mkdir = |p: &str| std::fs::create_dir_all(p).map_err(|e| format!("mkdir {p}: {e}"));
+
+    // Make root-mount propagation private so pivot_root is permitted.
+    m(
+        "make / private",
+        mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+            None::<&str>,
+        ),
+    )?;
+
+    // A tmpfs to back the overlay's upper + work dirs. /run exists in the base image
+    // (injected by mm-image); we re-mount /run fresh after pivoting anyway.
+    m(
+        "mount tmpfs /run",
+        mount(
+            Some("tmpfs"),
+            "/run",
+            Some("tmpfs"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+            None::<&str>,
+        ),
+    )?;
+    mkdir("/run/upper")?;
+    mkdir("/run/work")?;
+
+    // Merge ro base (lower) with the writable upper at /mnt (injected mountpoint).
+    m(
+        "mount overlay /mnt",
+        mount(
+            Some("overlay"),
+            "/mnt",
+            Some("overlay"),
+            MsFlags::empty(),
+            Some("lowerdir=/,upperdir=/run/upper,workdir=/run/work"),
+        ),
+    )?;
+
+    // Pivot into the writable merged root, stashing the old root at /mnt/oldroot
+    // (writable via the overlay upper), then detach the old read-only base.
+    mkdir("/mnt/oldroot")?;
+    m("chdir /mnt", chdir("/mnt"))?;
+    m("pivot_root", pivot_root(".", "oldroot"))?;
+    m("chdir /", chdir("/"))?;
+    // Lazy detach: the overlay keeps its own references to the lower + upper, so the
+    // old base unmounts from the namespace while the overlay stays fully functional.
+    m("detach /oldroot", umount2("/oldroot", MntFlags::MNT_DETACH))?;
+    let _ = std::fs::remove_dir("/oldroot");
+    Ok(())
 }
 
 /// A single pseudo-filesystem mount the guest needs before userspace runs.
