@@ -194,8 +194,16 @@ fn io_from_errno(e: nix::Error) -> std::io::Error {
 /// even when it cannot apply the full namespace/chroot/uid-drop confinement (which
 /// would break the in-process TAP/KVM access in M1 — see `confine`).
 pub fn apply_cgroup_limits(cgroup: &CgroupLimits) -> Result<(), JailerError> {
-    let base = Path::new("/sys/fs/cgroup").join(&cgroup.name);
+    let root = Path::new("/sys/fs/cgroup");
+    let base = root.join(&cgroup.name);
     fs::create_dir_all(&base).map_err(JailerError::Cgroup)?;
+    // Delegate the cpu + memory controllers from the root down to the leaf's parent
+    // so the leaf actually exposes `cpu.max`/`memory.max`. A cgroup's
+    // `cgroup.subtree_control` enables controllers in its *children*; for a nested
+    // name like `micro_machines/<vm>` the intermediate cgroup must enable them too,
+    // or the leaf has no controller interface files and writing `cpu.max` fails with
+    // EACCES (the kernel won't create files in cgroupfs).
+    enable_controllers_down_to(root, &base);
     fs::write(base.join("cpu.max"), &cgroup.cpu_max).map_err(JailerError::Cgroup)?;
     fs::write(base.join("memory.max"), cgroup.memory_max_bytes.to_string())
         .map_err(JailerError::Cgroup)?;
@@ -203,6 +211,34 @@ pub fn apply_cgroup_limits(cgroup: &CgroupLimits) -> Result<(), JailerError> {
     fs::write(base.join("cgroup.procs"), std::process::id().to_string())
         .map_err(JailerError::Cgroup)?;
     Ok(())
+}
+
+/// Enable the cpu + memory controllers in every cgroup from `root` down to (but not
+/// including) `leaf`, so `leaf` exposes the controllers' interface files. Each write
+/// is best-effort and idempotent: "+cpu +memory" on an already-delegated cgroup is a
+/// no-op, and a genuinely missing controller surfaces as an error on the subsequent
+/// `cpu.max` write rather than here.
+fn enable_controllers_down_to(root: &Path, leaf: &Path) {
+    for cg in controller_ancestors(root, leaf) {
+        let _ = fs::write(cg.join("cgroup.subtree_control"), "+cpu +memory");
+    }
+}
+
+/// The cgroups whose `subtree_control` must enable cpu+memory for `leaf` to expose
+/// them: `root` and every intermediate directory, excluding `leaf` itself. Returns
+/// empty if `leaf` is not under `root`.
+fn controller_ancestors(root: &Path, leaf: &Path) -> Vec<PathBuf> {
+    let Ok(rel) = leaf.strip_prefix(root) else {
+        return Vec::new();
+    };
+    let mut dir = root.to_path_buf();
+    let mut ancestors = vec![root.to_path_buf()];
+    for component in rel.components() {
+        dir = dir.join(component);
+        ancestors.push(dir.clone());
+    }
+    ancestors.pop(); // drop the leaf — we delegate *into* it, not *from* it
+    ancestors
 }
 
 /// Unshare the mount, PID, and network namespaces.
@@ -285,4 +321,33 @@ fn drop_privileges(uid: u32, gid: u32) -> Result<(), JailerError> {
     setgid(gid).map_err(JailerError::DropPrivileges)?;
     setuid(Uid::from_raw(uid)).map_err(JailerError::DropPrivileges)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controller_ancestors_flat_name_is_root_only() {
+        let root = Path::new("/sys/fs/cgroup");
+        let leaf = root.join("mm-vm-1");
+        assert_eq!(controller_ancestors(root, &leaf), vec![root.to_path_buf()]);
+    }
+
+    #[test]
+    fn controller_ancestors_nested_name_includes_each_level() {
+        let root = Path::new("/sys/fs/cgroup");
+        let leaf = root.join("micro_machines").join("oci-test");
+        assert_eq!(
+            controller_ancestors(root, &leaf),
+            vec![root.to_path_buf(), root.join("micro_machines")],
+        );
+    }
+
+    #[test]
+    fn controller_ancestors_unrelated_leaf_is_empty() {
+        assert!(
+            controller_ancestors(Path::new("/sys/fs/cgroup"), Path::new("/elsewhere")).is_empty()
+        );
+    }
 }
