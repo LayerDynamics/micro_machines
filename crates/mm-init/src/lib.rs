@@ -2,5 +2,8 @@
 pub mod cmdline;
 pub use cmdline::{InitConfig, Mode};
 
-// The PID-1 runtime (mount, net, exec, fail-fast) is linux-only and added in
-// Task 4 behind `cfg(target_os = "linux")`.
+// The PID-1 runtime (mount, net, exec, fail-fast) is linux-only.
+#[cfg(target_os = "linux")]
+mod pid1;
+#[cfg(target_os = "linux")]
+pub use pid1::run_pid1;
