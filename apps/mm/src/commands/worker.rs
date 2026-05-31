@@ -40,6 +40,9 @@ pub struct WorkerArgs {
     /// `memory.max` in bytes.
     #[arg(long)]
     pub mem_max: u64,
+    /// Also enter a user namespace (maps inner-root to the unprivileged uid/gid).
+    #[arg(long)]
+    pub user_namespace: bool,
 }
 
 pub fn run(args: WorkerArgs) -> Result<()> {
@@ -84,6 +87,7 @@ mod linux {
                 cpu_max: args.cpu_max.clone(),
                 memory_max_bytes: args.mem_max,
             },
+            user_namespace: args.user_namespace,
         };
         mm_sandbox::confine(&spec).context("confining the VMM process")?;
 

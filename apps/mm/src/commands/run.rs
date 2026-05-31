@@ -282,6 +282,11 @@ mod linux {
             .arg(cpu_max)
             .arg("--mem-max")
             .arg(mem_max.to_string());
+        // Enter a user namespace by default (additive hardening); MM_NO_USERNS=1
+        // disables it for kernels without unprivileged-userns or for debugging.
+        if std::env::var_os("MM_NO_USERNS").is_none() {
+            cmd.arg("--user-namespace");
+        }
 
         // SAFETY: `pre_exec` runs in the forked child before `exec`; `dup2` is
         // async-signal-safe and clears CLOEXEC on the target, so 10/11 survive exec.

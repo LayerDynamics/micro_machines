@@ -40,12 +40,18 @@ pub struct CgroupLimits {
 pub struct JailSpec {
     /// Per-VM root the process is chrooted into.
     pub chroot_dir: PathBuf,
-    /// Unprivileged uid the process drops to.
+    /// Unprivileged uid the process drops to (or, with a user namespace, the outer
+    /// uid that inner-root maps to).
     pub uid: u32,
-    /// Unprivileged gid the process drops to.
+    /// Unprivileged gid the process drops to (or the outer gid mapped to inner 0).
     pub gid: u32,
     /// cgroup v2 limits.
     pub cgroup: CgroupLimits,
+    /// When true, also enter a **user namespace**, mapping inner-root to the outer
+    /// `uid`/`gid` (additive hardening: a namespace escape lands as `uid`/`gid`,
+    /// not real root). With this set we stay inner-root rather than `setuid`-ing,
+    /// since being unprivileged outside the namespace is already the goal.
+    pub user_namespace: bool,
 }
 
 /// Errors from confining a process.
@@ -61,6 +67,8 @@ pub enum JailerError {
     Chroot { path: PathBuf, source: nix::Error },
     #[error("prctl(PR_SET_NO_NEW_PRIVS) failed: {0}")]
     NoNewPrivs(std::io::Error),
+    #[error("user namespace setup failed: {0}")]
+    UserNamespace(std::io::Error),
     #[error("dropping privileges failed: {0}")]
     DropPrivileges(nix::Error),
 }
@@ -68,12 +76,35 @@ pub enum JailerError {
 /// Confine the current process per `spec`. Returns once the process is jailed; the
 /// caller then applies the seccomp filter and boots the VM.
 pub fn confine(spec: &JailSpec) -> Result<(), JailerError> {
+    // cgroup setup needs real root, so it runs before any namespace entry.
     apply_cgroup_limits(&spec.cgroup)?;
+    // The user namespace (when requested) must be entered before the others so the
+    // process holds the necessary capabilities *inside* it for chroot etc.
+    if spec.user_namespace {
+        enter_user_namespace(spec.uid, spec.gid)?;
+    }
     enter_namespaces()?;
     make_mounts_private()?;
     enter_chroot(&spec.chroot_dir)?;
     set_no_new_privs()?;
-    drop_privileges(spec.uid, spec.gid)?;
+    // With a user namespace we are already unprivileged outside it (inner-root maps
+    // to `uid`/`gid`), so no `setuid` drop — that uid is not mapped inside the ns.
+    if !spec.user_namespace {
+        drop_privileges(spec.uid, spec.gid)?;
+    }
+    Ok(())
+}
+
+/// Enter a new user namespace and map inner-root (uid/gid 0) to the outer
+/// `uid`/`gid`. `setgroups` is denied first, as the kernel requires before writing
+/// `gid_map` from an unprivileged-mapping context.
+fn enter_user_namespace(uid: u32, gid: u32) -> Result<(), JailerError> {
+    unshare(CloneFlags::CLONE_NEWUSER).map_err(JailerError::Namespace)?;
+    std::fs::write("/proc/self/setgroups", "deny").map_err(JailerError::UserNamespace)?;
+    std::fs::write("/proc/self/uid_map", format!("0 {uid} 1"))
+        .map_err(JailerError::UserNamespace)?;
+    std::fs::write("/proc/self/gid_map", format!("0 {gid} 1"))
+        .map_err(JailerError::UserNamespace)?;
     Ok(())
 }
 
