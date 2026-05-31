@@ -32,7 +32,10 @@ time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 # never compile them.
 kvm-ioctls = "0.24"
 kvm-bindings = { version = "0.14", features = ["fam-wrappers", "serde"] }
-vm-memory = { version = "0.17", features = ["backend-mmap", "backend-bitmap"] }
+# Pinned to 0.16 so the *single* vm-memory in the graph is shared by linux-loader
+# (requires >=0.16,<=0.17.1) and virtio-queue 0.16 (requires ^0.16). A higher pin
+# splits GuestMemory into incompatible trait copies across crate boundaries.
+vm-memory = { version = "0.16", features = ["backend-mmap", "backend-bitmap"] }
 vmm-sys-util = "0.15"
 linux-loader = "0.13"
 vm-superio = "0.8"

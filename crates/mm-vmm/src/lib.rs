@@ -11,10 +11,14 @@ pub use config::{BlockDevice, ConfigError, VirtioDevice, VmConfig};
 
 // Linux-only KVM machinery (Tasks 5–8), behind `cfg(target_os = "linux")`.
 #[cfg(target_os = "linux")]
+pub mod boot;
+#[cfg(target_os = "linux")]
 mod machine;
 #[cfg(target_os = "linux")]
 mod vcpu;
 
+#[cfg(target_os = "linux")]
+pub use boot::KernelBoot;
 #[cfg(target_os = "linux")]
 pub use machine::{IoDispatch, Machine, VmmError};
 #[cfg(target_os = "linux")]
