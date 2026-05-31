@@ -48,7 +48,7 @@ virtio-queue = "0.16"
 seccompiler = "0.5"
 
 # Host-side syscalls / namespaces / mounts (linux-only consumers).
-nix = { version = "0.30", features = ["mount", "sched", "user", "net", "fs", "reboot", "ioctl"] }
+nix = { version = "0.30", features = ["mount", "sched", "user", "net", "fs", "reboot", "ioctl", "process"] }
 
 # CLI + observability + ergonomics (cross-platform).
 clap = { version = "4", features = ["derive"] }

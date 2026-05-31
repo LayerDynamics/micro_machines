@@ -11,9 +11,15 @@
 //!    the PID space, and networking. (Like Firecracker's jailer we drop to an
 //!    unprivileged uid rather than entering a user namespace; user-namespace
 //!    mapping is additive hardening for a later milestone.)
-//! 3. **chroot** — pivot into the per-VM root so the process cannot see the host
+//! 3. **fork into the PID namespace** — `unshare(CLONE_NEWPID)` does not move the
+//!    caller into the new namespace, only its children. As a side effect the
+//!    caller can no longer create threads (the kernel rejects `CLONE_THREAD` with
+//!    `EINVAL` once its active PID namespace differs from `pid_ns_for_children`),
+//!    which would break the multi-threaded VMM. We fork so the VMM runs as PID 1
+//!    of the new namespace, where threads are allowed again; the parent reaps it.
+//! 4. **chroot** — pivot into the per-VM root so the process cannot see the host
 //!    filesystem.
-//! 4. **no_new_privs + uid/gid drop** — forbid regaining privilege via setuid
+//! 5. **no_new_privs + uid/gid drop** — forbid regaining privilege via setuid
 //!    binaries, then drop to an unprivileged uid/gid.
 //!
 //! After `confine`, install the seccomp filter ([`crate::seccomp`]) on each thread.
@@ -22,7 +28,8 @@ use std::path::{Path, PathBuf};
 
 use nix::mount::{mount, MsFlags};
 use nix::sched::{unshare, CloneFlags};
-use nix::unistd::{chdir, chroot, setgid, setgroups, setuid, Gid, Uid};
+use nix::sys::wait::{waitpid, WaitStatus};
+use nix::unistd::{chdir, chroot, fork, setgid, setgroups, setuid, ForkResult, Gid, Uid};
 
 /// cgroup v2 resource limits for a jailed VM.
 #[derive(Debug, Clone)]
@@ -61,6 +68,8 @@ pub enum JailerError {
     Cgroup(std::io::Error),
     #[error("namespace unshare failed: {0}")]
     Namespace(nix::Error),
+    #[error("fork into pid namespace failed: {0}")]
+    Fork(nix::Error),
     #[error("making mounts private failed: {0}")]
     Mount(nix::Error),
     #[error("chroot to {path} failed: {source}")]
@@ -84,6 +93,11 @@ pub fn confine(spec: &JailSpec) -> Result<(), JailerError> {
         enter_user_namespace(spec.uid, spec.gid)?;
     }
     enter_namespaces()?;
+    // We have unshared a PID namespace, so this process can no longer spawn
+    // threads. Fork into it: only the child (PID 1 of the new namespace) returns
+    // here to finish confinement and boot the multi-threaded VMM; the parent
+    // reaps the child and exits with an equivalent status and never returns.
+    fork_into_pid_namespace()?;
     make_mounts_private()?;
     enter_chroot(&spec.chroot_dir)?;
     set_no_new_privs()?;
@@ -129,6 +143,37 @@ pub fn apply_cgroup_limits(cgroup: &CgroupLimits) -> Result<(), JailerError> {
 fn enter_namespaces() -> Result<(), JailerError> {
     unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNET)
         .map_err(JailerError::Namespace)
+}
+
+/// Fork so the VMM runs as PID 1 of the freshly unshared PID namespace.
+///
+/// `unshare(CLONE_NEWPID)` places the caller's *children* — not the caller — in
+/// the new namespace. As a side effect the caller's active PID namespace stops
+/// matching its `pid_ns_for_children`, and the kernel then rejects `CLONE_THREAD`
+/// (the clone flavour `pthread_create` uses) with `EINVAL`. The VMM is
+/// multi-threaded (one thread per vCPU), so it must run from a process where the
+/// two namespaces agree: the child of this fork, which is PID 1 of the new
+/// namespace. The parent has nothing left to do but reap that child and mirror
+/// its exit status, so to the launcher the worker still looks like one process.
+///
+/// The caller is single-threaded at this point (the preceding
+/// `unshare(CLONE_NEWPID)` would have failed otherwise), so `fork()` is free of
+/// the usual multi-threaded-fork hazards.
+fn fork_into_pid_namespace() -> Result<(), JailerError> {
+    // SAFETY: single-threaded process (see above); each branch only does
+    // async-signal-safe work before the child returns / the parent exits.
+    match unsafe { fork() }.map_err(JailerError::Fork)? {
+        ForkResult::Child => Ok(()),
+        ForkResult::Parent { child } => {
+            let code = match waitpid(child, None) {
+                Ok(WaitStatus::Exited(_, code)) => code,
+                // Convention: 128 + signal number for a signal-terminated child.
+                Ok(WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
+                _ => 1,
+            };
+            std::process::exit(code);
+        }
+    }
 }
 
 /// Make the whole mount tree private+recursive so chroot and any later mounts in
