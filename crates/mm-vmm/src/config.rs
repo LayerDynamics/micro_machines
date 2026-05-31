@@ -9,6 +9,15 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Kernel command-line arguments that skip device probes a microVM never needs, so
+/// the guest reaches userspace fast (SPEC-1 NFR-P1). On a virtio-mmio microVM there
+/// is no PS/2 controller and no PCI bus; the default i8042 probe alone blocks the
+/// boot for ~0.6 s on a timeout. These disable that probe (`i8042.*`), the PCI scan
+/// (`pci=off`), and extra 8250 UART ports (`8250.nr_uarts=1`, keeping COM1 for the
+/// console). Callers append this to the guest cmdline.
+pub const FAST_BOOT_ARGS: &str =
+    "i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd pci=off 8250.nr_uarts=1";
+
 /// Fully-resolved configuration for a single microVM (SPEC-1 FR-4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmConfig {

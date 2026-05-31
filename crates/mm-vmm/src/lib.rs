@@ -7,7 +7,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 pub mod config;
-pub use config::{BlockDevice, ConfigError, VirtioDevice, VmConfig};
+pub use config::{BlockDevice, ConfigError, VirtioDevice, VmConfig, FAST_BOOT_ARGS};
 
 // Linux-only KVM machinery (Tasks 5–8), behind `cfg(target_os = "linux")`.
 #[cfg(target_os = "linux")]

@@ -59,10 +59,13 @@ pub fn build_vm_config(
         None => "mm.mode=sandbox".to_string(),
     };
     // root=/dev/vda: the rootfs is the first virtio-mmio block device. init=/init:
-    // mm-init is PID 1 in the guest image. The rootfs is read-only in M1 (writes go
-    // to tmpfs mounts that mm-init sets up).
-    let mut kernel_cmdline =
-        format!("console=ttyS0 root=/dev/vda ro init=/init reboot=k panic=1 {ip_param} {mode}");
+    // mm-init is PID 1 in the guest image. FAST_BOOT_ARGS skips the PS/2 + PCI probes
+    // a microVM never needs (NFR-P1). The rootfs is read-only; mm-init turns it into
+    // a writable overlay root at boot.
+    let mut kernel_cmdline = format!(
+        "console=ttyS0 root=/dev/vda ro init=/init reboot=k panic=1 {} {ip_param} {mode}",
+        mm_vmm::FAST_BOOT_ARGS,
+    );
     if let Some(hex) = authorized_key_hex {
         // Hex-encoded (no spaces) so it survives the whitespace-split cmdline.
         kernel_cmdline.push_str(&format!(" mm.authorized_key={hex}"));

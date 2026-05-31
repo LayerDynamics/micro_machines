@@ -93,7 +93,8 @@ fn net_config() -> VmConfig {
         // rather than a predictable name (enp0s…) that would leave eth0 unconfigured.
         kernel_cmdline: format!(
             "{GUEST_CONSOLE} root=/dev/vda ro init=/init reboot=k panic=1 \
-             net.ifnames=0 {ip_param} mm.workload=/sbin/ready"
+             {} net.ifnames=0 {ip_param} mm.workload=/sbin/ready",
+            mm_vmm::FAST_BOOT_ARGS,
         ),
         rootfs: BlockDevice {
             path: "tests/fixtures/rootfs.ext4".into(),

@@ -110,7 +110,8 @@ fn run_jailed_boot(tag: &str, user_namespace: bool) {
         memory_mib: 128,
         kernel: "/vmlinux".into(),
         kernel_cmdline: format!(
-            "{GUEST_CONSOLE} root=/dev/vda ro init=/init reboot=k panic=1 mm.workload=/sbin/ready"
+            "{GUEST_CONSOLE} root=/dev/vda ro init=/init reboot=k panic=1 {} mm.workload=/sbin/ready",
+            mm_vmm::FAST_BOOT_ARGS,
         ),
         rootfs: BlockDevice {
             path: "/rootfs.ext4".into(),
