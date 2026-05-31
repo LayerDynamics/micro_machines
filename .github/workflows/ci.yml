@@ -90,3 +90,29 @@ jobs:
         run: ./scripts/fetch-test-fixtures.sh
       - name: Run KVM boot integration test
         run: cargo test -p mm-vmm --features kvm-integration -- --ignored --nocapture
+
+  # Preflight for the upcoming net + jail runtime tests: confirms the hosted
+  # runner allows passwordless sudo and host bridge/TAP creation (host<->guest
+  # over a bridge is all the net test needs; NAT egress is not required). Pure
+  # diagnostic — never fails the build.
+  net-jail-preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe sudo + bridge/TAP + namespaces
+        run: |
+          set +e
+          sudo -n true && echo "passwordless-sudo=yes" || echo "passwordless-sudo=no"
+          sudo ip link add mm-test-br type bridge && echo "bridge-create=ok" || echo "bridge-create=FAILED"
+          sudo ip addr add 10.99.0.1/24 dev mm-test-br && echo "bridge-addr=ok" || echo "bridge-addr=FAILED"
+          sudo ip link set mm-test-br up && echo "bridge-up=ok" || echo "bridge-up=FAILED"
+          sudo ip tuntap add mm-test-tap mode tap && echo "tap-create=ok" || echo "tap-create=FAILED"
+          sudo ip link set mm-test-tap master mm-test-br && echo "tap-attach=ok" || echo "tap-attach=FAILED"
+          sudo ip link set mm-test-tap up && echo "tap-up=ok" || echo "tap-up=FAILED"
+          # Unprivileged user namespaces (the jailer uses CLONE_NEWUSER):
+          echo "userns-clone=$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo n/a)"
+          echo "userns-max=$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo n/a)"
+          # cgroup v2:
+          mount | grep -q 'cgroup2 on /sys/fs/cgroup ' && echo "cgroup2=yes" || echo "cgroup2=no"
+          sudo ip link del mm-test-tap 2>/dev/null
+          sudo ip link del mm-test-br 2>/dev/null
+          exit 0
