@@ -7,6 +7,7 @@
 //! event loop rather than a single blocking wait. The guest speaks virtio-net
 //! (frames prefixed by a 12-byte `virtio_net_hdr`); the TAP carries raw Ethernet,
 //! so the worker strips the header on tx and prepends a zeroed one on rx.
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -26,6 +27,9 @@ const VIRTIO_NET_HDR_LEN: usize = 12;
 const VIRTIO_NET_F_MAC: u64 = 1 << 5;
 /// Max Ethernet frame + virtio header (jumbo-safe upper bound).
 const MAX_FRAME_LEN: usize = 65_562;
+/// Bound on buffered receive frames when the guest has not posted RX buffers.
+/// When full, the oldest frame is dropped (and logged) to cap memory use.
+const RX_BACKLOG_MAX: usize = 64;
 
 const RX_QUEUE_INDEX: usize = 0;
 const TX_QUEUE_INDEX: usize = 1;
@@ -102,6 +106,7 @@ impl VirtioDevice for Net {
             tap,
             mem,
             interrupt,
+            rx_backlog: VecDeque::new(),
         };
 
         let mut manager = EventManager::<NetWorker>::new()
@@ -130,6 +135,10 @@ struct NetWorker {
     tap: File,
     mem: Arc<GuestMemoryMmap>,
     interrupt: Arc<Interrupt>,
+    /// Frames (each already prefixed with its virtio-net header) received from the
+    /// TAP while the guest had no RX buffers posted; drained FIFO when buffers
+    /// become available.
+    rx_backlog: VecDeque<Vec<u8>>,
 }
 
 impl NetWorker {
@@ -162,10 +171,65 @@ impl NetWorker {
         Ok(())
     }
 
-    /// Pull frames from the TAP and deliver each into a receive chain, prepending
-    /// a zeroed virtio-net header.
+    /// Copy one fully-formed frame (already including its virtio-net header) into
+    /// the next available guest RX chain. Returns `Ok(false)` if the guest has no
+    /// RX buffer posted (so the caller can buffer the frame instead of dropping it).
+    fn deliver_to_guest(&mut self, frame: &[u8]) -> Result<bool> {
+        let Some(chain) = self.rx_queue.pop_descriptor_chain(self.mem.clone()) else {
+            return Ok(false);
+        };
+        let head = chain.head_index();
+        let mut copied = 0usize;
+        for desc in chain {
+            if copied >= frame.len() {
+                break;
+            }
+            let want = std::cmp::min(desc.len() as usize, frame.len() - copied);
+            self.mem
+                .write_slice(&frame[copied..copied + want], desc.addr())
+                .map_err(|e| VmmError::Device(format!("net rx write: {e}")))?;
+            copied += want;
+        }
+        self.rx_queue
+            .add_used(self.mem.as_ref(), head, copied as u32)
+            .map_err(|e| VmmError::Device(format!("net rx add_used: {e}")))?;
+        Ok(true)
+    }
+
+    /// Deliver as many backlogged frames as the guest now has buffers for, in FIFO
+    /// order. Returns how many were delivered.
+    fn drain_backlog(&mut self) -> Result<usize> {
+        let mut delivered = 0;
+        while let Some(frame) = self.rx_backlog.pop_front() {
+            if self.deliver_to_guest(&frame)? {
+                delivered += 1;
+            } else {
+                // No buffer yet: put it back at the front and stop (preserve order).
+                self.rx_backlog.push_front(frame);
+                break;
+            }
+        }
+        Ok(delivered)
+    }
+
+    /// Buffer a frame for later delivery, bounding the backlog by dropping (and
+    /// logging) the oldest frame when the limit is reached.
+    fn enqueue_backlog(&mut self, frame: &[u8]) {
+        if self.rx_backlog.len() >= RX_BACKLOG_MAX {
+            self.rx_backlog.pop_front();
+            tracing::warn!("net: rx backlog full ({RX_BACKLOG_MAX}); dropped oldest frame");
+        }
+        self.rx_backlog.push_back(frame.to_vec());
+    }
+
+    /// Pull frames from the TAP and deliver each into a receive chain (prepending a
+    /// zeroed virtio-net header). Frames that arrive while the guest has no RX
+    /// buffers are buffered in `rx_backlog` and delivered on the next RX
+    /// notification rather than dropped.
     fn process_rx(&mut self) -> Result<()> {
-        let mut signalled = false;
+        // First flush any backlog into newly-available buffers.
+        let mut signalled = self.drain_backlog()? > 0;
+
         let mut buf = vec![0u8; MAX_FRAME_LEN];
         loop {
             let n = match self.tap.read(&mut buf[VIRTIO_NET_HDR_LEN..]) {
@@ -181,28 +245,17 @@ impl NetWorker {
             buf[..VIRTIO_NET_HDR_LEN].fill(0);
             buf[10] = 1;
             let total = VIRTIO_NET_HDR_LEN + n;
+            let frame = &buf[..total];
 
-            let Some(chain) = self.rx_queue.pop_descriptor_chain(self.mem.clone()) else {
-                // No guest buffer available: drop (M1 has no rx backlog buffering).
-                break;
-            };
-            let head = chain.head_index();
-            let mut copied = 0usize;
-            for desc in chain {
-                if copied >= total {
-                    break;
-                }
-                let want = std::cmp::min(desc.len() as usize, total - copied);
-                self.mem
-                    .write_slice(&buf[copied..copied + want], desc.addr())
-                    .map_err(|e| VmmError::Device(format!("net rx write: {e}")))?;
-                copied += want;
+            // Preserve ordering: only deliver directly when the backlog is empty;
+            // otherwise enqueue so earlier frames are not overtaken.
+            if self.rx_backlog.is_empty() && self.deliver_to_guest(frame)? {
+                signalled = true;
+            } else {
+                self.enqueue_backlog(frame);
             }
-            self.rx_queue
-                .add_used(self.mem.as_ref(), head, copied as u32)
-                .map_err(|e| VmmError::Device(format!("net rx add_used: {e}")))?;
-            signalled = true;
         }
+
         if signalled {
             self.interrupt.signal_used_queue()?;
         }
@@ -255,7 +308,11 @@ fn set_nonblocking(file: &File) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use virtio_queue::mock::MockSplitQueue;
+    use vm_memory::GuestAddress;
+
     use super::*;
+    use crate::devices::Interrupt;
 
     #[test]
     fn config_reports_mac() {
@@ -268,5 +325,52 @@ mod tests {
         net.read_config(0, &mut cfg);
         assert_eq!(cfg, mac);
         assert!(net.features() & VIRTIO_NET_F_MAC != 0);
+    }
+
+    /// Build a worker with empty (no available buffers) RX/TX queues.
+    fn empty_worker() -> NetWorker {
+        let mem = Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x100_0000)]).unwrap());
+        let rx_queue = MockSplitQueue::new(mem.as_ref(), 16)
+            .create_queue::<Queue>()
+            .unwrap();
+        let tx_queue = MockSplitQueue::new(mem.as_ref(), 16)
+            .create_queue::<Queue>()
+            .unwrap();
+        let interrupt = Arc::new(Interrupt::new(EventFd::new(0).unwrap()));
+        NetWorker {
+            rx_queue,
+            tx_queue,
+            rx_evt: EventFd::new(0).unwrap(),
+            tx_evt: EventFd::new(0).unwrap(),
+            tap: File::open("/dev/null").unwrap(),
+            mem,
+            interrupt,
+            rx_backlog: VecDeque::new(),
+        }
+    }
+
+    #[test]
+    fn frames_are_buffered_when_no_guest_buffer() {
+        let mut worker = empty_worker();
+        // No posted RX buffers -> delivery reports "not delivered".
+        assert!(!worker.deliver_to_guest(&[0u8; 64]).unwrap());
+        worker.enqueue_backlog(&[1u8; 64]);
+        assert_eq!(worker.rx_backlog.len(), 1);
+        // Draining with still no buffers leaves the frame queued (not dropped).
+        assert_eq!(worker.drain_backlog().unwrap(), 0);
+        assert_eq!(worker.rx_backlog.len(), 1);
+    }
+
+    #[test]
+    fn backlog_is_bounded_and_drops_oldest() {
+        let mut worker = empty_worker();
+        for i in 0..(RX_BACKLOG_MAX + 5) {
+            worker.enqueue_backlog(&[(i % 256) as u8; 32]);
+        }
+        assert_eq!(
+            worker.rx_backlog.len(),
+            RX_BACKLOG_MAX,
+            "backlog is capped at RX_BACKLOG_MAX"
+        );
     }
 }
