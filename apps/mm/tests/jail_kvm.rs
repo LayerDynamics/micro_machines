@@ -153,11 +153,12 @@ fn run_jailed_boot(tag: &str, user_namespace: bool) {
     if user_namespace {
         cmd.arg("--user-namespace");
     }
-    // Capture stderr (the worker's tracing) so we can prove the guest actually
-    // reached userspace — the worker exits 0 even on a readiness *timeout*, so a
-    // clean exit alone is not proof of boot. stdout (the guest serial console)
-    // stays inherited so it still shows in CI logs.
-    cmd.stderr(Stdio::piped());
+    // Capture stdout — the worker's tracing (tracing_subscriber::fmt defaults to
+    // stdout) *and* the guest serial console both land there. We need the tracing
+    // to prove the guest reached userspace: the worker exits 0 even on a readiness
+    // *timeout*, so a clean exit alone is not proof of boot. We re-print the
+    // captured output afterward so CI logs still show it.
+    cmd.stdout(Stdio::piped());
 
     // SAFETY: pre_exec runs in the forked child before exec; dup2 is
     // async-signal-safe and clears CLOEXEC on fd 10 so it survives exec.
@@ -174,12 +175,13 @@ fn run_jailed_boot(tag: &str, user_namespace: bool) {
     // SAFETY: kvm_fd is our copy; the child inherited its own dup at fd 10.
     unsafe { libc::close(kvm_fd) };
 
-    // Drain the worker's stderr concurrently so its pipe never fills, and so we can
-    // inspect it after exit. The reader returns when the worker closes stderr.
-    let mut stderr_pipe = child.stderr.take().expect("piped worker stderr");
-    let stderr_reader = std::thread::spawn(move || {
+    // Drain the worker's stdout concurrently so its pipe never fills (the guest
+    // console can be chatty), and so we can inspect it after exit. The reader
+    // returns when the worker closes stdout.
+    let mut stdout_pipe = child.stdout.take().expect("piped worker stdout");
+    let stdout_reader = std::thread::spawn(move || {
         let mut buf = String::new();
-        let _ = stderr_pipe.read_to_string(&mut buf);
+        let _ = stdout_pipe.read_to_string(&mut buf);
         buf
     });
 
@@ -199,10 +201,10 @@ fn run_jailed_boot(tag: &str, user_namespace: bool) {
         std::thread::sleep(Duration::from_millis(50));
     };
 
-    let stderr = stderr_reader.join().unwrap_or_default();
+    let output = stdout_reader.join().unwrap_or_default();
     cleanup(&work, &cgroup);
-    // Surface the worker's tracing in CI logs (stderr was piped, not inherited).
-    eprintln!("--- worker stderr (user_namespace={user_namespace}) ---\n{stderr}\n--- end ---");
+    // Surface the worker's output in CI logs (stdout was piped, not inherited).
+    eprintln!("--- worker stdout (user_namespace={user_namespace}) ---\n{output}\n--- end ---");
 
     assert!(
         status.success(),
@@ -215,9 +217,9 @@ fn run_jailed_boot(tag: &str, user_namespace: bool) {
     // Require the positive readiness marker so a guest that never reaches userspace
     // (e.g. a device worker blocked by an over-tight seccomp filter) fails the test.
     assert!(
-        stderr.contains("guest signaled readiness over vsock"),
+        output.contains("guest signaled readiness over vsock"),
         "jailed guest did not reach userspace (no readiness signal) — \
-         user_namespace={user_namespace}\nworker stderr:\n{stderr}"
+         user_namespace={user_namespace}\nworker output:\n{output}"
     );
 }
 
