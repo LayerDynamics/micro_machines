@@ -1,19 +1,27 @@
 //! KVM machine: device-independent VM setup — the `/dev/kvm` handle, guest RAM,
 //! the in-kernel interrupt controller + PIT, and vCPU creation (SPEC-1 FR-1).
 //!
-//! This module owns everything that does not depend on the concrete device set:
-//! it builds the VM, maps guest memory into KVM, and constructs (but does not yet
-//! run) the vCPUs. Kernel loading lives in [`crate::boot`], the device model in
-//! [`crate::devices`], and the end-to-end [`Machine::boot`] orchestration is added
-//! in Task 8.
-use std::sync::Arc;
+//! It builds the VM, maps guest memory into KVM, creates the vCPUs, and — via
+//! [`Machine::boot`] — wires the device model ([`crate::devices`]), loads the
+//! kernel ([`crate::boot`]), configures the vCPUs for the boot protocol, and runs
+//! them. [`Machine::wait_for_ready`] blocks on the guest's vsock readiness signal.
+use std::fmt::Write as _;
+use std::os::unix::io::AsRawFd;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use kvm_bindings::{kvm_pit_config, kvm_userspace_memory_region};
 use kvm_ioctls::{Kvm, VmFd};
 use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vmm_sys_util::eventfd::EventFd;
 
-use crate::config::{ConfigError, VmConfig};
-use crate::vcpu::Vcpu;
+use crate::config::{ConfigError, VirtioDevice as ConfigDevice, VmConfig};
+use crate::devices::{
+    Block, Bus, Interrupt, MmioTransport, Net, SerialDevice, VirtioDevice, Vsock, VsockReady,
+    COM1_IRQ,
+};
+use crate::vcpu::{Vcpu, VcpuRunExit};
 
 /// Start of the 32-bit MMIO hole on x86: guest RAM is split around it so device
 /// BARs and the LAPIC/IOAPIC windows are never backed by RAM (matches the
@@ -21,6 +29,15 @@ use crate::vcpu::Vcpu;
 const MMIO_GAP_START: u64 = 0xc000_0000; // 3 GiB
 /// Where RAM resumes above the 4 GiB boundary when a guest is given > 3 GiB.
 const RAM_64BIT_START: u64 = 0x1_0000_0000; // 4 GiB
+
+/// Base of the virtio-mmio device window (inside the 32-bit MMIO hole).
+const MMIO_DEVICE_BASE: u64 = 0xd000_0000;
+/// Per-device MMIO window size (one 4 KiB page, the virtio-mmio convention).
+const MMIO_DEVICE_SIZE: u64 = 0x1000;
+/// First GSI for virtio devices; COM1 takes GSI 4 ([`COM1_IRQ`]).
+const FIRST_VIRTIO_GSI: u32 = 5;
+/// The default guest context id for the boot vsock channel.
+const DEFAULT_GUEST_CID: u64 = 3;
 
 /// Errors from VMM setup and the run loop (SPEC-1 §3.2).
 #[derive(Debug, thiserror::Error)]
@@ -61,15 +78,22 @@ pub trait IoDispatch: Send + Sync {
     fn mmio_write(&self, addr: u64, data: &[u8]);
 }
 
-/// A constructed (not yet booted) microVM: the KVM/VM handles, mapped guest RAM,
-/// and the vCPUs. [`crate::boot`] loads a kernel into `guest_memory`, and Task 8's
-/// orchestration configures the vCPUs and runs them.
+/// A microVM. After [`Machine::new`] it is constructed but idle; after
+/// [`Machine::boot`] its vCPUs are running in their own threads and its device
+/// workers are live. The KVM/VM handles and guest RAM are retained so the running
+/// machine (and its devices) stay valid for the VM's lifetime.
 pub struct Machine {
     kvm: Kvm,
     vm: Arc<VmFd>,
     guest_memory: Arc<GuestMemoryMmap>,
     vcpus: Vec<Vcpu>,
     config: VmConfig,
+    /// Running vCPU threads (populated by [`Machine::boot`]).
+    vcpu_threads: Vec<JoinHandle<Result<VcpuRunExit>>>,
+    /// The device bus, kept alive while vCPUs reference it.
+    bus: Option<Arc<Bus>>,
+    /// The guest readiness signal from the boot vsock device.
+    ready: Option<Arc<VsockReady>>,
 }
 
 impl Machine {
@@ -103,7 +127,189 @@ impl Machine {
             guest_memory,
             vcpus,
             config: config.clone(),
+            vcpu_threads: Vec::new(),
+            bus: None,
+            ready: None,
         })
+    }
+
+    /// Build **and start** a microVM: assemble the device set (rootfs block, boot
+    /// vsock, serial console, plus any configured net devices), build the kernel
+    /// command line (appending the discovered `virtio_mmio.device=` params), load
+    /// the kernel, configure the vCPUs for the boot protocol, and spawn a thread
+    /// per vCPU. Returns once the guest is executing.
+    pub fn boot(config: &VmConfig) -> Result<Self> {
+        let mut machine = Self::new(config)?;
+        machine.start()?;
+        Ok(machine)
+    }
+
+    /// Wire up devices, load the kernel, and launch the vCPU threads.
+    fn start(&mut self) -> Result<()> {
+        let mut bus = Bus::new();
+        let mut mmio_cmdline = String::new();
+        let mut next_mmio = MMIO_DEVICE_BASE;
+        let mut next_gsi = FIRST_VIRTIO_GSI;
+
+        // Serial console on COM1 (always present so `console=ttyS0` works).
+        let serial_irq = EventFd::new(libc::EFD_NONBLOCK).map_err(VmmError::Io)?;
+        self.vm.register_irqfd(&serial_irq, COM1_IRQ)?;
+        let serial = Arc::new(Mutex::new(SerialDevice::new(
+            serial_irq,
+            Box::new(std::io::stdout()),
+        )));
+        bus.set_serial(serial);
+
+        // Rootfs block device (always present).
+        let block = Block::new(&self.config.rootfs.path, self.config.rootfs.read_only)?;
+        self.attach_virtio(
+            &mut bus,
+            &mut mmio_cmdline,
+            &mut next_mmio,
+            &mut next_gsi,
+            Box::new(block),
+        )?;
+
+        // Boot vsock channel (always present): carries the guest "ready" signal.
+        let vsock = Vsock::new(DEFAULT_GUEST_CID)?;
+        self.ready = Some(vsock.ready_signal());
+        self.attach_virtio(
+            &mut bus,
+            &mut mmio_cmdline,
+            &mut next_mmio,
+            &mut next_gsi,
+            Box::new(vsock),
+        )?;
+
+        // Configured devices: net (attach to its TAP). The boot vsock above already
+        // covers M1's single vsock use; balloon is a tracked M1 TODO, so a config
+        // that asks for it fails loudly rather than being silently dropped.
+        for device in &self.config.devices {
+            match device {
+                ConfigDevice::Net { tap_name, mac } => {
+                    let tap = open_tap(tap_name)?;
+                    let net = Net::new(tap, parse_mac(mac)?);
+                    self.attach_virtio(
+                        &mut bus,
+                        &mut mmio_cmdline,
+                        &mut next_mmio,
+                        &mut next_gsi,
+                        Box::new(net),
+                    )?;
+                }
+                ConfigDevice::Vsock { .. } => {
+                    // M1 uses the single boot vsock created above.
+                }
+                ConfigDevice::Balloon { .. } => {
+                    return Err(VmmError::Device(
+                        "balloon device is not supported in M1".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // Assemble the final cmdline and load the kernel + boot params.
+        let cmdline = format!("{}{}", self.config.kernel_cmdline, mmio_cmdline);
+        let mem_size = self
+            .config
+            .memory_mib
+            .checked_mul(1 << 20)
+            .ok_or_else(|| VmmError::Memory("memory size overflow".to_string()))?;
+        let kernel_boot = crate::boot::load_and_configure(
+            &self.guest_memory,
+            &self.config.kernel,
+            &cmdline,
+            mem_size,
+        )?;
+
+        // Configure each vCPU for the 64-bit boot protocol.
+        for vcpu in &self.vcpus {
+            vcpu.configure_boot(
+                &self.guest_memory,
+                kernel_boot.entry_point,
+                kernel_boot.boot_params_addr,
+            )?;
+        }
+
+        // Hand the bus to the vCPU threads and start them.
+        let bus = Arc::new(bus);
+        self.bus = Some(bus.clone());
+        let dispatch: Arc<dyn IoDispatch> = bus;
+        for mut vcpu in std::mem::take(&mut self.vcpus) {
+            let dispatch = dispatch.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!("mm-vcpu-{}", vcpu.index()))
+                .spawn(move || vcpu.run(&dispatch))
+                .map_err(VmmError::Io)?;
+            self.vcpu_threads.push(handle);
+        }
+        Ok(())
+    }
+
+    /// Allocate an MMIO window + GSI for `device`, register its interrupt with KVM,
+    /// place its transport on the bus, and append its `virtio_mmio.device=` cmdline
+    /// fragment so the guest discovers it.
+    fn attach_virtio(
+        &self,
+        bus: &mut Bus,
+        cmdline: &mut String,
+        next_mmio: &mut u64,
+        next_gsi: &mut u32,
+        device: Box<dyn VirtioDevice>,
+    ) -> Result<()> {
+        let base = *next_mmio;
+        let gsi = *next_gsi;
+
+        let irq = EventFd::new(libc::EFD_NONBLOCK).map_err(VmmError::Io)?;
+        self.vm.register_irqfd(&irq, gsi)?;
+        let interrupt = Arc::new(Interrupt::new(irq));
+
+        let transport = MmioTransport::new(device, self.guest_memory.clone(), interrupt)?;
+        bus.add_mmio_device(base, MMIO_DEVICE_SIZE, Arc::new(Mutex::new(transport)));
+
+        // e.g. " virtio_mmio.device=4K@0xd0000000:5"
+        let _ = write!(cmdline, " virtio_mmio.device=4K@0x{base:x}:{gsi}");
+
+        *next_mmio += MMIO_DEVICE_SIZE;
+        *next_gsi += 1;
+        Ok(())
+    }
+
+    /// Wait up to `timeout` for the guest to signal readiness over the boot vsock.
+    /// Returns `Ok(true)` if the guest reached userspace, `Ok(false)` on timeout.
+    pub fn wait_for_ready(&self, timeout: Duration) -> Result<bool> {
+        let ready = self
+            .ready
+            .as_ref()
+            .ok_or_else(|| VmmError::Device("no vsock readiness signal".to_string()))?;
+        if ready.is_ready() {
+            return Ok(true);
+        }
+        let mut poll_fd = libc::pollfd {
+            fd: ready.event_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: `poll_fd` is a valid, initialized pollfd describing one fd.
+        let rc = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if rc < 0 {
+            return Err(VmmError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(rc > 0 && (poll_fd.revents & libc::POLLIN) != 0)
+    }
+
+    /// Stop the VM: join the vCPU threads. The guest powers off (via `mm-init`)
+    /// when its workload exits, which halts the vCPUs and ends their threads.
+    pub fn shutdown(&mut self) -> Result<()> {
+        for handle in self.vcpu_threads.drain(..) {
+            match handle.join() {
+                Ok(Ok(_exit)) => {}
+                Ok(Err(e)) => tracing::error!("vcpu thread exited with error: {e}"),
+                Err(_) => tracing::error!("vcpu thread panicked"),
+            }
+        }
+        Ok(())
     }
 
     /// Build the guest physical memory map, splitting RAM around the 32-bit MMIO
@@ -172,5 +378,97 @@ impl Machine {
     /// The configuration this machine was built from.
     pub fn config(&self) -> &VmConfig {
         &self.config
+    }
+}
+
+// TUNSETIFF and TAP interface flags (not always surfaced by the `libc` crate).
+const TUNSETIFF: libc::Ioctl = 0x4004_54ca;
+const IFF_TAP: libc::c_short = 0x0002;
+const IFF_NO_PI: libc::c_short = 0x1000;
+
+/// Open and attach to an existing host TAP device by name, returning a file for
+/// the virtio-net device to read/write raw Ethernet frames. The TAP itself is
+/// created and bridged by `mm-net` (Task 9); here we only obtain its fd.
+fn open_tap(name: &str) -> Result<std::fs::File> {
+    use std::os::unix::io::FromRawFd;
+
+    let path = std::ffi::CString::new("/dev/net/tun")
+        .map_err(|e| VmmError::Device(format!("tun path: {e}")))?;
+    // SAFETY: `path` is a valid NUL-terminated C string.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
+    if fd < 0 {
+        return Err(VmmError::Io(std::io::Error::last_os_error()));
+    }
+
+    // SAFETY: `ifreq` is a C POD; zeroing is a valid initial state.
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    let bytes = name.as_bytes();
+    if bytes.len() >= ifr.ifr_name.len() {
+        // SAFETY: `fd` is the descriptor we just opened.
+        unsafe { libc::close(fd) };
+        return Err(VmmError::Device(format!("tap name too long: {name}")));
+    }
+    for (slot, &b) in ifr.ifr_name.iter_mut().zip(bytes) {
+        *slot = b as libc::c_char;
+    }
+    // Writing a union field (no read) is safe; this selects TAP mode without a
+    // packet-info prefix so the device exchanges raw Ethernet frames.
+    ifr.ifr_ifru.ifru_flags = IFF_TAP | IFF_NO_PI;
+
+    // SAFETY: `fd` is a valid /dev/net/tun fd and `ifr` is sized for TUNSETIFF.
+    let rc = unsafe { libc::ioctl(fd, TUNSETIFF, &ifr) };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        // SAFETY: closing the fd we own before returning the error.
+        unsafe { libc::close(fd) };
+        return Err(VmmError::Io(err));
+    }
+
+    // SAFETY: `fd` is an open descriptor we now hand exclusive ownership of to File.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Parse an `aa:bb:cc:dd:ee:ff` MAC string into 6 bytes.
+fn parse_mac(mac: &str) -> Result<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut count = 0;
+    for (i, part) in mac.split(':').enumerate() {
+        if i >= 6 {
+            return Err(VmmError::Device(format!(
+                "invalid MAC (too many octets): {mac}"
+            )));
+        }
+        out[i] = u8::from_str_radix(part, 16)
+            .map_err(|_| VmmError::Device(format!("invalid MAC octet {part:?} in {mac}")))?;
+        count += 1;
+    }
+    if count != 6 {
+        return Err(VmmError::Device(format!(
+            "invalid MAC (need 6 octets): {mac}"
+        )));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_mac_accepts_canonical_form() {
+        assert_eq!(
+            parse_mac("02:00:00:12:34:56").unwrap(),
+            [0x02, 0x00, 0x00, 0x12, 0x34, 0x56]
+        );
+    }
+
+    #[test]
+    fn parse_mac_rejects_malformed() {
+        assert!(parse_mac("02:00:00:12:34").is_err(), "too few octets");
+        assert!(parse_mac("zz:00:00:12:34:56").is_err(), "non-hex octet");
+        assert!(
+            parse_mac("02:00:00:12:34:56:78").is_err(),
+            "too many octets"
+        );
     }
 }
