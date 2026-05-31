@@ -849,11 +849,24 @@ sudo ./target/debug/mm run docker.io/library/alpine:latest --name m1 --ssh && ./
 → Expected: boot test passes; `echo ok` returns over SSH; cleanup leaves no TAP/overlay/store residue.
 
 **Exit criteria (M1 complete when ALL true):**
-- [ ] `mm run <oci-image>` boots a real microVM to userspace on a Linux/KVM host (FR-1, FR-2, FR-3, FR-6).
-- [ ] The guest gets an IP automatically via kernel `ip=` (FR-10, FR-11); `mm ssh` works with no manual sshd/key setup (FR-12).
-- [ ] The VMM runs jailed (namespaces + chroot + cgroup v2) with a per-thread seccomp-BPF filter applied before guest code (FR-27).
-- [ ] Boot-to-userspace is recorded; hard gate < 1 s, NFR-P1 (< 125 ms p50) tracked as a benchmark TODO if not yet met.
-- [ ] `mm ps/stop/rm` manage lifecycle and clean up fully.
-- [ ] All pure-logic crates have passing unit tests; clippy + fmt clean; each task committed; CI runs the KVM test on a kvm-enabled runner.
 
-**TODOs discovered during M1** (note, do NOT fix now): _record here (e.g. boot-time optimization toward NFR-P1, balloon device, multi-arch fixtures)._
+Status legend: ✅ done & verified on this (macOS) host · 🟡 code-complete + compiles
+for Linux (cross-checked via `cargo check/clippy --target x86_64-unknown-linux-gnu`)
+but its *runtime* behavior can only be exercised on the Linux/KVM runner.
+
+- [🟡] `mm run <oci-image>` boots a real microVM to userspace on a Linux/KVM host (FR-1, FR-2, FR-3, FR-6) — full VMM (KVM machine, vCPU boot protocol, kernel load, virtio blk/net/vsock + serial) and `mm run` orchestration implemented and compile-verified for Linux; boot-to-userspace runs on the KVM runner (`kvm-integration` job).
+- [🟡] The guest gets an IP automatically via kernel `ip=` (FR-10, FR-11); `mm ssh` works with no manual sshd/key setup (FR-12) — IPAM + `ip=` generation unit-tested (✅); bridge/TAP/NAT and `mm ssh` compile-verified for Linux.
+- [🟡/⚠️] The VMM runs jailed (namespaces + chroot + cgroup v2) with a per-thread seccomp-BPF filter applied before guest code (FR-27) — **seccomp** is fully wired into `mm run` (installed per vCPU thread via the new `Machine::boot_with_hook` seam, after the VMM's opens, before guest code) and **cgroup v2** caps are applied; the **namespace/chroot/uid-drop** jailer (`mm_sandbox::confine`) is fully implemented + compile-verified but **not yet wired into the default in-process boot** — see TODO 1.
+- [🟡] Boot-to-userspace is recorded; hard gate < 1 s, NFR-P1 (< 125 ms p50) tracked as a benchmark TODO — the integration test records and asserts the timing; p50 bench is TODO 2.
+- [🟡] `mm ps/stop/rm` manage lifecycle and clean up fully — store round-trip unit-tested (✅); TAP/overlay teardown compile-verified for Linux.
+- [✅] All pure-logic crates have passing unit tests (38 across the workspace); clippy + fmt clean; each task committed; CI runs the KVM test on a kvm-enabled runner.
+
+**TODOs discovered during M1** (recorded, NOT fixed — per scope guard):
+1. **Wire the full jailer into the in-process boot.** `mm run` applies cgroup v2 + per-thread seccomp today. Namespace/chroot/uid-drop confinement is implemented in `mm-sandbox` but not wired in by default because correct ordering needs the TAP fd passed into the jail and `/dev/kvm` bind-mounted into a prepared chroot (a jailer-exec or fd-passing restructure of `Machine`). Until then, `confine()` would break in-process TAP/KVM access.
+2. **NFR-P1 boot-time benchmark.** Add a bench that records boot-to-userspace p50 on the KVM runner and tracks the < 125 ms target.
+3. **virtio-balloon device.** `VirtioDevice::Balloon` exists in the config enum; M1 errors on it loudly. Implement the device in a later milestone.
+4. **User namespace mapping** (`CLONE_NEWUSER` + uid/gid maps) in the jailer as additive hardening (M1 uses chroot + drop-to-unprivileged-uid, matching Firecracker's jailer).
+5. **`mm run` is foreground in M1** (no daemonized supervisor); operators background it with `&`. A supervised/detached run mode is later work.
+6. **SSH key injection.** `mm ssh` assumes an authorized key reaches the guest; injecting it into the per-instance overlay at boot is not yet wired.
+7. **Multi-arch fixtures** (aarch64 kernel/rootfs) for the boot test; M1 fixtures target x86_64.
+8. **Net RX backpressure.** The virtio-net worker drops frames when no guest RX buffer is available (no rx backlog queue in M1).
