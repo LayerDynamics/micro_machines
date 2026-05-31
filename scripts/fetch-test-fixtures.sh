@@ -18,12 +18,40 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FIXTURES_DIR="${REPO_ROOT}/crates/mm-vmm/tests/fixtures"
 KERNEL="${FIXTURES_DIR}/vmlinux"
 ROOTFS="${FIXTURES_DIR}/rootfs.ext4"
+
+# --- Architecture selection (x86_64 and aarch64) ---
+# Normalize the host arch, pick the guest serial console for that arch, and the
+# musl target the guest binaries are built for.
 ARCH="$(uname -m)"
+case "${ARCH}" in
+  x86_64 | amd64)
+    ARCH="x86_64"
+    GUEST_CONSOLE="ttyS0"
+    ;;
+  aarch64 | arm64)
+    ARCH="aarch64"
+    GUEST_CONSOLE="ttyAMA0"
+    ;;
+  *)
+    echo "unsupported architecture: ${ARCH} (expected x86_64 or aarch64)" >&2
+    exit 1
+    ;;
+esac
 MUSL_TARGET="${ARCH}-unknown-linux-musl"
 
-# A known-good, publicly hosted test kernel. Override with MM_TEST_KERNEL_URL.
+# The M1 VMM boot protocol (GDT, page tables, long-mode regs) is x86_64-only.
+# aarch64 fixtures are still built so they are ready when aarch64 VMM support
+# lands, but the boot test will not pass on aarch64 until then.
+if [[ "${ARCH}" != "x86_64" ]]; then
+  echo "NOTE: M1 VMM boot is x86_64-only; building ${ARCH} fixtures anyway, but the" >&2
+  echo "      boot integration test will not pass on ${ARCH} yet." >&2
+fi
+
+# A known-good, publicly hosted test kernel for this arch. Override with
+# MM_TEST_KERNEL_URL. The guest console for the arch is exported for the test.
 KERNEL_URL="${MM_TEST_KERNEL_URL:-https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/${ARCH}/kernels/vmlinux.bin}"
 
+echo "arch=${ARCH} musl-target=${MUSL_TARGET} guest-console=${GUEST_CONSOLE}"
 mkdir -p "${FIXTURES_DIR}"
 
 fetch_kernel() {

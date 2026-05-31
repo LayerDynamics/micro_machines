@@ -7,8 +7,17 @@ runner (Task 13), and the CI `kvm-integration` job runs it before the test.
 
 | File           | What it is                                                            |
 |----------------|-----------------------------------------------------------------------|
-| `vmlinux`      | An uncompressed x86_64 Linux kernel ELF with virtio-mmio + 8250 serial built in. |
+| `vmlinux`      | An uncompressed Linux kernel ELF (per host arch) with virtio-mmio + a serial console built in. |
 | `rootfs.ext4`  | A minimal ext4 root image whose `/sbin/ready` (or PID 1) opens the boot vsock, writes one byte (the readiness edge the VMM waits on), then powers off. |
+
+## Architecture
+
+`fetch-test-fixtures.sh` is arch-aware: it selects the kernel, the musl target for
+the guest binaries, and the guest serial console per host arch — `x86_64` →
+`ttyS0`, `aarch64` → `ttyAMA0` (the test picks the matching console via
+`cfg(target_arch)`). **The M1 VMM boot protocol itself is x86_64-only** (GDT, page
+tables, long-mode registers), so `aarch64` fixtures are prepared for when aarch64
+VMM support lands but the boot test will not pass on aarch64 until then.
 
 ## Kernel requirements
 

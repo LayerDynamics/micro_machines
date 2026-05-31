@@ -6,13 +6,20 @@ use std::time::{Duration, Instant};
 
 use mm_vmm::{BlockDevice, Machine, VmConfig};
 
+/// The guest serial console for the build architecture (matches the arch-aware
+/// fixtures built by `scripts/fetch-test-fixtures.sh`).
+#[cfg(target_arch = "aarch64")]
+const GUEST_CONSOLE: &str = "console=ttyAMA0";
+#[cfg(not(target_arch = "aarch64"))]
+const GUEST_CONSOLE: &str = "console=ttyS0";
+
 /// The fixture VM config used by every test/benchmark in this file.
 fn fixture_config() -> VmConfig {
     VmConfig {
         vcpus: 1,
         memory_mib: 128,
         kernel: "tests/fixtures/vmlinux".into(),
-        kernel_cmdline: "console=ttyS0 reboot=k panic=1 mm.workload=/sbin/ready".into(),
+        kernel_cmdline: format!("{GUEST_CONSOLE} reboot=k panic=1 mm.workload=/sbin/ready"),
         rootfs: BlockDevice {
             path: "tests/fixtures/rootfs.ext4".into(),
             read_only: true,
