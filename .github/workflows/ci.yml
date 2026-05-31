@@ -164,6 +164,14 @@ jobs:
           cat /sys/fs/cgroup/cgroup.subtree_control || true
       - name: Build the jail integration test
         run: cargo test -p mm --test jail_kvm --no-run
+      # DIAG(jail-einval): bisect the jailed-boot EINVAL. This run skips
+      # confinement + seccomp, so a clean boot here proves the fault is in
+      # `confine`; combined with the start() step-markers it pinpoints the call.
+      - name: Diagnostic — jailed boot WITHOUT confinement (bisect)
+        continue-on-error: true
+        run: |
+          sudo -E env "PATH=$PATH" MM_JAIL_SKIP_CONFINE=1 \
+            cargo test -p mm --test jail_kvm -- --ignored --nocapture
       - name: Run the jail integration test as root
         run: |
           sudo -E env "PATH=$PATH" \
