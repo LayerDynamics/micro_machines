@@ -13,6 +13,8 @@ pub use config::{BlockDevice, ConfigError, VirtioDevice, VmConfig};
 #[cfg(target_os = "linux")]
 pub mod boot;
 #[cfg(target_os = "linux")]
+pub mod devices;
+#[cfg(target_os = "linux")]
 mod machine;
 #[cfg(target_os = "linux")]
 mod vcpu;
