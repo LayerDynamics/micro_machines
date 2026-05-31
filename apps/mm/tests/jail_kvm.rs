@@ -1,0 +1,186 @@
+//! End-to-end: drive the real `mm __vmm-worker` re-exec the way `mm run` does and
+//! confirm a **fully jailed** microVM boots to userspace (SPEC-1 FR-27).
+//!
+//! This is the jailer counterpart to the plain boot test. It exercises the exact
+//! production confinement path — cgroup v2 limits, mount/pid/net namespaces,
+//! chroot into a per-VM root, `no_new_privs`, drop to an unprivileged uid/gid, and
+//! a per-thread seccomp allowlist — and only then boots guest code using an
+//! inherited `/dev/kvm` fd (the confined process cannot open it itself). The
+//! worker exits 0 *only if* the jailed guest signalled readiness over vsock, so a
+//! clean exit is proof the whole jailed path works end to end.
+//!
+//! No net device is configured: the jail is tested in isolation, so the worker
+//! needs only the inherited KVM fd (the TAP fd is unused, passed as -1).
+//!
+//! Requires /dev/kvm, the fixtures (see crates/mm-vmm/tests/fixtures/README.md),
+//! AND root — the jailer's cgroup writes, `unshare`, `chroot`, and uid-drop all
+//! need privilege. The CI `jail-integration` job runs it under `sudo`. It is
+//! `#[ignore]`d so a normal `cargo test` never confines anything.
+#![cfg(target_os = "linux")]
+
+use std::fs;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use mm_vmm::{BlockDevice, VmConfig};
+
+// Must match the worker spawn contract in apps/mm/src/commands/run.rs.
+const WORKER_KVM_FD: i32 = 10;
+const WORKER_UID: u32 = 65534; // nobody
+const WORKER_GID: u32 = 65534; // nogroup
+
+#[cfg(target_arch = "aarch64")]
+const GUEST_CONSOLE: &str = "console=ttyAMA0";
+#[cfg(not(target_arch = "aarch64"))]
+const GUEST_CONSOLE: &str = "console=ttyS0";
+
+/// Repository root, derived from this crate's manifest dir (apps/mm).
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("canonicalize repo root")
+}
+
+/// Recursively copy world-readable so the dropped-to uid can read the fixtures.
+fn copy_readable(src: &Path, dst: &Path) {
+    fs::copy(src, dst)
+        .unwrap_or_else(|e| panic!("copy {} -> {}: {e}", src.display(), dst.display()));
+    let mut perms = fs::metadata(dst).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o644);
+    fs::set_permissions(dst, perms).unwrap();
+}
+
+#[test]
+#[ignore = "requires /dev/kvm, fixtures, and root (jailer chroot/cgroup/uid-drop)"]
+fn jailed_worker_boots_to_userspace() {
+    let root = repo_root();
+    let fixtures = root.join("crates/mm-vmm/tests/fixtures");
+    let kernel_src = fixtures.join("vmlinux");
+    let rootfs_src = fixtures.join("rootfs.ext4");
+    assert!(
+        kernel_src.exists() && rootfs_src.exists(),
+        "missing fixtures — run scripts/fetch-test-fixtures.sh first"
+    );
+
+    // Per-VM chroot the worker pivots into. The kernel + rootfs must live at the
+    // paths the config names, since the VMM loads them *after* chroot.
+    let work = std::env::temp_dir().join(format!("mm-jail-test-{}", std::process::id()));
+    let jail = work.join("root");
+    fs::create_dir_all(&jail).expect("create jail root");
+    copy_readable(&kernel_src, &jail.join("vmlinux"));
+    copy_readable(&rootfs_src, &jail.join("rootfs.ext4"));
+
+    // Config names in-chroot paths and no net device. The fixture /init runs
+    // /sbin/ready, which signals readiness over vsock then powers off.
+    let cfg = VmConfig {
+        vcpus: 1,
+        memory_mib: 128,
+        kernel: "/vmlinux".into(),
+        kernel_cmdline: format!(
+            "{GUEST_CONSOLE} root=/dev/vda ro init=/init reboot=k panic=1 mm.workload=/sbin/ready"
+        ),
+        rootfs: BlockDevice {
+            path: "/rootfs.ext4".into(),
+            read_only: true,
+        },
+        devices: vec![],
+    };
+    cfg.validate().unwrap();
+    // The worker reads the config *before* chroot, so it lives outside the jail.
+    let cfg_path = work.join("worker-config.json");
+    fs::write(&cfg_path, serde_json::to_vec(&cfg).unwrap()).expect("write worker config");
+
+    // Open /dev/kvm without CLOEXEC and hand it to the worker at fd 10, exactly as
+    // `mm run` does — the confined worker cannot open /dev/kvm after uid-drop.
+    let kvm_fd = open_kvm_inheritable();
+
+    let cgroup = format!("mm-jail-test-{}", std::process::id());
+    let mm_bin = env!("CARGO_BIN_EXE_mm");
+    let mut cmd = Command::new(mm_bin);
+    cmd.arg("__vmm-worker")
+        .arg("--config")
+        .arg(&cfg_path)
+        .arg("--kvm-fd")
+        .arg(WORKER_KVM_FD.to_string())
+        // No TAP: `=-1` form so clap does not treat -1 as a flag. The worker never
+        // consumes it because the config has no net device.
+        .arg("--tap-fd=-1")
+        .arg("--chroot")
+        .arg(&jail)
+        .arg("--uid")
+        .arg(WORKER_UID.to_string())
+        .arg("--gid")
+        .arg(WORKER_GID.to_string())
+        .arg("--cgroup")
+        .arg(&cgroup)
+        .arg("--cpu-max")
+        .arg("max")
+        .arg("--mem-max")
+        .arg((512u64 * 1024 * 1024).to_string());
+    // Firecracker-style jail: drop to an unprivileged uid under real root. We do
+    // not request --user-namespace here so the test does not depend on the runner
+    // permitting unprivileged user namespaces.
+
+    // SAFETY: pre_exec runs in the forked child before exec; dup2 is
+    // async-signal-safe and clears CLOEXEC on fd 10 so it survives exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(kvm_fd, WORKER_KVM_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = cmd.spawn().expect("spawn mm __vmm-worker");
+    // SAFETY: kvm_fd is our copy; the child inherited its own dup at fd 10.
+    unsafe { libc::close(kvm_fd) };
+
+    // Wait up to 60s for the jailed worker to boot the guest, observe readiness,
+    // and exit. std has no timed wait, so poll.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll worker") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            cleanup(&work, &cgroup);
+            panic!("jailed worker did not exit within 60s (guest never signalled readiness)");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    cleanup(&work, &cgroup);
+
+    assert!(
+        status.success(),
+        "jailed worker exited unsuccessfully: code={:?} signal={:?}",
+        status.code(),
+        status.signal()
+    );
+}
+
+/// Open `/dev/kvm` read-write without CLOEXEC (mirrors run.rs::open_kvm_inheritable).
+fn open_kvm_inheritable() -> i32 {
+    let path = std::ffi::CString::new("/dev/kvm").unwrap();
+    // SAFETY: path is a valid C string; result is checked.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
+    assert!(
+        fd >= 0,
+        "open /dev/kvm: {}",
+        std::io::Error::last_os_error()
+    );
+    fd
+}
+
+/// Best-effort teardown: remove the work dir and the (now-empty) cgroup.
+fn cleanup(work: &Path, cgroup: &str) {
+    let _ = fs::remove_dir_all(work);
+    let _ = fs::remove_dir(Path::new("/sys/fs/cgroup").join(cgroup));
+}

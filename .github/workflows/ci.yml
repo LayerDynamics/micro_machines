@@ -125,6 +125,50 @@ jobs:
             cargo test -p mm-vmm --features kvm-integration --test net_kvm \
             -- --ignored --nocapture
 
+  # Real jailer integration test (FR-27). Drives `mm __vmm-worker` the way
+  # `mm run` does and confirms a fully confined microVM (cgroup v2 + mount/pid/net
+  # namespaces + chroot + no_new_privs + uid-drop + seccomp) boots to userspace
+  # using only an inherited /dev/kvm fd. Needs root for the jailer's privileged
+  # setup, so the test binary runs under sudo.
+  jail-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: x86_64-unknown-linux-musl }
+      - uses: Swatinem/rust-cache@v2
+      - name: Enable /dev/kvm access for the runner user
+        run: |
+          set -euo pipefail
+          sudo modprobe kvm || true
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+      - name: Install fixture build tools (musl linker + mke2fs)
+        run: sudo apt-get update && sudo apt-get install -y musl-tools e2fsprogs
+      - name: Fetch test fixtures (kernel + rootfs)
+        run: ./scripts/fetch-test-fixtures.sh
+      - name: Enable cgroup v2 cpu+memory controllers
+        run: |
+          # The jailer creates a leaf cgroup and writes cpu.max/memory.max; those
+          # files only exist if the controllers are delegated into the cgroup tree.
+          # A privileged `mm` install would ensure this; here we do it explicitly
+          # and report the before/after so a cgroup failure is self-diagnosing.
+          set -x
+          cat /sys/fs/cgroup/cgroup.controllers || true
+          cat /sys/fs/cgroup/cgroup.subtree_control || true
+          echo "+cpu +memory" | sudo tee /sys/fs/cgroup/cgroup.subtree_control || true
+          cat /sys/fs/cgroup/cgroup.subtree_control || true
+      - name: Build the jail integration test
+        run: cargo test -p mm --test jail_kvm --no-run
+      - name: Run the jail integration test as root
+        run: |
+          sudo -E env "PATH=$PATH" \
+            cargo test -p mm --test jail_kvm -- --ignored --nocapture
+
   # Preflight for the upcoming net + jail runtime tests: confirms the hosted
   # runner allows passwordless sudo and host bridge/TAP creation (host<->guest
   # over a bridge is all the net test needs; NAT egress is not required). Pure
