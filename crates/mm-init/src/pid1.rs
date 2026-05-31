@@ -20,11 +20,8 @@ use crate::cmdline::{InitConfig, Mode};
 pub fn run_pid1() -> ExitCode {
     install_panic_hook();
 
-    if let Err(e) = mount_core_filesystems() {
-        // No /proc guarantees yet, but the kernel console is wired to our stderr.
-        eprintln!("mm-init: mounting core filesystems failed: {e}");
-        poweroff();
-    }
+    // Best-effort; individual mount failures are logged, not fatal.
+    mount_core_filesystems();
 
     if let Err(e) = bring_up_loopback() {
         // Loopback failure is not fatal for every workload; record and continue.
@@ -104,7 +101,11 @@ struct CoreMount {
 /// `/dev`, `/run`, `/tmp`, and the unified cgroup2 hierarchy). `/proc` is mounted
 /// first so the subsequent cmdline read works; `/sys` precedes cgroup2 because
 /// the latter lives under `/sys/fs/cgroup`.
-fn mount_core_filesystems() -> nix::Result<()> {
+///
+/// Individual mounts are best-effort: a filesystem the kernel already mounted
+/// (e.g. `devtmpfs` on `/dev` via `CONFIG_DEVTMPFS_MOUNT`) returns `EBUSY`, which
+/// is not an error, and a single failure must not abort the whole boot.
+fn mount_core_filesystems() {
     let nodev_noexec_nosuid = MsFlags::MS_NODEV | MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID;
     let mounts = [
         CoreMount {
@@ -149,15 +150,21 @@ fn mount_core_filesystems() -> nix::Result<()> {
         // The mount point may be absent on a minimal OCI-derived rootfs; create
         // it (ignoring "already exists") before mounting.
         let _ = std::fs::create_dir_all(m.target);
-        mount(
+        match mount(
             Some(m.source),
             m.target,
             Some(m.fstype),
             m.flags,
             None::<&str>,
-        )?;
+        ) {
+            Ok(()) => {}
+            // Already mounted by the kernel (e.g. devtmpfs on /dev) — fine.
+            Err(nix::errno::Errno::EBUSY) => {}
+            Err(e) => {
+                eprintln!("mm-init: mounting {} on {} failed: {e}", m.fstype, m.target);
+            }
+        }
     }
-    Ok(())
 }
 
 /// Bring the loopback interface up via `SIOCSIFFLAGS`. We use a raw ioctl rather
