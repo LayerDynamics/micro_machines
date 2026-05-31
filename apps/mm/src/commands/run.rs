@@ -22,6 +22,10 @@ pub struct RunArgs {
     /// Boot into an SSH-reachable sandbox shell rather than the image workload.
     #[arg(long)]
     pub ssh: bool,
+    /// Run the microVM in the background (its own session) and return immediately,
+    /// capturing the guest console to a per-VM log, instead of staying foreground.
+    #[arg(long, short = 'd')]
+    pub detach: bool,
 }
 
 /// The guest netmask for the MicroMachines `/24` (used when building the cmdline).
@@ -111,7 +115,7 @@ mod linux {
     use std::os::unix::io::RawFd;
     use std::os::unix::process::CommandExt;
     use std::path::Path;
-    use std::process::{Child, Command};
+    use std::process::{Child, Command, Stdio};
 
     use anyhow::{Context, Result};
     use mm_api_types::{ObjectMeta, State};
@@ -221,6 +225,7 @@ mod linux {
         let cgroup = format!("micro_machines/{name}");
         let cpu_max = format!("{} 100000", u64::from(args.cpus) * 100_000);
         let mem_max = args.memory * 1024 * 1024;
+        let log_path = jail.join("console.log");
         let mut child = spawn_worker(
             &cfg_path,
             kvm_fd,
@@ -229,6 +234,8 @@ mod linux {
             &cgroup,
             &cpu_max,
             mem_max,
+            args.detach,
+            &log_path,
         )?;
 
         // 8. Record as running and report.
@@ -251,6 +258,12 @@ mod linux {
         unsafe { libc::close(kvm_fd) };
         drop(tap);
 
+        if args.detach {
+            // The worker runs in its own session; leave it running and return.
+            println!("detached; guest console -> {}", log_path.display());
+            return Ok(());
+        }
+
         // 9. Foreground: wait for the worker, then mark stopped.
         let status = child.wait().context("waiting for the VMM worker")?;
         if !status.success() {
@@ -264,7 +277,9 @@ mod linux {
     }
 
     /// Spawn `mm __vmm-worker`, dup'ing the KVM + TAP fds to fixed numbers in the
-    /// child so they survive `exec` at predictable descriptors.
+    /// child so they survive `exec` at predictable descriptors. When `detach` is
+    /// set, the worker is put in its own session (`setsid`) and its console is
+    /// redirected to `log_path`, so it outlives the parent and the terminal.
     #[allow(clippy::too_many_arguments)]
     fn spawn_worker(
         config: &Path,
@@ -274,6 +289,8 @@ mod linux {
         cgroup: &str,
         cpu_max: &str,
         mem_max: u64,
+        detach: bool,
+        log_path: &Path,
     ) -> Result<Child> {
         let exe = std::env::current_exe().context("locating current executable")?;
         let mut cmd = Command::new(exe);
@@ -302,14 +319,32 @@ mod linux {
             cmd.arg("--user-namespace");
         }
 
-        // SAFETY: `pre_exec` runs in the forked child before `exec`; `dup2` is
-        // async-signal-safe and clears CLOEXEC on the target, so 10/11 survive exec.
+        // Detached: capture the guest console to a log and detach from stdin so the
+        // worker does not depend on the parent's terminal.
+        if detach {
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path)
+                .with_context(|| format!("opening console log {}", log_path.display()))?;
+            let log_err = log.try_clone().context("cloning console log handle")?;
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::from(log))
+                .stderr(Stdio::from(log_err));
+        }
+
+        // SAFETY: `pre_exec` runs in the forked child before `exec`; `dup2` and
+        // `setsid` are async-signal-safe; `dup2` clears CLOEXEC on the target so
+        // 10/11 survive exec.
         unsafe {
             cmd.pre_exec(move || {
                 if libc::dup2(kvm_fd, WORKER_KVM_FD) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 if libc::dup2(tap_fd, WORKER_TAP_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if detach && libc::setsid() < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
