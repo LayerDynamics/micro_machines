@@ -7,10 +7,11 @@
 //! 1. **cgroup v2 limits** — create a per-VM cgroup, cap `cpu.max` and
 //!    `memory.max`, and move the process into it (done first, while still real
 //!    root, since writing the cgroup tree needs privilege).
-//! 2. **namespaces** — `CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET` isolate mounts,
-//!    the PID space, and networking. (Like Firecracker's jailer we drop to an
-//!    unprivileged uid rather than entering a user namespace; user-namespace
-//!    mapping is additive hardening for a later milestone.)
+//! 2. **namespaces** — `CLONE_NEWNS | CLONE_NEWPID` isolate mounts and the PID
+//!    space. We do *not* unshare a network namespace: the VMM owns a host TAP via an
+//!    inherited fd, and a tun/tap queue cannot follow its owner into a new netns
+//!    (it would detach and the guest would lose host connectivity). The worker
+//!    cannot originate traffic anyway — seccomp denies `socket`/`connect`.
 //! 3. **fork into the PID namespace** — `unshare(CLONE_NEWPID)` does not move the
 //!    caller into the new namespace, only its children. As a side effect the
 //!    caller can no longer create threads (the kernel rejects `CLONE_THREAD` with
@@ -241,10 +242,18 @@ fn controller_ancestors(root: &Path, leaf: &Path) -> Vec<PathBuf> {
     ancestors
 }
 
-/// Unshare the mount, PID, and network namespaces.
+/// Unshare the mount and PID namespaces.
+///
+/// We deliberately do **not** unshare a network namespace. The VMM owns a host TAP
+/// (opened by the privileged parent and inherited as an fd); a tun/tap queue cannot
+/// survive its owner moving into a new netns, so `CLONE_NEWNET` here silently
+/// detaches the TAP — the device loses carrier and the guest becomes unreachable
+/// from the host. The worker has no legitimate use for the network anyway: the
+/// seccomp filter denies `socket`/`connect`, so it cannot originate any traffic of
+/// its own. (The Firecracker-style alternative — create the TAP *inside* the
+/// worker's netns — is heavier and a candidate for a later hardening pass.)
 fn enter_namespaces() -> Result<(), JailerError> {
-    unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNET)
-        .map_err(JailerError::Namespace)
+    unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID).map_err(JailerError::Namespace)
 }
 
 /// Fork so the VMM runs as PID 1 of the freshly unshared PID namespace.

@@ -67,22 +67,6 @@ fn mm_ssh_reaches_the_guest() {
         String::from_utf8_lossy(&launch.stderr),
     );
 
-    // DIAG(ssh-netns): the jailed worker enters a new netns; the host tap/bridge
-    // came up DOWN. Force them up and capture carrier state to tell "admin-down"
-    // (re-up fixes it) from "queue detached by the worker's netns" (carrier stays
-    // off even after `up`).
-    std::thread::sleep(Duration::from_secs(8));
-    let probe = Command::new("sh")
-        .args([
-            "-c",
-            "ip link set mm-ssh-test up; ip link set mm-br0 up; \
-             echo '== after force-up =='; ip -d link show mm-ssh-test; ip -br addr",
-        ])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    eprintln!("netns probe:\n{probe}");
-
     // Poll `mm ssh` until the guest has booted and dropbear is serving (host-key
     // generation on first connect can take a moment).
     let deadline = Instant::now() + Duration::from_secs(90);
