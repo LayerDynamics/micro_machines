@@ -89,7 +89,10 @@ jobs:
       - name: Fetch test fixtures (kernel + rootfs)
         run: ./scripts/fetch-test-fixtures.sh
       - name: Run KVM boot integration test
-        run: cargo test -p mm-vmm --features kvm-integration -- --ignored --nocapture
+        # Scope to the boot test file: this job runs as the unprivileged runner
+        # user. The net test (tests/net_kvm.rs) needs root to create a bridge/TAP
+        # and runs in the dedicated `net-integration` job instead.
+        run: cargo test -p mm-vmm --features kvm-integration --test boot_kvm -- --ignored --nocapture
 
   # Real virtio-net integration test (FR-10/11). Boots a microVM with a net
   # device on a host bridge and asserts a guest-originated UDP datagram reaches a
@@ -164,14 +167,6 @@ jobs:
           cat /sys/fs/cgroup/cgroup.subtree_control || true
       - name: Build the jail integration test
         run: cargo test -p mm --test jail_kvm --no-run
-      # DIAG(jail-einval): bisect the jailed-boot EINVAL. This run skips
-      # confinement + seccomp, so a clean boot here proves the fault is in
-      # `confine`; combined with the start() step-markers it pinpoints the call.
-      - name: Diagnostic — jailed boot WITHOUT confinement (bisect)
-        continue-on-error: true
-        run: |
-          sudo -E env "PATH=$PATH" MM_JAIL_SKIP_CONFINE=1 \
-            cargo test -p mm --test jail_kvm -- --ignored --nocapture
       - name: Run the jail integration test as root
         run: |
           sudo -E env "PATH=$PATH" \

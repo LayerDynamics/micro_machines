@@ -255,9 +255,7 @@ impl Machine {
         let mut next_gsi = FIRST_VIRTIO_GSI;
 
         // Serial console on COM1 (always present so `console=ttyS0` works).
-        eprintln!("mm-vmm: start: serial eventfd"); // DIAG(jail-einval): remove
         let serial_irq = EventFd::new(libc::EFD_NONBLOCK).map_err(VmmError::Io)?;
-        eprintln!("mm-vmm: start: serial irqfd"); // DIAG(jail-einval): remove
         self.vm.register_irqfd(&serial_irq, COM1_IRQ)?;
         // Wrap stdout so every guest console byte is flushed immediately — block
         // buffering (stdout -> pipe) otherwise swallows early kernel messages.
@@ -268,10 +266,6 @@ impl Machine {
         bus.set_serial(serial);
 
         // Rootfs block device (always present).
-        eprintln!(
-            "mm-vmm: start: block open {}",
-            self.config.rootfs.path.display()
-        ); // DIAG(jail-einval): remove
         let block = Block::new(&self.config.rootfs.path, self.config.rootfs.read_only)?;
         self.attach_virtio(
             &mut bus,
@@ -282,7 +276,6 @@ impl Machine {
         )?;
 
         // Boot vsock channel (always present): carries the guest "ready" signal.
-        eprintln!("mm-vmm: start: vsock new"); // DIAG(jail-einval): remove
         let vsock = Vsock::new(DEFAULT_GUEST_CID)?;
         self.ready = Some(vsock.ready_signal());
         self.attach_virtio(
@@ -341,10 +334,6 @@ impl Machine {
             .memory_mib
             .checked_mul(1 << 20)
             .ok_or_else(|| VmmError::Memory("memory size overflow".to_string()))?;
-        eprintln!(
-            "mm-vmm: start: kernel load {}",
-            self.config.kernel.display()
-        ); // DIAG(jail-einval): remove
         let kernel_boot = crate::boot::load_and_configure(
             &self.guest_memory,
             &self.config.kernel,
@@ -362,7 +351,6 @@ impl Machine {
         }
 
         // Hand the bus to the vCPU threads and start them.
-        eprintln!("mm-vmm: start: spawn vcpu threads"); // DIAG(jail-einval): remove
         let bus = Arc::new(bus);
         self.bus = Some(bus.clone());
         let dispatch: Arc<dyn IoDispatch> = bus;

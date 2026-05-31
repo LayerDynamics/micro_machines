@@ -89,33 +89,23 @@ mod linux {
             },
             user_namespace: args.user_namespace,
         };
-        // DIAG(jail-einval): MM_JAIL_SKIP_CONFINE bisects a jailed-boot failure —
-        // when set, skip confinement *and* seccomp so the bare inherited-fd boot
-        // path runs unconfined. If it then boots, the fault is in `confine`.
-        let skip_confine = std::env::var_os("MM_JAIL_SKIP_CONFINE").is_some();
-        if skip_confine {
-            tracing::warn!("MM_JAIL_SKIP_CONFINE set — booting WITHOUT confinement (diagnostic)");
-        } else {
-            mm_sandbox::confine(&spec).context("confining the VMM process")?;
-        }
+        mm_sandbox::confine(&spec).context("confining the VMM process")?;
 
         // Install the seccomp allowlist on each vCPU thread before it runs guest
         // code. PR_SET_NO_NEW_PRIVS was set by `confine`, so this works post-drop.
         let rules = Arc::new(mm_sandbox::vmm_thread_rules());
-        let hook: Option<VcpuHook> = if skip_confine {
-            None
-        } else {
+        let hook: VcpuHook = {
             let rules = rules.clone();
-            Some(Arc::new(move |_idx| {
+            Arc::new(move |_idx| {
                 rules
                     .apply_to_current_thread()
                     .map_err(|e| VmmError::Device(format!("seccomp install failed: {e}")))
-            }))
+            })
         };
 
         // Boot using the inherited KVM + TAP fds (the confined process cannot open
         // them itself).
-        let mut machine = Machine::boot_jailed(&config, args.kvm_fd, vec![args.tap_fd], hook)
+        let mut machine = Machine::boot_jailed(&config, args.kvm_fd, vec![args.tap_fd], Some(hook))
             .context("booting jailed microVM")?;
         let ready = machine
             .wait_for_ready(Duration::from_secs(10))
