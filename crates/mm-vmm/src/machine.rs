@@ -39,6 +39,11 @@ const FIRST_VIRTIO_GSI: u32 = 5;
 /// The default guest context id for the boot vsock channel.
 const DEFAULT_GUEST_CID: u64 = 3;
 
+/// KVM identity-map page and TSS region (3 pages), in the MMIO hole below 4 GiB
+/// (the canonical Firecracker addresses).
+const IDENTITY_MAP_ADDR: u64 = 0xfffb_c000;
+const TSS_ADDR: u64 = 0xfffb_d000;
+
 /// Errors from VMM setup and the run loop (SPEC-1 §3.2).
 #[derive(Debug, thiserror::Error)]
 pub enum VmmError {
@@ -123,6 +128,14 @@ impl Machine {
         config.validate()?;
 
         let vm = kvm.create_vm()?;
+
+        // On Intel hosts (including the nested KVM on CI runners, where
+        // unrestricted_guest may be off) KVM_RUN requires a TSS region and an
+        // identity-map page to be set before vCPUs are created — otherwise entry
+        // into the guest fails outright. Place them in the MMIO hole just below
+        // 4 GiB, clear of guest RAM. These are x86 ioctls (this VMM is x86_64-only).
+        vm.set_identity_map_address(IDENTITY_MAP_ADDR)?;
+        vm.set_tss_address(TSS_ADDR as usize)?;
 
         let guest_memory = Self::allocate_guest_memory(config.memory_mib)?;
         Self::register_memory(&vm, &guest_memory)?;

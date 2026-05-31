@@ -9,7 +9,9 @@
 //! layout below follow the standard PC/Linux boot conventions.
 use std::sync::Arc;
 
-use kvm_bindings::{kvm_regs, kvm_segment, kvm_sregs, CpuId, KVM_MAX_CPUID_ENTRIES};
+use kvm_bindings::{
+    kvm_fpu, kvm_msr_entry, kvm_regs, kvm_segment, kvm_sregs, CpuId, Msrs, KVM_MAX_CPUID_ENTRIES,
+};
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
@@ -34,6 +36,19 @@ const EFER_LMA: u64 = 0x400;
 // --- Page-table entry flags. ---
 const PTE_PRESENT_RW: u64 = 0x3; // present + writable
 const PDE_PRESENT_RW_PS: u64 = 0x83; // present + writable + 2 MiB page
+
+// --- Boot MSR indices (set to a clean initial state before the kernel runs). ---
+const MSR_IA32_SYSENTER_CS: u32 = 0x0000_0174;
+const MSR_IA32_SYSENTER_ESP: u32 = 0x0000_0175;
+const MSR_IA32_SYSENTER_EIP: u32 = 0x0000_0176;
+const MSR_IA32_TSC: u32 = 0x0000_0010;
+const MSR_IA32_MISC_ENABLE: u32 = 0x0000_01a0;
+const MSR_IA32_MISC_ENABLE_FAST_STRING: u64 = 0x1;
+const MSR_STAR: u32 = 0xc000_0081;
+const MSR_LSTAR: u32 = 0xc000_0082;
+const MSR_CSTAR: u32 = 0xc000_0083;
+const MSR_SYSCALL_MASK: u32 = 0xc000_0084;
+const MSR_KERNEL_GS_BASE: u32 = 0xc000_0102;
 
 /// How a vCPU run loop ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +97,27 @@ impl Vcpu {
         setup_page_tables(guest_memory, &mut sregs)?;
         self.fd.set_sregs(&sregs)?;
 
-        let mut regs = kvm_regs {
+        // A clean FPU state (default control words) so the kernel does not inherit
+        // garbage x87/SSE state.
+        let fpu = kvm_fpu {
+            fcw: 0x37f,
+            mxcsr: 0x1f80,
+            ..Default::default()
+        };
+        self.fd.set_fpu(&fpu)?;
+
+        // Boot MSRs the kernel expects to be initialized (SYSENTER/SYSCALL targets
+        // zeroed, TSC zeroed, fast-string copies enabled).
+        let msrs = boot_msrs()?;
+        let written = self.fd.set_msrs(&msrs)?;
+        if written != msrs.as_slice().len() {
+            return Err(VmmError::Vcpu(format!(
+                "set_msrs wrote {written}/{} entries",
+                msrs.as_slice().len()
+            )));
+        }
+
+        let regs = kvm_regs {
             // Bit 1 of RFLAGS is reserved and must be set.
             rflags: 0x0000_0000_0000_0002,
             rip: entry_point.raw_value(),
@@ -91,8 +126,6 @@ impl Vcpu {
             rsi: boot_params_addr.raw_value(),
             ..Default::default()
         };
-        // Silence "unused mut" on toolchains that see the struct-update as final.
-        regs.rax = 0;
         self.fd.set_regs(&regs)?;
         Ok(())
     }
@@ -105,7 +138,20 @@ impl Vcpu {
             // exits (None = keep running). Folding to owned data here ends the
             // `&mut self.fd` borrow the `VcpuExit` holds, so we can read registers
             // afterwards for the fault diagnostic.
-            let terminal: Option<(bool, String)> = match self.fd.run()? {
+            // Surface a KVM_RUN failure (e.g. invalid entry state) instead of
+            // letting `?` drop it silently into the thread result.
+            let exit = match self.fd.run() {
+                Ok(exit) => exit,
+                Err(e) => {
+                    let rip = self.fd.get_regs().map(|r| r.rip).unwrap_or(0);
+                    eprintln!(
+                        "mm-vmm: vcpu {} KVM_RUN failed at rip=0x{rip:x}: {e}",
+                        self.index
+                    );
+                    return Err(VmmError::Kvm(e));
+                }
+            };
+            let terminal: Option<(bool, String)> = match exit {
                 VcpuExit::IoIn(port, data) => {
                     dispatch.pio_read(port, data);
                     None
@@ -140,6 +186,29 @@ impl Vcpu {
             }
         }
     }
+}
+
+/// Build the boot MSR set: SYSENTER/SYSCALL targets and TSC zeroed, fast-string
+/// string copies enabled.
+fn boot_msrs() -> Result<Msrs> {
+    let entry = |index: u32, data: u64| kvm_msr_entry {
+        index,
+        data,
+        ..Default::default()
+    };
+    let entries = [
+        entry(MSR_IA32_SYSENTER_CS, 0),
+        entry(MSR_IA32_SYSENTER_ESP, 0),
+        entry(MSR_IA32_SYSENTER_EIP, 0),
+        entry(MSR_STAR, 0),
+        entry(MSR_CSTAR, 0),
+        entry(MSR_LSTAR, 0),
+        entry(MSR_KERNEL_GS_BASE, 0),
+        entry(MSR_SYSCALL_MASK, 0),
+        entry(MSR_IA32_TSC, 0),
+        entry(MSR_IA32_MISC_ENABLE, MSR_IA32_MISC_ENABLE_FAST_STRING),
+    ];
+    Msrs::from_entries(&entries).map_err(|e| VmmError::Vcpu(format!("building boot MSRs: {e:?}")))
 }
 
 /// Patch the supported CPUID: write this vCPU's local APIC id into leaf 1 EBX
