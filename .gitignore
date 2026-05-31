@@ -1,0 +1,25 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Node
+node_modules/
+dist/
+.pnpm-store/
+*.tsbuildinfo
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# MicroMachines build artifacts / VM images
+/vms/*.img
+/vms/*.elf
+/data/*.db
+*.log
+
+# Reference-only upstreams: inspiration/context, never imported or committed
+/development/reference_only/
