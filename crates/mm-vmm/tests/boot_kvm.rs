@@ -22,7 +22,7 @@ fn fixture_config() -> VmConfig {
         // root=/dev/vda: the rootfs block device is the first virtio-mmio device.
         // init=/init: mm-init is installed as /init in the fixture rootfs.
         kernel_cmdline: format!(
-            "{GUEST_CONSOLE} root=/dev/vda ro init=/init reboot=k panic=1 {} initcall_debug mm.workload=/sbin/ready",
+            "{GUEST_CONSOLE} root=/dev/vda ro init=/init reboot=k panic=1 {} initcall_debug ignore_loglevel mm.workload=/sbin/ready",
             mm_vmm::FAST_BOOT_ARGS,
         ),
         rootfs: BlockDevice {
