@@ -1,0 +1,13 @@
+[package]
+name = "mm-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true }
+seccompiler = { workspace = true }
+libc = { workspace = true }

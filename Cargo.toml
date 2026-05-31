@@ -5,6 +5,7 @@ members = [
     "crates/mm-vmm",
     "crates/mm-net",
     "crates/mm-init",
+    "crates/mm-sandbox",
 ]
 
 [workspace.package]
