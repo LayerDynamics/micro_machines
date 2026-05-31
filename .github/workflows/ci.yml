@@ -217,6 +217,23 @@ jobs:
           sudo -E env "PATH=$PATH" \
             cargo test -p mm --test run_oci_kvm -- --ignored --nocapture
 
+  # Confirm the static dropbear sshd (injected into guest rootfs images for FR-12)
+  # builds and is statically linked, so it runs in any guest userland.
+  ssh-build-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools file
+      - name: Build static dropbear
+        run: ./scripts/build-dropbear.sh /tmp/dropbear
+      - name: Verify it is a static binary
+        run: |
+          set -euo pipefail
+          file /tmp/dropbear
+          file /tmp/dropbear | grep -q "statically linked"
+          /tmp/dropbear -V 2>&1 | head -1 || true
+
   # Preflight for the upcoming net + jail runtime tests: confirms the hosted
   # runner allows passwordless sudo and host bridge/TAP creation (host<->guest
   # over a bridge is all the net test needs; NAT egress is not required). Pure
