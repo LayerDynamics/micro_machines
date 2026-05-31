@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/mm-api-types",
     "crates/mm-vmm",
+    "crates/mm-net",
 ]
 
 [workspace.package]
