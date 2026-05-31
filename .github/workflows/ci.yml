@@ -27,12 +27,26 @@ jobs:
       - run: pnpm -r typecheck
       - run: pnpm -r test
 
-  # KVM-gated integration tests (added by M1). Runs only where /dev/kvm exists.
-  kvm-integration:
+  # KVM capability preflight: reports whether this runner can host microVMs.
+  # GitHub-hosted runners do not expose nested KVM, so the job records capability
+  # without failing the build; a self-hosted/KVM-enabled runner exercises the
+  # real host-virtualization path. M1 extends this job with mm-vmm integration
+  # tests once that crate exists.
+  kvm-preflight:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check KVM availability
+      - name: Probe KVM capability
         run: |
-          if [ -e /dev/kvm ]; then echo "kvm=present"; else echo "kvm=absent (GitHub-hosted runners lack nested KVM; M1 wires a self-hosted/KVM-enabled runner)"; fi
-      # M1 Task: add `cargo test -p mm-vmm --features kvm-integration -- --ignored` here.
+          set -euo pipefail
+          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "kvm=available (/dev/kvm is a readable, writable character device)"
+            if grep -Eqm1 'vmx|svm' /proc/cpuinfo; then
+              echo "cpu-virtualization=supported"
+            else
+              echo "cpu-virtualization=not-reported"
+            fi
+          else
+            echo "kvm=unavailable (GitHub-hosted runners do not expose nested KVM)"
+            echo "Host-virtualization integration runs on a self-hosted KVM runner."
+          fi

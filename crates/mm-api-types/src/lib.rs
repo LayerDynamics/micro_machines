@@ -4,8 +4,10 @@
 //! rather than redefining spec/status shapes. Keep it dependency-light.
 #![forbid(unsafe_code)]
 
+mod error;
 mod meta;
 mod state;
 
+pub use error::Error;
 pub use meta::ObjectMeta;
 pub use state::State;
