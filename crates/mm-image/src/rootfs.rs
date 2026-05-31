@@ -84,13 +84,15 @@ impl ImageStore {
         Self { root: root.into() }
     }
 
-    /// Deterministic cache path of the read-only base ext4 image for `digest`:
-    /// `<root>/images/<algo>/<hex>.ext4`.
-    pub fn base_image_path(&self, digest: &Digest) -> PathBuf {
+    /// Deterministic cache path of the read-only base ext4 image for `digest`,
+    /// built with a given `mm-init` (`init_tag`): `<root>/images/<algo>/<hex>.<tag>.ext4`.
+    /// The init tag is part of the key because the base has `mm-init` injected as
+    /// `/init`, so a different init must produce a different cached image.
+    pub fn base_image_path(&self, digest: &Digest, init_tag: &str) -> PathBuf {
         self.root
             .join("images")
             .join(&digest.algorithm)
-            .join(format!("{}.ext4", digest.hex))
+            .join(format!("{}.{init_tag}.ext4", digest.hex))
     }
 
     /// Per-instance overlay paths under `<root>/instances/<instance_id>/`.
@@ -103,27 +105,38 @@ impl ImageStore {
         }
     }
 
-    /// Whether the base image for `digest` is already built and cached.
-    pub fn is_base_cached(&self, digest: &Digest) -> bool {
-        self.base_image_path(digest).exists()
+    /// Whether the base image for `digest` built with `init_tag` is already cached.
+    pub fn is_base_cached(&self, digest: &Digest, init_tag: &str) -> bool {
+        self.base_image_path(digest, init_tag).exists()
     }
 
-    /// Build (or reuse the cached) read-only base ext4 image for `image_ref`.
-    /// Returns the path to the ext4 image.
+    /// Build (or reuse the cached) read-only base ext4 image for `image_ref`, with
+    /// `init_binary` (the guest `mm-init`) injected as `/init`. Returns the path to
+    /// the ext4 image.
     ///
     /// Pipeline (all rootless): resolve the manifest digest with `skopeo inspect`,
     /// short-circuit if already cached, otherwise `skopeo copy` into an OCI layout,
-    /// `umoci unpack` to a rootfs bundle, and `mke2fs -d` to populate an ext4 image.
-    pub fn build_base_rootfs(&self, image_ref: &str) -> Result<PathBuf, ImageError> {
+    /// `umoci unpack` to a rootfs bundle, inject `mm-init` as `/init`, and `mke2fs
+    /// -d` to populate an ext4 image. The cache key folds in the init binary's hash
+    /// so changing `mm-init` rebuilds the base.
+    pub fn build_base_rootfs(
+        &self,
+        image_ref: &str,
+        init_binary: &Path,
+    ) -> Result<PathBuf, ImageError> {
         let digest = self.resolve_digest(image_ref)?;
-        let target = self.base_image_path(&digest);
+        let tag = init_tag(init_binary)?;
+        let target = self.base_image_path(&digest, &tag);
         if target.exists() {
             tracing::debug!("base rootfs for {image_ref} already cached at {target:?}");
             return Ok(target);
         }
         create_dir_all(target.parent().expect("base image path has a parent"))?;
 
-        let scratch = self.root.join("build").join(&digest.hex);
+        let scratch = self
+            .root
+            .join("build")
+            .join(format!("{}-{tag}", digest.hex));
         let oci_dir = scratch.join("oci");
         let bundle = scratch.join("bundle");
         // Clean any partial previous attempt.
@@ -150,6 +163,8 @@ impl ImageStore {
         )?;
 
         let rootfs = bundle.join("rootfs");
+        // Inject mm-init as /init so the guest kernel's `init=/init` finds PID 1.
+        inject_init(&rootfs, init_binary)?;
         let size_bytes = ext4_image_size(&rootfs)?;
         // Build into a temp path, then rename for an atomic cache publish.
         let tmp_image = scratch.join("rootfs.ext4");
@@ -214,6 +229,54 @@ impl ImageStore {
         let digest = String::from_utf8_lossy(&output.stdout).trim().to_string();
         Digest::parse(&digest)
     }
+
+    /// The image's default command — `Entrypoint` followed by `Cmd` (Docker/OCI
+    /// semantics) — read from its config via `skopeo inspect --config`. This is the
+    /// argv `mm-init` should exec as the guest workload.
+    pub fn image_argv(&self, image_ref: &str) -> Result<Vec<String>, ImageError> {
+        let output = Command::new("skopeo")
+            .args(["inspect", "--config", &format!("docker://{image_ref}")])
+            .output()
+            .map_err(|_| ImageError::Spawn("skopeo".to_string()))?;
+        if !output.status.success() {
+            return Err(ImageError::Command {
+                cmd: format!("skopeo inspect --config docker://{image_ref}"),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        parse_image_argv(&output.stdout)
+    }
+}
+
+/// Extract the effective argv (`Entrypoint` ++ `Cmd`) from an OCI image config
+/// JSON document. Either field may be absent or null; their concatenation is the
+/// command Docker/OCI would run. An empty result is an error — there is nothing to
+/// exec.
+fn parse_image_argv(config_json: &[u8]) -> Result<Vec<String>, ImageError> {
+    let doc: serde_json::Value =
+        serde_json::from_slice(config_json).map_err(|e| ImageError::Command {
+            cmd: "skopeo inspect --config".to_string(),
+            stderr: format!("parsing image config JSON: {e}"),
+        })?;
+    let as_argv = |v: &serde_json::Value| -> Vec<String> {
+        v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let cfg = &doc["config"];
+    let mut argv = as_argv(&cfg["Entrypoint"]);
+    argv.extend(as_argv(&cfg["Cmd"]));
+    if argv.is_empty() {
+        return Err(ImageError::Command {
+            cmd: "skopeo inspect --config".to_string(),
+            stderr: "image config has no Entrypoint or Cmd (nothing to run)".to_string(),
+        });
+    }
+    Ok(argv)
 }
 
 /// Compute the ext4 image size for a rootfs: its apparent size plus generous
@@ -268,6 +331,35 @@ fn rename(from: &Path, to: &Path) -> Result<(), ImageError> {
     })
 }
 
+/// A short, deterministic content tag for the `mm-init` binary, used to key the
+/// base-image cache. Not cryptographic — only needs to change when the bytes do.
+fn init_tag(init_binary: &Path) -> Result<String, ImageError> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(init_binary).map_err(|source| ImageError::Io {
+        path: init_binary.to_path_buf(),
+        source,
+    })?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Ok(format!("init-{:016x}", hasher.finish()))
+}
+
+/// Copy `init_binary` into the unpacked rootfs as `/init` (0755) so the guest
+/// kernel's `init=/init` boots `mm-init` as PID 1. Overwrites any `/init` the image
+/// shipped — MicroMachines owns PID 1.
+fn inject_init(rootfs: &Path, init_binary: &Path) -> Result<(), ImageError> {
+    use std::os::unix::fs::PermissionsExt;
+    let dst = rootfs.join("init");
+    // Remove any existing /init (e.g. a symlink) so we write a fresh regular file.
+    let _ = std::fs::remove_file(&dst);
+    std::fs::copy(init_binary, &dst).map_err(|source| ImageError::Io {
+        path: dst.clone(),
+        source,
+    })?;
+    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))
+        .map_err(|source| ImageError::Io { path: dst, source })
+}
+
 /// Make a file readable by owner/group/other (0644) so an unprivileged jailed VMM
 /// can open the shared, read-only base image.
 fn set_world_readable(path: &Path) -> Result<(), ImageError> {
@@ -319,9 +411,72 @@ mod tests {
         let store = ImageStore::new("/var/lib/mm");
         let digest = Digest::parse("sha256:deadbeef").unwrap();
         assert_eq!(
-            store.base_image_path(&digest),
-            PathBuf::from("/var/lib/mm/images/sha256/deadbeef.ext4")
+            store.base_image_path(&digest, "init-00000000000000ff"),
+            PathBuf::from("/var/lib/mm/images/sha256/deadbeef.init-00000000000000ff.ext4")
         );
+    }
+
+    #[test]
+    fn parse_argv_concatenates_entrypoint_and_cmd() {
+        let json = br#"{"config":{"Entrypoint":["/docker-entrypoint.sh"],
+            "Cmd":["nginx","-g","daemon off;"]}}"#;
+        assert_eq!(
+            parse_image_argv(json).unwrap(),
+            vec!["/docker-entrypoint.sh", "nginx", "-g", "daemon off;"]
+        );
+    }
+
+    #[test]
+    fn parse_argv_handles_cmd_only_and_entrypoint_only() {
+        let cmd_only = br#"{"config":{"Cmd":["/bin/sh"]}}"#;
+        assert_eq!(parse_image_argv(cmd_only).unwrap(), vec!["/bin/sh"]);
+        let entry_only = br#"{"config":{"Entrypoint":["/app"],"Cmd":null}}"#;
+        assert_eq!(parse_image_argv(entry_only).unwrap(), vec!["/app"]);
+    }
+
+    #[test]
+    fn parse_argv_rejects_empty_command() {
+        let none = br#"{"config":{"Entrypoint":null,"Cmd":null}}"#;
+        assert!(parse_image_argv(none).is_err(), "no command to run");
+    }
+
+    #[test]
+    fn inject_init_writes_executable_init() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("mm-inject-{}", std::process::id()));
+        let rootfs = tmp.join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let src = tmp.join("mm-init");
+        std::fs::write(&src, b"\x7fELF-fake-init").unwrap();
+
+        inject_init(&rootfs, &src).unwrap();
+
+        let init = rootfs.join("init");
+        assert_eq!(std::fs::read(&init).unwrap(), b"\x7fELF-fake-init");
+        let mode = std::fs::metadata(&init).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "/init must be executable");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn init_tag_is_deterministic_and_content_sensitive() {
+        let tmp = std::env::temp_dir().join(format!("mm-tag-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let a = tmp.join("a");
+        let b = tmp.join("b");
+        std::fs::write(&a, b"one").unwrap();
+        std::fs::write(&b, b"two").unwrap();
+        assert_eq!(
+            init_tag(&a).unwrap(),
+            init_tag(&a).unwrap(),
+            "deterministic"
+        );
+        assert_ne!(
+            init_tag(&a).unwrap(),
+            init_tag(&b).unwrap(),
+            "content-sensitive"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

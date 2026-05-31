@@ -48,14 +48,15 @@ pub fn build_vm_config(
     hostname: &str,
     tap_name: String,
     mac: String,
-    sandbox: bool,
+    workload_argv_hex: Option<&str>,
     authorized_key_hex: Option<&str>,
 ) -> VmConfig {
     let ip_param = mm_net::ip_cmdline(ip, gateway, mask, hostname, "eth0");
-    let mode = if sandbox {
-        "mm.mode=sandbox".to_string()
-    } else {
-        "mm.workload=/sbin/init".to_string()
+    // Some(hex) → run the image's command (argv hex-encoded as mm.workload_argv);
+    // None → sandbox mode (an interactive shell, for `mm run --ssh`).
+    let mode = match workload_argv_hex {
+        Some(hex) => format!("mm.workload_argv={hex}"),
+        None => "mm.mode=sandbox".to_string(),
     };
     // root=/dev/vda: the rootfs is the first virtio-mmio block device. init=/init:
     // mm-init is PID 1 in the guest image. The rootfs is read-only in M1 (writes go
@@ -147,6 +148,21 @@ mod linux {
             .unwrap_or_else(|| crate::commands::state_root().join("vmlinux"))
     }
 
+    /// Path to the guest `mm-init` binary injected as `/init` (`MM_INIT`, else
+    /// `<root>/mm-init`). Provisioned alongside the kernel, mirroring `kernel_path`.
+    fn mm_init_path() -> PathBuf {
+        std::env::var_os("MM_INIT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| crate::commands::state_root().join("mm-init"))
+    }
+
+    /// Encode an argv as the `mm.workload_argv` cmdline value: NUL-join the elements
+    /// (NUL can't appear in argv) and hex-encode, so arguments with spaces or commas
+    /// survive the whitespace-split kernel command line.
+    fn encode_argv(argv: &[String]) -> String {
+        hex_encode(argv.join("\0").as_bytes())
+    }
+
     /// Privileged `mm run`: build the rootfs, wire the bridge/TAP/NAT, open
     /// `/dev/kvm`, prepare a per-VM chroot, then spawn the jailed `mm __vmm-worker`
     /// child — passing it the KVM + TAP fds. The child confines itself
@@ -155,10 +171,11 @@ mod linux {
     pub fn launch(args: &RunArgs, store: &Store) -> Result<()> {
         let root = crate::commands::state_root();
 
-        // 1. OCI image -> read-only base rootfs (digest-cached).
+        // 1. OCI image -> read-only base rootfs (digest-cached), with mm-init
+        //    injected as /init so the guest kernel's `init=/init` finds PID 1.
         let images = ImageStore::new(&root);
         let rootfs = images
-            .build_base_rootfs(&args.image)
+            .build_base_rootfs(&args.image, &mm_init_path())
             .with_context(|| format!("building rootfs for {}", args.image))?;
 
         // 2. Name + IP (seed the pool from already-running machines).
@@ -206,6 +223,17 @@ mod linux {
         // 6. Worker VM config with chroot-relative paths; serialized for the child.
         // Inject the managed SSH public key so `mm ssh` works with no in-guest setup.
         let authorized_key_hex = ensure_ssh_key(&root)?;
+        // Workload: `--ssh` boots the sandbox shell; otherwise run the image's own
+        // command (Entrypoint+Cmd), hex-encoded so args with spaces survive the
+        // kernel cmdline.
+        let workload_argv_hex = if args.ssh {
+            None
+        } else {
+            let argv = images
+                .image_argv(&args.image)
+                .with_context(|| format!("reading the image command for {}", args.image))?;
+            Some(encode_argv(&argv))
+        };
         let worker_cfg = build_vm_config(
             args.cpus,
             args.memory,
@@ -217,7 +245,7 @@ mod linux {
             &name,
             tap_name.clone(),
             mac_from_ip(ip),
-            args.ssh,
+            workload_argv_hex.as_deref(),
             authorized_key_hex.as_deref(),
         );
         worker_cfg.validate().context("validating VM config")?;
@@ -518,14 +546,16 @@ mod tests {
             "web-1",
             "mm-web-1".to_string(),
             "02:00:00:0a:00:02".to_string(),
-            false,
+            Some("2f62696e2f7368"), // hex("/bin/sh")
             None,
         );
         assert_eq!(cfg.vcpus, 2);
         assert!(cfg
             .kernel_cmdline
             .contains("ip=10.0.0.2::10.0.0.1:255.255.255.0:web-1:eth0:off"));
-        assert!(cfg.kernel_cmdline.contains("mm.workload=/sbin/init"));
+        assert!(cfg
+            .kernel_cmdline
+            .contains("mm.workload_argv=2f62696e2f7368"));
         assert!(cfg.rootfs.read_only);
         assert_eq!(
             cfg.devices,
@@ -549,7 +579,7 @@ mod tests {
             "s",
             "tap".to_string(),
             "02:00:00:0a:00:05".to_string(),
-            true,
+            None, // no workload argv → sandbox mode
             None,
         );
         assert!(cfg.kernel_cmdline.contains("mm.mode=sandbox"));
@@ -569,7 +599,7 @@ mod tests {
             "k",
             "tap".to_string(),
             "02:00:00:0a:00:07".to_string(),
-            false,
+            Some("2f62696e2f7368"), // hex("/bin/sh")
             Some("deadbeef"),
         );
         assert!(cfg.kernel_cmdline.contains("mm.authorized_key=deadbeef"));

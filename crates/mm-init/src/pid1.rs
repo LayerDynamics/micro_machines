@@ -38,9 +38,38 @@ pub fn run_pid1() -> ExitCode {
         }
     }
 
+    // Tell the host we reached userspace *before* handing off to the workload, so
+    // boot readiness is observable for any image — not only the test fixtures whose
+    // workload happens to signal. Best-effort: a failure must not block the boot.
+    signal_boot_ready();
+
     match cfg.mode {
         Mode::Workload => run_workload(&cfg),
         Mode::Sandbox => run_sandbox(&cfg),
+    }
+}
+
+/// Signal boot readiness to the host VMM over the boot vsock — connect to
+/// `VMADDR_CID_HOST` (2) port 1024; the host treats any vsock TX as the readiness
+/// edge. Best-effort and non-fatal.
+fn signal_boot_ready() {
+    // SAFETY: each libc call is checked or best-effort; on any failure we simply
+    // return and let the workload run.
+    unsafe {
+        let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return;
+        }
+        let mut addr: libc::sockaddr_vm = std::mem::zeroed();
+        addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+        addr.svm_cid = 2; // VMADDR_CID_HOST
+        addr.svm_port = 1024;
+        libc::connect(
+            fd,
+            (&addr as *const libc::sockaddr_vm).cast(),
+            std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+        );
+        libc::close(fd);
     }
 }
 

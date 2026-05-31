@@ -22,8 +22,14 @@ pub enum Mode {
 
 impl InitConfig {
     /// Parse a raw /proc/cmdline string. Recognizes `mm.workload=`, `mm.args=`,
-    /// `mm.mode=`, `mm.vsock_boot_port=`, `mm.authorized_key=`. Unknown tokens are
-    /// ignored.
+    /// `mm.workload_argv=`, `mm.mode=`, `mm.vsock_boot_port=`, `mm.authorized_key=`.
+    /// Unknown tokens are ignored.
+    ///
+    /// `mm.workload_argv=<hex>` is the robust form `mm run` uses for OCI images: the
+    /// hex decodes to the full argv joined by NUL bytes, so arguments may contain
+    /// spaces or commas (which `mm.workload`/`mm.args` cannot carry on the
+    /// whitespace-split, comma-split command line). It sets `workload` (argv[0]) and
+    /// `args` (the rest).
     pub fn parse(cmdline: &str) -> Self {
         let mut cfg = InitConfig::default();
         for tok in cmdline.split_whitespace() {
@@ -35,6 +41,20 @@ impl InitConfig {
                         .filter(|s| !s.is_empty())
                         .map(String::from)
                         .collect()
+                }
+                Some(("mm.workload_argv", v)) => {
+                    if let Some(argv) = decode_hex(v).map(|bytes| {
+                        bytes
+                            .split(|b| *b == 0)
+                            .filter(|s| !s.is_empty())
+                            .filter_map(|s| std::str::from_utf8(s).ok().map(String::from))
+                            .collect::<Vec<String>>()
+                    }) {
+                        if let Some((first, rest)) = argv.split_first() {
+                            cfg.workload = Some(first.clone());
+                            cfg.args = rest.to_vec();
+                        }
+                    }
                 }
                 Some(("mm.mode", "sandbox")) => cfg.mode = Mode::Sandbox,
                 Some(("mm.vsock_boot_port", v)) => cfg.vsock_boot_port = v.parse().ok(),
@@ -83,6 +103,20 @@ mod tests {
         assert_eq!(c.args, vec!["--port", "8080"]);
         assert_eq!(c.mode, Mode::Workload);
     }
+    #[test]
+    fn parses_workload_argv_hex_with_spaces() {
+        // argv whose args contain spaces — impossible via mm.workload/mm.args.
+        let argv = ["/bin/sh", "-c", "echo a b"];
+        let hex: String = argv
+            .join("\0")
+            .bytes()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let c = InitConfig::parse(&format!("console=ttyS0 mm.workload_argv={hex} ip=10.0.0.2"));
+        assert_eq!(c.workload.as_deref(), Some("/bin/sh"));
+        assert_eq!(c.args, vec!["-c", "echo a b"]);
+    }
+
     #[test]
     fn detects_sandbox_mode_and_vsock_port() {
         let c = InitConfig::parse("mm.mode=sandbox mm.vsock_boot_port=13");
