@@ -16,7 +16,7 @@ use linux_loader::configurator::{BootConfigurator, BootParams};
 use linux_loader::loader::bootparam::boot_params;
 use linux_loader::loader::elf::Elf;
 use linux_loader::loader::{load_cmdline, KernelLoader};
-use vm_memory::{Address, GuestAddress, GuestMemoryMmap};
+use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use crate::machine::{Result, VmmError};
 
@@ -77,15 +77,6 @@ fn load_kernel(guest_memory: &GuestMemoryMmap, kernel_path: &Path) -> Result<Gue
         Some(GuestAddress(HIMEM_START)),
     )
     .map_err(|e| VmmError::KernelLoad(format!("ELF load failed: {e}")))?;
-
-    // Diagnostic: the entry RIP and whether the ELF advertises a PVH boot entry.
-    // A high (non-identity-mapped) entry or a PVH note means the 64-bit boot
-    // protocol path is wrong for this kernel.
-    eprintln!(
-        "mm-vmm: kernel_load=0x{:x} pvh_boot_cap={:?}",
-        result.kernel_load.raw_value(),
-        result.pvh_boot_cap
-    );
 
     Ok(result.kernel_load)
 }

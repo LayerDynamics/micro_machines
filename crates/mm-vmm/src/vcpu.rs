@@ -10,7 +10,8 @@
 use std::sync::Arc;
 
 use kvm_bindings::{
-    kvm_fpu, kvm_msr_entry, kvm_regs, kvm_segment, kvm_sregs, CpuId, Msrs, KVM_MAX_CPUID_ENTRIES,
+    kvm_cpuid_entry2, kvm_fpu, kvm_msr_entry, kvm_regs, kvm_segment, kvm_sregs, CpuId, Msrs,
+    KVM_MAX_CPUID_ENTRIES,
 };
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
@@ -71,8 +72,8 @@ impl Vcpu {
     pub fn new(kvm: &Kvm, vm: &VmFd, index: u8) -> Result<Self> {
         let fd = vm.create_vcpu(u64::from(index))?;
 
-        let mut cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
-        filter_cpuid(index, &mut cpuid);
+        let supported = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
+        let cpuid = build_cpuid(index, &supported, &fd)?;
         fd.set_cpuid2(&cpuid)?;
 
         Ok(Self { fd, index })
@@ -133,12 +134,6 @@ impl Vcpu {
     /// Run this vCPU until it halts or shuts down, dispatching every port-I/O and
     /// MMIO exit to the device model. Returns how the loop ended.
     pub fn run(&mut self, dispatch: &Arc<dyn IoDispatch>) -> Result<VcpuRunExit> {
-        // Bounded early-boot exit trace (diagnostic): the first N exits reveal what
-        // the guest is doing. An empty trace means it is spinning in-guest with no
-        // I/O; serial OUT bytes are the console characters.
-        const TRACE_LIMIT: usize = 200;
-        let mut traced = 0usize;
-
         loop {
             // Surface a KVM_RUN failure (e.g. invalid entry state) instead of
             // letting `?` drop it silently into the thread result.
@@ -159,42 +154,18 @@ impl Vcpu {
             // afterwards for the fault diagnostic.
             let terminal: Option<(bool, String)> = match exit {
                 VcpuExit::IoIn(port, data) => {
-                    if traced < TRACE_LIMIT {
-                        eprintln!(
-                            "mm-vmm: exit#{traced} IO_IN port=0x{port:x} len={}",
-                            data.len()
-                        );
-                        traced += 1;
-                    }
                     dispatch.pio_read(port, data);
                     None
                 }
                 VcpuExit::IoOut(port, data) => {
-                    if traced < TRACE_LIMIT {
-                        eprintln!("mm-vmm: exit#{traced} IO_OUT port=0x{port:x} data={data:02x?}");
-                        traced += 1;
-                    }
                     dispatch.pio_write(port, data);
                     None
                 }
                 VcpuExit::MmioRead(addr, data) => {
-                    if traced < TRACE_LIMIT {
-                        eprintln!(
-                            "mm-vmm: exit#{traced} MMIO_READ addr=0x{addr:x} len={}",
-                            data.len()
-                        );
-                        traced += 1;
-                    }
                     dispatch.mmio_read(addr, data);
                     None
                 }
                 VcpuExit::MmioWrite(addr, data) => {
-                    if traced < TRACE_LIMIT {
-                        eprintln!(
-                            "mm-vmm: exit#{traced} MMIO_WRITE addr=0x{addr:x} data={data:02x?}"
-                        );
-                        traced += 1;
-                    }
                     dispatch.mmio_write(addr, data);
                     None
                 }
@@ -241,18 +212,48 @@ fn boot_msrs() -> Result<Msrs> {
     Msrs::from_entries(&entries).map_err(|e| VmmError::Vcpu(format!("building boot MSRs: {e:?}")))
 }
 
-/// Patch the supported CPUID: write this vCPU's local APIC id into leaf 1 EBX
-/// and ensure the APIC feature bit is advertised.
-fn filter_cpuid(index: u8, cpuid: &mut CpuId) {
-    for entry in cpuid.as_mut_slice() {
-        if entry.function == 1 {
-            // EBX[31:24] = initial local APIC id.
-            entry.ebx &= 0x00ff_ffff;
-            entry.ebx |= u32::from(index) << 24;
-            // EDX[9] = on-chip APIC present.
-            entry.edx |= 1 << 9;
+/// Build this vCPU's CPUID from the host-supported set: patch leaf 1 (local APIC
+/// id, on-chip APIC, **hypervisor-present**) and append the **KVM paravirt** leaves
+/// so the guest uses kvm-clock and reads its TSC frequency directly — skipping the
+/// legacy PIT-based TSC calibration that otherwise spins forever polling the
+/// unemulated port 0x61.
+fn build_cpuid(index: u8, supported: &CpuId, fd: &VcpuFd) -> Result<CpuId> {
+    let mut entries: Vec<kvm_cpuid_entry2> = supported.as_slice().to_vec();
+
+    for entry in entries.iter_mut() {
+        if entry.function == 1 && entry.index == 0 {
+            entry.ebx = (entry.ebx & 0x00ff_ffff) | (u32::from(index) << 24); // APIC id
+            entry.edx |= 1 << 9; // on-chip APIC
+            entry.ecx |= 1 << 31; // hypervisor present
         }
     }
+
+    // KVM signature leaf: EAX = highest paravirt leaf; EBX/ECX/EDX = "KVMKVMKVM".
+    entries.push(kvm_cpuid_entry2 {
+        function: 0x4000_0000,
+        eax: 0x4000_0010,
+        ebx: 0x4b4d_564b, // "KVMK"
+        ecx: 0x564b_4d56, // "VMKV"
+        edx: 0x0000_004d, // "M"
+        ..Default::default()
+    });
+    // KVM feature leaf: kvm-clock (clocksource + clocksource2 + stable TSC) and
+    // no-op I/O delay so the kernel does not busy-wait on port 0x80.
+    entries.push(kvm_cpuid_entry2 {
+        function: 0x4000_0001,
+        eax: (1 << 0) | (1 << 1) | (1 << 3) | (1 << 24),
+        ..Default::default()
+    });
+    // TSC frequency leaf (kHz) so the guest never falls back to PIT calibration.
+    if let Ok(tsc_khz) = fd.get_tsc_khz() {
+        entries.push(kvm_cpuid_entry2 {
+            function: 0x4000_0010,
+            eax: tsc_khz,
+            ..Default::default()
+        });
+    }
+
+    CpuId::from_entries(&entries).map_err(|e| VmmError::Vcpu(format!("building cpuid: {e:?}")))
 }
 
 /// Build a flat GDT (null/code/data/TSS), write it to guest memory, and load the
