@@ -134,6 +134,12 @@ impl Vcpu {
     /// Run this vCPU until it halts or shuts down, dispatching every port-I/O and
     /// MMIO exit to the device model. Returns how the loop ended.
     pub fn run(&mut self, dispatch: &Arc<dyn IoDispatch>) -> Result<VcpuRunExit> {
+        // Diagnostic: log each distinct PIO port / MMIO page exactly once. Bounded
+        // (a few dozen entries), so it never throttles the guest like a per-exit
+        // trace would, while still revealing the I/O the guest is doing.
+        let mut seen_pio: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        let mut seen_mmio: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
         loop {
             // Surface a KVM_RUN failure (e.g. invalid entry state) instead of
             // letting `?` drop it silently into the thread result.
@@ -154,18 +160,30 @@ impl Vcpu {
             // afterwards for the fault diagnostic.
             let terminal: Option<(bool, String)> = match exit {
                 VcpuExit::IoIn(port, data) => {
+                    if seen_pio.insert(port) {
+                        eprintln!("mm-vmm: first IO_IN port=0x{port:x}");
+                    }
                     dispatch.pio_read(port, data);
                     None
                 }
                 VcpuExit::IoOut(port, data) => {
+                    if seen_pio.insert(port) {
+                        eprintln!("mm-vmm: first IO_OUT port=0x{port:x} data={data:02x?}");
+                    }
                     dispatch.pio_write(port, data);
                     None
                 }
                 VcpuExit::MmioRead(addr, data) => {
+                    if seen_mmio.insert(addr & !0xfff) {
+                        eprintln!("mm-vmm: first MMIO_READ page=0x{:x}", addr & !0xfff);
+                    }
                     dispatch.mmio_read(addr, data);
                     None
                 }
                 VcpuExit::MmioWrite(addr, data) => {
+                    if seen_mmio.insert(addr & !0xfff) {
+                        eprintln!("mm-vmm: first MMIO_WRITE page=0x{:x}", addr & !0xfff);
+                    }
                     dispatch.mmio_write(addr, data);
                     None
                 }
