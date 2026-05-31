@@ -64,8 +64,11 @@ fetch_kernel() {
   mv "${KERNEL}.tmp" "${KERNEL}"
 }
 
-# Build a tiny static `ready` helper: it opens an AF_VSOCK connection (any vsock
-# traffic is the readiness edge the M1 vsock device waits on), then powers off.
+# Build a tiny static `ready` helper. It emits two best-effort readiness edges
+# then powers off: (1) a UDP datagram to the gateway over the guest NIC — the
+# edge the net integration test observes; (2) an AF_VSOCK connect — the edge the
+# plain boot test waits on. Whichever device the VM lacks simply makes its send
+# fail and is ignored.
 build_ready_helper() {
   local stage="$1"
   local proj="${stage}/.ready-src"
@@ -91,11 +94,39 @@ panic = "abort"
 EOF
 
   cat >"${proj}/src/main.rs" <<'EOF'
-// Signal boot readiness to the host VMM over vsock, then power off.
+// Signal boot readiness to the host. Two best-effort signals, then power off:
+//   1. a UDP datagram to the gateway (10.0.0.1:1234) over the guest NIC — this
+//      is the edge the net integration test observes (proves virtio-net TX +
+//      the kernel's static `ip=` config brought eth0 up);
+//   2. an AF_VSOCK connect to the host — the edge the plain boot test waits on.
+// On the no-net boot test the UDP send simply fails (no route) and is ignored;
+// on the net test the vsock connect fails the same way. Either way we power off
+// so the vCPU halts and the host-side gate fires.
 fn main() {
     // SAFETY: each libc call is checked or best-effort; on failure we still
-    // power off so the boot test's vCPU halts.
+    // power off so the test's vCPU halts.
     unsafe {
+        // (1) UDP to the gateway over eth0 — the net test's readiness edge.
+        let ufd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if ufd >= 0 {
+            let mut dst: libc::sockaddr_in = core::mem::zeroed();
+            dst.sin_family = libc::AF_INET as libc::sa_family_t;
+            dst.sin_port = 1234u16.to_be(); // host byte order -> network
+            // 10.0.0.1 as raw network-order bytes.
+            dst.sin_addr.s_addr = u32::from_ne_bytes([10, 0, 0, 1]);
+            let msg = b"mm-ready";
+            libc::sendto(
+                ufd,
+                msg.as_ptr().cast(),
+                msg.len(),
+                0,
+                (&dst as *const libc::sockaddr_in).cast(),
+                core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            libc::close(ufd);
+        }
+
+        // (2) vsock connect — the plain boot test's readiness edge.
         let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
         if fd >= 0 {
             let mut addr: libc::sockaddr_vm = core::mem::zeroed();
