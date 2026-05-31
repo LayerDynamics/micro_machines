@@ -7,6 +7,7 @@
 //! kernel entry point, and `RSI` pointing at the zero page (`boot_params`). KVM
 //! does none of this for us — the VMM is the firmware. The constants and segment
 //! layout below follow the standard PC/Linux boot conventions.
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use kvm_bindings::{
@@ -131,20 +132,29 @@ impl Vcpu {
         Ok(())
     }
 
-    /// Run this vCPU until it halts or shuts down, dispatching every port-I/O and
-    /// MMIO exit to the device model. Returns how the loop ended.
-    pub fn run(&mut self, dispatch: &Arc<dyn IoDispatch>) -> Result<VcpuRunExit> {
-        // Diagnostic: log each distinct PIO port / MMIO page exactly once. Bounded
-        // (a few dozen entries), so it never throttles the guest like a per-exit
-        // trace would, while still revealing the I/O the guest is doing.
-        let mut seen_pio: std::collections::HashSet<u16> = std::collections::HashSet::new();
-        let mut seen_mmio: std::collections::HashSet<u64> = std::collections::HashSet::new();
-
+    /// Run this vCPU until it halts, shuts down, or `stop` is set, dispatching every
+    /// port-I/O and MMIO exit to the device model. With the in-kernel irqchip a
+    /// guest `HLT` is handled inside KVM (KVM_RUN blocks rather than returning), so
+    /// teardown signals the thread: the signal interrupts KVM_RUN with `EINTR`, we
+    /// observe `stop`, and return.
+    pub fn run(
+        &mut self,
+        dispatch: &Arc<dyn IoDispatch>,
+        stop: &AtomicBool,
+    ) -> Result<VcpuRunExit> {
         loop {
-            // Surface a KVM_RUN failure (e.g. invalid entry state) instead of
-            // letting `?` drop it silently into the thread result.
+            if stop.load(Ordering::Acquire) {
+                return Ok(VcpuRunExit::Halted);
+            }
             let exit = match self.fd.run() {
                 Ok(exit) => exit,
+                // A stop signal interrupts KVM_RUN with EINTR; re-check `stop`.
+                Err(e) if e.errno() == libc::EINTR => {
+                    if stop.load(Ordering::Acquire) {
+                        return Ok(VcpuRunExit::Halted);
+                    }
+                    continue;
+                }
                 Err(e) => {
                     let rip = self.fd.get_regs().map(|r| r.rip).unwrap_or(0);
                     eprintln!(
@@ -160,30 +170,18 @@ impl Vcpu {
             // afterwards for the fault diagnostic.
             let terminal: Option<(bool, String)> = match exit {
                 VcpuExit::IoIn(port, data) => {
-                    if seen_pio.insert(port) {
-                        eprintln!("mm-vmm: first IO_IN port=0x{port:x}");
-                    }
                     dispatch.pio_read(port, data);
                     None
                 }
                 VcpuExit::IoOut(port, data) => {
-                    if seen_pio.insert(port) {
-                        eprintln!("mm-vmm: first IO_OUT port=0x{port:x} data={data:02x?}");
-                    }
                     dispatch.pio_write(port, data);
                     None
                 }
                 VcpuExit::MmioRead(addr, data) => {
-                    if seen_mmio.insert(addr & !0xfff) {
-                        eprintln!("mm-vmm: first MMIO_READ page=0x{:x}", addr & !0xfff);
-                    }
                     dispatch.mmio_read(addr, data);
                     None
                 }
                 VcpuExit::MmioWrite(addr, data) => {
-                    if seen_mmio.insert(addr & !0xfff) {
-                        eprintln!("mm-vmm: first MMIO_WRITE page=0x{:x}", addr & !0xfff);
-                    }
                     dispatch.mmio_write(addr, data);
                     None
                 }

@@ -7,6 +7,7 @@
 //! them. [`Machine::wait_for_ready`] blocks on the guest's vsock readiness signal.
 use std::fmt::Write as _;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -112,6 +113,34 @@ pub struct Machine {
     /// only on the jailed boot path, where the (now unprivileged) VMM cannot open
     /// the TAP itself — the privileged parent opened it and passed the fd in.
     tap_fds: Vec<RawFd>,
+    /// Set by `shutdown` to ask the vCPU threads to stop.
+    vcpu_stop: Arc<AtomicBool>,
+    /// pthread ids of the running vCPU threads, so `shutdown` can signal them out
+    /// of a halted KVM_RUN.
+    vcpu_tids: Arc<Mutex<Vec<libc::pthread_t>>>,
+}
+
+/// The signal used to kick a vCPU thread out of `KVM_RUN` at teardown. A no-op
+/// handler (installed once) makes the signal interrupt the blocking ioctl with
+/// `EINTR` without terminating the thread.
+const VCPU_STOP_SIGNAL: libc::c_int = libc::SIGUSR1;
+
+/// Install the no-op `SIGUSR1` handler exactly once per process.
+fn install_vcpu_stop_handler() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        extern "C" fn noop(_: libc::c_int) {}
+        let handler = noop as extern "C" fn(libc::c_int);
+        // SAFETY: a no-op handler with no SA_RESTART so blocking syscalls return
+        // EINTR rather than auto-restarting.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = handler as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = 0;
+            libc::sigaction(VCPU_STOP_SIGNAL, &action, std::ptr::null_mut());
+        }
+    });
 }
 
 impl Machine {
@@ -126,6 +155,7 @@ impl Machine {
     /// VMM can no longer open `/dev/kvm` or `/dev/net/tun` itself.
     fn with_resources(config: &VmConfig, kvm: Kvm, tap_fds: Vec<RawFd>) -> Result<Self> {
         config.validate()?;
+        install_vcpu_stop_handler();
 
         let vm = kvm.create_vm()?;
 
@@ -170,6 +200,8 @@ impl Machine {
             ready: None,
             vcpu_hook: None,
             tap_fds,
+            vcpu_stop: Arc::new(AtomicBool::new(false)),
+            vcpu_tids: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -325,15 +357,23 @@ impl Machine {
         for mut vcpu in std::mem::take(&mut self.vcpus) {
             let dispatch = dispatch.clone();
             let hook = self.vcpu_hook.clone();
+            let stop = self.vcpu_stop.clone();
+            let tids = self.vcpu_tids.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("mm-vcpu-{}", vcpu.index()))
                 .spawn(move || {
+                    // Register this thread so `shutdown` can signal it out of KVM_RUN.
+                    // SAFETY: `pthread_self` is always safe and returns this thread.
+                    let tid = unsafe { libc::pthread_self() };
+                    if let Ok(mut guard) = tids.lock() {
+                        guard.push(tid);
+                    }
                     // Run the pre-run hook (e.g. seccomp install) on this thread,
                     // after the VMM's opens, before any guest code executes.
                     if let Some(hook) = &hook {
                         hook(vcpu.index())?;
                     }
-                    vcpu.run(&dispatch)
+                    vcpu.run(&dispatch, &stop)
                 })
                 .map_err(VmmError::Io)?;
             self.vcpu_threads.push(handle);
@@ -394,9 +434,38 @@ impl Machine {
         Ok(rc > 0 && (poll_fd.revents & libc::POLLIN) != 0)
     }
 
-    /// Stop the VM: join the vCPU threads. The guest powers off (via `mm-init`)
-    /// when its workload exits, which halts the vCPUs and ends their threads.
+    /// Stop the VM: ask the vCPU threads to stop and signal them out of any halted
+    /// `KVM_RUN` (the in-kernel irqchip handles guest `HLT` internally, so KVM_RUN
+    /// blocks rather than returning), then join them.
     pub fn shutdown(&mut self) -> Result<()> {
+        self.vcpu_stop.store(true, Ordering::Release);
+
+        let tids: Vec<libc::pthread_t> = self
+            .vcpu_tids
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+
+        // Kicker: repeatedly signal the vCPU threads until they have all joined.
+        // Repeating closes the race where a signal lands just before a thread
+        // re-enters KVM_RUN (a thread that already exited just yields ESRCH).
+        let kicker_done = Arc::new(AtomicBool::new(false));
+        let kicker = {
+            let done = kicker_done.clone();
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Acquire) {
+                    for &tid in &tids {
+                        // SAFETY: VCPU_STOP_SIGNAL has a no-op handler; this only
+                        // interrupts a blocking KVM_RUN.
+                        unsafe {
+                            libc::pthread_kill(tid, VCPU_STOP_SIGNAL);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+        };
+
         for handle in self.vcpu_threads.drain(..) {
             match handle.join() {
                 Ok(Ok(_exit)) => {}
@@ -404,6 +473,9 @@ impl Machine {
                 Err(_) => tracing::error!("vcpu thread panicked"),
             }
         }
+
+        kicker_done.store(true, Ordering::Release);
+        let _ = kicker.join();
         Ok(())
     }
 
