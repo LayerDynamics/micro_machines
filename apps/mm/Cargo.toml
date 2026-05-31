@@ -1,0 +1,28 @@
+[package]
+name = "mm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mm"
+path = "src/main.rs"
+
+[dependencies]
+mm-api-types = { path = "../../crates/mm-api-types" }
+mm-vmm = { path = "../../crates/mm-vmm" }     # VmConfig is cross-platform; Machine is linux-only
+mm-net = { path = "../../crates/mm-net" }
+mm-image = { path = "../../crates/mm-image" }
+mm-sandbox = { path = "../../crates/mm-sandbox" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+redb = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }

@@ -22,6 +22,6 @@ mod vcpu;
 #[cfg(target_os = "linux")]
 pub use boot::KernelBoot;
 #[cfg(target_os = "linux")]
-pub use machine::{IoDispatch, Machine, VmmError};
+pub use machine::{IoDispatch, Machine, VcpuHook, VmmError};
 #[cfg(target_os = "linux")]
 pub use vcpu::{Vcpu, VcpuRunExit};

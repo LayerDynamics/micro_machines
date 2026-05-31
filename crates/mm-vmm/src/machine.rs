@@ -78,6 +78,13 @@ pub trait IoDispatch: Send + Sync {
     fn mmio_write(&self, addr: u64, data: &[u8]);
 }
 
+/// A hook invoked inside each vCPU thread *after* the VMM has finished opening
+/// resources but *before* the first `vcpu.run()`. The argument is the vCPU index.
+/// This is the seam the CLI uses to install a per-thread seccomp-BPF filter at the
+/// only correct moment — once the file/ioctl setup is done, before guest code runs
+/// (SPEC-1 FR-27). If it returns an error, that vCPU thread aborts before running.
+pub type VcpuHook = Arc<dyn Fn(u8) -> Result<()> + Send + Sync>;
+
 /// A microVM. After [`Machine::new`] it is constructed but idle; after
 /// [`Machine::boot`] its vCPUs are running in their own threads and its device
 /// workers are live. The KVM/VM handles and guest RAM are retained so the running
@@ -94,6 +101,8 @@ pub struct Machine {
     bus: Option<Arc<Bus>>,
     /// The guest readiness signal from the boot vsock device.
     ready: Option<Arc<VsockReady>>,
+    /// Optional per-vCPU-thread pre-run hook (e.g. seccomp install).
+    vcpu_hook: Option<VcpuHook>,
 }
 
 impl Machine {
@@ -130,6 +139,7 @@ impl Machine {
             vcpu_threads: Vec::new(),
             bus: None,
             ready: None,
+            vcpu_hook: None,
         })
     }
 
@@ -139,7 +149,15 @@ impl Machine {
     /// the kernel, configure the vCPUs for the boot protocol, and spawn a thread
     /// per vCPU. Returns once the guest is executing.
     pub fn boot(config: &VmConfig) -> Result<Self> {
+        Self::boot_with_hook(config, None)
+    }
+
+    /// Like [`Machine::boot`], but installs `vcpu_hook` in each vCPU thread before
+    /// it runs guest code — the seam the CLI uses to apply a seccomp filter
+    /// (SPEC-1 FR-27).
+    pub fn boot_with_hook(config: &VmConfig, vcpu_hook: Option<VcpuHook>) -> Result<Self> {
         let mut machine = Self::new(config)?;
+        machine.vcpu_hook = vcpu_hook;
         machine.start()?;
         Ok(machine)
     }
@@ -237,9 +255,17 @@ impl Machine {
         let dispatch: Arc<dyn IoDispatch> = bus;
         for mut vcpu in std::mem::take(&mut self.vcpus) {
             let dispatch = dispatch.clone();
+            let hook = self.vcpu_hook.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("mm-vcpu-{}", vcpu.index()))
-                .spawn(move || vcpu.run(&dispatch))
+                .spawn(move || {
+                    // Run the pre-run hook (e.g. seccomp install) on this thread,
+                    // after the VMM's opens, before any guest code executes.
+                    if let Some(hook) = &hook {
+                        hook(vcpu.index())?;
+                    }
+                    vcpu.run(&dispatch)
+                })
                 .map_err(VmmError::Io)?;
             self.vcpu_threads.push(handle);
         }

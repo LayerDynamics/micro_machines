@@ -48,6 +48,13 @@ impl Ipam {
     pub fn release(&mut self, addr: Ipv4Addr) {
         self.allocated.remove(&addr.octets()[3]);
     }
+
+    /// Mark `addr` as already in use without allocating a fresh one. Used to seed
+    /// the pool from persisted state (each CLI invocation rebuilds the IPAM and
+    /// must avoid IPs already handed out to running machines).
+    pub fn reserve(&mut self, addr: Ipv4Addr) {
+        self.allocated.insert(addr.octets()[3]);
+    }
 }
 
 #[cfg(test)]

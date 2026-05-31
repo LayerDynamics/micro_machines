@@ -15,4 +15,4 @@ pub use seccomp::{vmm_thread_rules, SeccompAllowlist, SeccompError};
 #[cfg(target_os = "linux")]
 pub mod jailer;
 #[cfg(target_os = "linux")]
-pub use jailer::{confine, CgroupLimits, JailSpec, JailerError};
+pub use jailer::{apply_cgroup_limits, confine, CgroupLimits, JailSpec, JailerError};

@@ -7,6 +7,7 @@ members = [
     "crates/mm-init",
     "crates/mm-sandbox",
     "crates/mm-image",
+    "apps/mm",
 ]
 
 [workspace.package]

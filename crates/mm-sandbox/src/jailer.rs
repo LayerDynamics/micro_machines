@@ -78,7 +78,11 @@ pub fn confine(spec: &JailSpec) -> Result<(), JailerError> {
 }
 
 /// Create the per-VM cgroup, write its limits, and move this process into it.
-fn apply_cgroup_limits(cgroup: &CgroupLimits) -> Result<(), JailerError> {
+///
+/// Exposed on its own because the CLI applies cgroup limits to the in-process VMM
+/// even when it cannot apply the full namespace/chroot/uid-drop confinement (which
+/// would break the in-process TAP/KVM access in M1 — see `confine`).
+pub fn apply_cgroup_limits(cgroup: &CgroupLimits) -> Result<(), JailerError> {
     let base = Path::new("/sys/fs/cgroup").join(&cgroup.name);
     fs::create_dir_all(&base).map_err(JailerError::Cgroup)?;
     fs::write(base.join("cpu.max"), &cgroup.cpu_max).map_err(JailerError::Cgroup)?;
