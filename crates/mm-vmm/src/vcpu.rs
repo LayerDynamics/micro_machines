@@ -133,11 +133,13 @@ impl Vcpu {
     /// Run this vCPU until it halts or shuts down, dispatching every port-I/O and
     /// MMIO exit to the device model. Returns how the loop ended.
     pub fn run(&mut self, dispatch: &Arc<dyn IoDispatch>) -> Result<VcpuRunExit> {
+        // Bounded early-boot exit trace (diagnostic): the first N exits reveal what
+        // the guest is doing. An empty trace means it is spinning in-guest with no
+        // I/O; serial OUT bytes are the console characters.
+        const TRACE_LIMIT: usize = 200;
+        let mut traced = 0usize;
+
         loop {
-            // Reduce the exit to an owned (is_shutdown, description) for terminal
-            // exits (None = keep running). Folding to owned data here ends the
-            // `&mut self.fd` borrow the `VcpuExit` holds, so we can read registers
-            // afterwards for the fault diagnostic.
             // Surface a KVM_RUN failure (e.g. invalid entry state) instead of
             // letting `?` drop it silently into the thread result.
             let exit = match self.fd.run() {
@@ -151,20 +153,48 @@ impl Vcpu {
                     return Err(VmmError::Kvm(e));
                 }
             };
+            // Reduce the exit to an owned (is_shutdown, description) for terminal
+            // exits (None = keep running). Folding to owned data here ends the
+            // `&mut self.fd` borrow the `VcpuExit` holds, so we can read registers
+            // afterwards for the fault diagnostic.
             let terminal: Option<(bool, String)> = match exit {
                 VcpuExit::IoIn(port, data) => {
+                    if traced < TRACE_LIMIT {
+                        eprintln!(
+                            "mm-vmm: exit#{traced} IO_IN port=0x{port:x} len={}",
+                            data.len()
+                        );
+                        traced += 1;
+                    }
                     dispatch.pio_read(port, data);
                     None
                 }
                 VcpuExit::IoOut(port, data) => {
+                    if traced < TRACE_LIMIT {
+                        eprintln!("mm-vmm: exit#{traced} IO_OUT port=0x{port:x} data={data:02x?}");
+                        traced += 1;
+                    }
                     dispatch.pio_write(port, data);
                     None
                 }
                 VcpuExit::MmioRead(addr, data) => {
+                    if traced < TRACE_LIMIT {
+                        eprintln!(
+                            "mm-vmm: exit#{traced} MMIO_READ addr=0x{addr:x} len={}",
+                            data.len()
+                        );
+                        traced += 1;
+                    }
                     dispatch.mmio_read(addr, data);
                     None
                 }
                 VcpuExit::MmioWrite(addr, data) => {
+                    if traced < TRACE_LIMIT {
+                        eprintln!(
+                            "mm-vmm: exit#{traced} MMIO_WRITE addr=0x{addr:x} data={data:02x?}"
+                        );
+                        traced += 1;
+                    }
                     dispatch.mmio_write(addr, data);
                     None
                 }
