@@ -28,10 +28,11 @@ jobs:
       - run: pnpm -r test
 
   # KVM capability preflight: reports whether this runner can host microVMs.
-  # GitHub-hosted runners do not expose nested KVM, so the job records capability
-  # without failing the build; a self-hosted/KVM-enabled runner exercises the
-  # real host-virtualization path. M1 extends this job with mm-vmm integration
-  # tests once that crate exists.
+  # GitHub-hosted ubuntu-latest exposes /dev/kvm with nested virtualization; the
+  # device is present but owned root:kvm (the runner user must be granted access).
+  # This diagnostic records device existence, perms, CPU virt flags, and whether a
+  # permissions fix makes it usable — without failing the build. The kvm-integration
+  # job below applies that fix and runs the real boot test.
   kvm-preflight:
     runs-on: ubuntu-latest
     steps:
@@ -60,19 +61,32 @@ jobs:
           fi
           exit 0
 
-  # Real boot-to-userspace integration test. Runs on a self-hosted runner that
-  # exposes /dev/kvm; skipped automatically elsewhere because no such runner picks
-  # the job up. Fetches a test kernel + minimal rootfs, then runs the #[ignore]d
-  # mm-vmm KVM tests.
+  # Real boot-to-userspace integration test. GitHub-hosted ubuntu-latest DOES
+  # expose /dev/kvm with nested virtualization (the kvm-preflight diagnostic
+  # confirms device-exists=yes, cpu-virt flags present); it only needs the runner
+  # user granted access. We enable that, fetch a test kernel + minimal rootfs, and
+  # run the #[ignore]d mm-vmm KVM boot test directly on GitHub's infrastructure —
+  # no self-hosted runner required.
   kvm-integration:
-    runs-on: [self-hosted, linux, kvm]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with: { targets: x86_64-unknown-linux-musl }
-      - name: Require /dev/kvm
-        run: test -e /dev/kvm
+      - name: Enable /dev/kvm access for the runner user
+        run: |
+          set -euo pipefail
+          sudo modprobe kvm || true
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          ls -ld /dev/kvm
+      - name: Install fixture build tools (musl linker + mke2fs)
+        run: sudo apt-get update && sudo apt-get install -y musl-tools e2fsprogs
       - name: Fetch test fixtures (kernel + rootfs)
         run: ./scripts/fetch-test-fixtures.sh
       - name: Run KVM boot integration test
-        run: cargo test -p mm-vmm --features kvm-integration -- --ignored
+        run: cargo test -p mm-vmm --features kvm-integration -- --ignored --nocapture
