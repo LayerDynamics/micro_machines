@@ -101,16 +101,42 @@ impl Vcpu {
     /// MMIO exit to the device model. Returns how the loop ended.
     pub fn run(&mut self, dispatch: &Arc<dyn IoDispatch>) -> Result<VcpuRunExit> {
         loop {
-            match self.fd.run()? {
-                VcpuExit::IoIn(port, data) => dispatch.pio_read(port, data),
-                VcpuExit::IoOut(port, data) => dispatch.pio_write(port, data),
-                VcpuExit::MmioRead(addr, data) => dispatch.mmio_read(addr, data),
-                VcpuExit::MmioWrite(addr, data) => dispatch.mmio_write(addr, data),
-                VcpuExit::Hlt => return Ok(VcpuRunExit::Halted),
-                VcpuExit::Shutdown => return Ok(VcpuRunExit::Shutdown),
-                other => {
-                    return Err(VmmError::Vcpu(format!("unexpected vcpu exit: {other:?}")));
+            // Reduce the exit to an owned (is_shutdown, description) for terminal
+            // exits (None = keep running). Folding to owned data here ends the
+            // `&mut self.fd` borrow the `VcpuExit` holds, so we can read registers
+            // afterwards for the fault diagnostic.
+            let terminal: Option<(bool, String)> = match self.fd.run()? {
+                VcpuExit::IoIn(port, data) => {
+                    dispatch.pio_read(port, data);
+                    None
                 }
+                VcpuExit::IoOut(port, data) => {
+                    dispatch.pio_write(port, data);
+                    None
+                }
+                VcpuExit::MmioRead(addr, data) => {
+                    dispatch.mmio_read(addr, data);
+                    None
+                }
+                VcpuExit::MmioWrite(addr, data) => {
+                    dispatch.mmio_write(addr, data);
+                    None
+                }
+                VcpuExit::Hlt => return Ok(VcpuRunExit::Halted),
+                VcpuExit::Shutdown => Some((true, "SHUTDOWN (triple fault)".to_string())),
+                other => Some((false, format!("unexpected exit {other:?}"))),
+            };
+
+            if let Some((is_shutdown, description)) = terminal {
+                let rip = self.fd.get_regs().map(|r| r.rip).unwrap_or(0);
+                eprintln!("mm-vmm: vcpu {} {description} at rip=0x{rip:x}", self.index);
+                if is_shutdown {
+                    return Ok(VcpuRunExit::Shutdown);
+                }
+                return Err(VmmError::Vcpu(format!(
+                    "vcpu {}: {description}",
+                    self.index
+                )));
             }
         }
     }
