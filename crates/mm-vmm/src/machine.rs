@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use kvm_bindings::{kvm_pit_config, kvm_userspace_memory_region};
+use kvm_bindings::{kvm_pit_config, kvm_userspace_memory_region, KVM_PIT_SPEAKER_DUMMY};
 use kvm_ioctls::{Kvm, VmFd};
 use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 use vmm_sys_util::eventfd::EventFd;
@@ -141,9 +141,15 @@ impl Machine {
         Self::register_memory(&vm, &guest_memory)?;
 
         // In-kernel interrupt controller + programmable interval timer. These let
-        // the guest take timer/IRQ interrupts without us emulating a PIC/APIC.
+        // the guest take timer/IRQ interrupts without us emulating a PIC/APIC. The
+        // SPEAKER_DUMMY flag makes KVM also emulate port 0x61 (the PIT channel-2
+        // gate/speaker port) in-kernel — otherwise it exits to userspace and the
+        // guest's PIT-based timer calibration spins on it forever.
         vm.create_irq_chip()?;
-        vm.create_pit2(kvm_pit_config::default())?;
+        vm.create_pit2(kvm_pit_config {
+            flags: KVM_PIT_SPEAKER_DUMMY,
+            ..Default::default()
+        })?;
 
         let vm = Arc::new(vm);
         let guest_memory = Arc::new(guest_memory);
