@@ -57,6 +57,30 @@ fn copy_readable(src: &Path, dst: &Path) {
 #[test]
 #[ignore = "requires /dev/kvm, fixtures, and root (jailer chroot/cgroup/uid-drop)"]
 fn jailed_worker_boots_to_userspace() {
+    // Firecracker-style jail: drop to an unprivileged uid under real root, no
+    // user namespace.
+    run_jailed_boot("uiddrop", false);
+}
+
+#[test]
+#[ignore = "requires /dev/kvm, fixtures, root, and unprivileged user namespaces"]
+fn jailed_worker_boots_with_user_namespace() {
+    // The *default* `mm run` confinement: also enter a user namespace, mapping
+    // inner-root to the unprivileged uid/gid (a namespace escape lands as that
+    // uid, not real root). This path stays inner-root rather than setuid-dropping,
+    // and wraps the same fork-into-PID-namespace step — so it is verified here
+    // directly rather than reasoned about. Requires unprivileged userns on the
+    // host (confirmed by the net-jail-preflight job: userns-clone=1).
+    run_jailed_boot("userns", true);
+}
+
+/// Drive `mm __vmm-worker` exactly as `mm run` does and assert a confined microVM
+/// boots to userspace and the worker exits 0 (which only happens if the jailed
+/// guest signalled readiness over vsock). `user_namespace` toggles the
+/// `--user-namespace` hardening (off = uid-drop only; on = the production
+/// default). `tag` keeps the per-run cgroup + work dir unique so the two variants
+/// can run concurrently.
+fn run_jailed_boot(tag: &str, user_namespace: bool) {
     let root = repo_root();
     let fixtures = root.join("crates/mm-vmm/tests/fixtures");
     let kernel_src = fixtures.join("vmlinux");
@@ -68,7 +92,8 @@ fn jailed_worker_boots_to_userspace() {
 
     // Per-VM chroot the worker pivots into. The kernel + rootfs must live at the
     // paths the config names, since the VMM loads them *after* chroot.
-    let work = std::env::temp_dir().join(format!("mm-jail-test-{}", std::process::id()));
+    let slug = format!("mm-jail-{tag}-{}", std::process::id());
+    let work = std::env::temp_dir().join(&slug);
     let jail = work.join("root");
     fs::create_dir_all(&jail).expect("create jail root");
     copy_readable(&kernel_src, &jail.join("vmlinux"));
@@ -98,7 +123,7 @@ fn jailed_worker_boots_to_userspace() {
     // `mm run` does — the confined worker cannot open /dev/kvm after uid-drop.
     let kvm_fd = open_kvm_inheritable();
 
-    let cgroup = format!("mm-jail-test-{}", std::process::id());
+    let cgroup = slug.clone();
     let mm_bin = env!("CARGO_BIN_EXE_mm");
     let mut cmd = Command::new(mm_bin);
     cmd.arg("__vmm-worker")
@@ -121,9 +146,9 @@ fn jailed_worker_boots_to_userspace() {
         .arg("max")
         .arg("--mem-max")
         .arg((512u64 * 1024 * 1024).to_string());
-    // Firecracker-style jail: drop to an unprivileged uid under real root. We do
-    // not request --user-namespace here so the test does not depend on the runner
-    // permitting unprivileged user namespaces.
+    if user_namespace {
+        cmd.arg("--user-namespace");
+    }
 
     // SAFETY: pre_exec runs in the forked child before exec; dup2 is
     // async-signal-safe and clears CLOEXEC on fd 10 so it survives exec.
@@ -160,7 +185,8 @@ fn jailed_worker_boots_to_userspace() {
 
     assert!(
         status.success(),
-        "jailed worker exited unsuccessfully: code={:?} signal={:?}",
+        "jailed worker (user_namespace={user_namespace}) exited unsuccessfully: \
+         code={:?} signal={:?}",
         status.code(),
         status.signal()
     );
