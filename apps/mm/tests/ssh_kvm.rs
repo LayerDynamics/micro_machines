@@ -89,12 +89,37 @@ fn mm_ssh_reaches_the_guest() {
         std::thread::sleep(Duration::from_secs(2));
     }
 
+    // On failure, gather diagnostics (host net state + the guest boot console)
+    // before tearing down, so the failure is self-explaining.
+    let mut diag = String::new();
+    if !reached {
+        let sh = |c: &str| {
+            String::from_utf8_lossy(
+                &Command::new("sh")
+                    .args(["-c", c])
+                    .output()
+                    .map(|o| o.stdout)
+                    .unwrap_or_default(),
+            )
+            .into_owned()
+        };
+        diag.push_str(&format!("\n--- ip addr ---\n{}", sh("ip -br addr")));
+        diag.push_str(&format!("--- ip route ---\n{}", sh("ip route")));
+        let console = state.join("jails/ssh-test/console.log");
+        let log =
+            std::fs::read_to_string(&console).unwrap_or_else(|e| format!("(no console.log: {e})"));
+        diag.push_str(&format!(
+            "--- guest console ({}) ---\n{log}\n--- end ---\n",
+            console.display()
+        ));
+    }
+
     // Tear down regardless of outcome.
     let _ = mm(&["stop", "ssh-test"]).output();
     let _ = std::fs::remove_dir_all(&state);
 
     assert!(
         reached,
-        "`mm ssh` never returned the token from the guest.\nlast attempt:\n{last}"
+        "`mm ssh` never returned the token from the guest.\nlast attempt:\n{last}\n{diag}"
     );
 }
