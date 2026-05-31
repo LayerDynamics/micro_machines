@@ -420,15 +420,17 @@ impl IoDispatch for Bus {
                 return;
             }
         }
-        // Unmapped port: emulate an open bus (all ones), as real hardware does for
-        // I/O with no device. This makes the guest's legacy probes — notably the
-        // i8042 PS/2 controller at 0x60/0x64 — fail *fast* (Linux reads 0xff, flushes
-        // the phantom buffer, and reports "No controller found") instead of
-        // busy-waiting on a status bit that never sets. That i8042 timeout alone
-        // otherwise stalls the boot ~0.6s (NFR-P1). Returning 0x00 (the previous
-        // behavior) is what triggered the stall.
-        for b in data.iter_mut() {
-            *b = 0xff;
+        // i8042 PS/2 controller (data 0x60, status 0x64): we emulate *no* controller.
+        // Returning open-bus 0xff makes Linux's i8042 probe flush a phantom buffer and
+        // report "No controller found" in microseconds, instead of busy-waiting on a
+        // status bit that never sets — a ~0.6s boot stall (NFR-P1). This is scoped to
+        // the i8042 ports on purpose: a blanket 0xff for every unmapped port breaks
+        // other legacy probes (the RTC reads the update-in-progress bit and would spin
+        // if it always read as set). Other unmapped ports are left untouched.
+        if port == 0x60 || port == 0x64 {
+            for b in data.iter_mut() {
+                *b = 0xff;
+            }
         }
     }
 
@@ -470,16 +472,23 @@ mod tests {
     use crate::machine::IoDispatch;
 
     #[test]
-    fn unmapped_pio_reads_as_open_bus() {
-        // No serial, no devices: every port is unmapped and must read all-ones, so
-        // legacy probes (e.g. the i8042 status port 0x64) fail fast instead of
-        // busy-waiting on a status bit that never sets.
+    fn i8042_ports_read_open_bus_others_untouched() {
         let bus = Bus::new();
-        let mut status = [0u8; 1];
-        bus.pio_read(0x64, &mut status);
-        assert_eq!(status, [0xff], "i8042 status port must read as open bus");
-        let mut wide = [0u8; 4];
-        bus.pio_read(0x0cf8, &mut wide);
-        assert_eq!(wide, [0xff; 4], "wide unmapped read must be all-ones");
+        // i8042 status (0x64) + data (0x60) read all-ones so the probe fails fast.
+        let mut s = [0u8; 1];
+        bus.pio_read(0x64, &mut s);
+        assert_eq!(s, [0xff], "i8042 status must read open bus");
+        let mut d = [0u8; 1];
+        bus.pio_read(0x60, &mut d);
+        assert_eq!(d, [0xff], "i8042 data must read open bus");
+        // A non-i8042 unmapped port (e.g. RTC 0x71) is left untouched — a blanket
+        // 0xff there would make the RTC spin on its update-in-progress bit.
+        let mut other = [0u8; 1];
+        bus.pio_read(0x71, &mut other);
+        assert_eq!(
+            other,
+            [0x00],
+            "non-i8042 unmapped port must be left untouched"
+        );
     }
 }
