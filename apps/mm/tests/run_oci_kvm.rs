@@ -34,8 +34,14 @@ fn repo_root() -> PathBuf {
 }
 
 /// Read `stream` line by line: append every line to `sink`, and send once on `tx`
-/// the first time a line contains `READY_MARKER`.
-fn watch<R: Read + Send + 'static>(stream: R, sink: Arc<Mutex<String>>, tx: mpsc::Sender<()>) {
+/// the first time a line contains `READY_MARKER`. The returned handle completes when
+/// the stream hits EOF (i.e. the child closed it), so the caller can join to be sure
+/// all output has been captured before inspecting `sink`.
+fn watch<R: Read + Send + 'static>(
+    stream: R,
+    sink: Arc<Mutex<String>>,
+    tx: mpsc::Sender<()>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut signalled = false;
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
@@ -48,7 +54,7 @@ fn watch<R: Read + Send + 'static>(stream: R, sink: Arc<Mutex<String>>, tx: mpsc
                 let _ = tx.send(());
             }
         }
-    });
+    })
 }
 
 #[test]
@@ -88,8 +94,8 @@ fn mm_run_boots_an_oci_image() {
 
     let output = Arc::new(Mutex::new(String::new()));
     let (tx, rx) = mpsc::channel();
-    watch(child.stdout.take().unwrap(), output.clone(), tx.clone());
-    watch(child.stderr.take().unwrap(), output.clone(), tx);
+    let h_out = watch(child.stdout.take().unwrap(), output.clone(), tx.clone());
+    let h_err = watch(child.stderr.take().unwrap(), output.clone(), tx);
 
     // Wait up to 120s for the guest to signal readiness (image pull + boot).
     let booted = rx.recv_timeout(Duration::from_secs(120)).is_ok();
@@ -104,6 +110,9 @@ fn mm_run_boots_an_oci_image() {
         .stderr(Stdio::null())
         .status();
 
+    // Join the readers (the pipes are now closed) so all output is captured.
+    let _ = h_out.join();
+    let _ = h_err.join();
     let log = output.lock().map(|s| s.clone()).unwrap_or_default();
     eprintln!("--- `mm run {IMAGE}` output ---\n{log}\n--- end ---");
     let _ = std::fs::remove_dir_all(&state);
@@ -111,5 +120,12 @@ fn mm_run_boots_an_oci_image() {
     assert!(
         booted,
         "`mm run {IMAGE}` did not boot the image to userspace (no \"{READY_MARKER}\")"
+    );
+    // The guest must come up on a *writable* overlay root — not silently fall back to
+    // the read-only base (which would break authorized-key injection and any workload
+    // that writes outside /run,/tmp).
+    assert!(
+        log.contains("writable overlay root active"),
+        "guest did not get a writable overlay root\noutput:\n{log}"
     );
 }
