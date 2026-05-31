@@ -87,10 +87,12 @@ pub enum JailerError {
 pub fn confine(spec: &JailSpec) -> Result<(), JailerError> {
     // cgroup setup needs real root, so it runs before any namespace entry.
     apply_cgroup_limits(&spec.cgroup)?;
-    // The user namespace (when requested) must be entered before the others so the
-    // process holds the necessary capabilities *inside* it for chroot etc.
+    // The user namespace (when requested) is entered first so the process holds the
+    // capabilities it needs *inside* it for the unshares/chroot that follow. Only
+    // the mapped child returns from this call; the privileged parent that writes
+    // the uid/gid maps reaps the child and exits.
     if spec.user_namespace {
-        enter_user_namespace(spec.uid, spec.gid)?;
+        setup_user_namespace_via_parent(spec.uid, spec.gid)?;
     }
     enter_namespaces()?;
     // We have unshared a PID namespace, so this process can no longer spawn
@@ -109,17 +111,81 @@ pub fn confine(spec: &JailSpec) -> Result<(), JailerError> {
     Ok(())
 }
 
-/// Enter a new user namespace and map inner-root (uid/gid 0) to the outer
-/// `uid`/`gid`. `setgroups` is denied first, as the kernel requires before writing
-/// `gid_map` from an unprivileged-mapping context.
-fn enter_user_namespace(uid: u32, gid: u32) -> Result<(), JailerError> {
-    unshare(CloneFlags::CLONE_NEWUSER).map_err(JailerError::Namespace)?;
-    std::fs::write("/proc/self/setgroups", "deny").map_err(JailerError::UserNamespace)?;
-    std::fs::write("/proc/self/uid_map", format!("0 {uid} 1"))
-        .map_err(JailerError::UserNamespace)?;
-    std::fs::write("/proc/self/gid_map", format!("0 {gid} 1"))
-        .map_err(JailerError::UserNamespace)?;
-    Ok(())
+/// Enter a new user namespace mapping inner-root (uid/gid 0) to the outer
+/// `uid`/`gid`, then return *in the mapped child only*.
+///
+/// Mapping inner-root to a *different* outer uid is the entire point of the
+/// hardening (a namespace escape lands as the unprivileged uid, not real root),
+/// but it cannot be done in-place: once a process is inside the new user
+/// namespace it has no `CAP_SETUID` in the parent namespace, so the kernel lets
+/// it write only an identity map of its own uid. A non-identity map must be
+/// written by a *privileged outside* process. So we fork: the child creates the
+/// user namespace and waits; the parent (still real root, with `CAP_SETUID`)
+/// writes the child's `setgroups`/`uid_map`/`gid_map`, then reaps the child and
+/// exits with its status. A pipe in each direction sequences the two steps.
+fn setup_user_namespace_via_parent(uid: u32, gid: u32) -> Result<(), JailerError> {
+    use std::fs::File;
+    use std::io::{Read, Write};
+
+    let pipe_err = |e: nix::Error| JailerError::UserNamespace(io_from_errno(e));
+    // child -> parent: "user namespace created"; parent -> child: "maps written".
+    let (c2p_r, c2p_w) = nix::unistd::pipe().map_err(pipe_err)?;
+    let (p2c_r, p2c_w) = nix::unistd::pipe().map_err(pipe_err)?;
+
+    // SAFETY: single-threaded at confinement time (an earlier unshare/clone of a
+    // PID namespace would have failed otherwise); each branch only performs
+    // async-signal-safe work before blocking on the pipe.
+    match unsafe { fork() }.map_err(JailerError::Fork)? {
+        ForkResult::Child => {
+            // Keep the child's ends; dropping the others closes our copies.
+            drop(c2p_r);
+            drop(p2c_w);
+            unshare(CloneFlags::CLONE_NEWUSER).map_err(JailerError::Namespace)?;
+            // Signal the parent that the namespace exists and is ready to map.
+            File::from(c2p_w)
+                .write_all(&[1])
+                .map_err(JailerError::UserNamespace)?;
+            // Block until the parent has written our maps; then we are inner-root.
+            File::from(p2c_r)
+                .read_exact(&mut [0u8; 1])
+                .map_err(JailerError::UserNamespace)?;
+            Ok(())
+        }
+        ForkResult::Parent { child } => {
+            drop(c2p_w);
+            drop(p2c_r);
+            // Wait until the child has created the user namespace.
+            File::from(c2p_r)
+                .read_exact(&mut [0u8; 1])
+                .map_err(JailerError::UserNamespace)?;
+            // `setgroups` must be denied before writing `gid_map`. We write the
+            // child's maps (not our own): as real root we hold CAP_SETUID in the
+            // child's parent namespace, so a non-identity map is permitted.
+            std::fs::write(format!("/proc/{child}/setgroups"), "deny")
+                .map_err(JailerError::UserNamespace)?;
+            std::fs::write(format!("/proc/{child}/uid_map"), format!("0 {uid} 1"))
+                .map_err(JailerError::UserNamespace)?;
+            std::fs::write(format!("/proc/{child}/gid_map"), format!("0 {gid} 1"))
+                .map_err(JailerError::UserNamespace)?;
+            // Release the child to continue confinement as inner-root.
+            File::from(p2c_w)
+                .write_all(&[1])
+                .map_err(JailerError::UserNamespace)?;
+            // Reap the VMM child and mirror its exit status.
+            let code = match waitpid(child, None) {
+                Ok(WaitStatus::Exited(_, code)) => code,
+                Ok(WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
+                _ => 1,
+            };
+            std::process::exit(code);
+        }
+    }
+}
+
+/// Convert a `nix` errno into a `std::io::Error` (for the few nix calls whose
+/// failures are surfaced as `JailerError::UserNamespace`).
+fn io_from_errno(e: nix::Error) -> std::io::Error {
+    std::io::Error::from_raw_os_error(e as i32)
 }
 
 /// Create the per-VM cgroup, write its limits, and move this process into it.
