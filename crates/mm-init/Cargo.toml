@@ -1,0 +1,16 @@
+[package]
+name = "mm-init"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mm-init"
+path = "src/main.rs"
+
+[dependencies]
+# Intentionally tiny. No async runtime, no serde in the hot path.
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true }
+libc = { workspace = true }

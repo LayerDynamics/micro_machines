@@ -247,6 +247,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mm-init"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "nix",
+]
+
+[[package]]
 name = "mm-net"
 version = "0.0.0"
 dependencies = [

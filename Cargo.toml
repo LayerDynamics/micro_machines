@@ -4,6 +4,7 @@ members = [
     "crates/mm-api-types",
     "crates/mm-vmm",
     "crates/mm-net",
+    "crates/mm-init",
 ]
 
 [workspace.package]
