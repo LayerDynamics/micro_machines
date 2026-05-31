@@ -1,0 +1,27 @@
+[package]
+name = "mm-vmm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mm-api-types = { path = "../mm-api-types" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-ioctls = { workspace = true }
+kvm-bindings = { workspace = true }
+vm-memory = { workspace = true }
+vmm-sys-util = { workspace = true }
+linux-loader = { workspace = true }
+vm-superio = { workspace = true }
+vm-allocator = { workspace = true }
+event-manager = { workspace = true }
+virtio-queue = { workspace = true }
+libc = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+# KVM-dependent integration tests, run only on linux+kvm hosts.
+kvm-integration = []

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/mm-api-types",
+    "crates/mm-vmm",
 ]
 
 [workspace.package]
@@ -20,6 +21,34 @@ serde_json = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+
+# --- M1 walking-skeleton deps ---
+# rust-vmm crate ecosystem (the native VMM core). The KVM/memory/loader crates
+# are a tightly-coupled set; versions come from a known-good matrix (Firecracker's
+# published pins) so resolution does not deadlock. These are referenced only from
+# `[target.'cfg(target_os = "linux")'.dependencies]` tables, so non-Linux hosts
+# never compile them.
+kvm-ioctls = "0.24"
+kvm-bindings = { version = "0.14", features = ["fam-wrappers", "serde"] }
+vm-memory = { version = "0.17", features = ["backend-mmap", "backend-bitmap"] }
+vmm-sys-util = "0.15"
+linux-loader = "0.13"
+vm-superio = "0.8"
+vm-allocator = { version = "0.1", features = ["serde"] }
+event-manager = "0.4"
+virtio-queue = "0.16"
+seccompiler = "0.5"
+
+# Host-side syscalls / namespaces / mounts (linux-only consumers).
+nix = { version = "0.30", features = ["mount", "sched", "user", "net", "fs", "reboot", "ioctl"] }
+
+# CLI + observability + ergonomics (cross-platform).
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+libc = "0.2"
+redb = "2"
 
 [profile.release]
 lto = "thin"
