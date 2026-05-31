@@ -103,14 +103,14 @@ pub fn run(args: RunArgs) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::process::Command;
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::os::unix::io::RawFd;
+    use std::os::unix::process::CommandExt;
+    use std::path::Path;
+    use std::process::{Child, Command};
 
     use anyhow::{Context, Result};
     use mm_api_types::{ObjectMeta, State};
     use mm_image::ImageStore;
-    use mm_vmm::{Machine, VcpuHook, VmmError};
     use time::OffsetDateTime;
 
     use super::*;
@@ -120,6 +120,12 @@ mod linux {
     const SUBNET_BASE: [u8; 3] = [10, 0, 0];
     const SUBNET_CIDR: &str = "10.0.0.0/24";
     const BRIDGE: &str = "mm-br0";
+    /// Unprivileged uid/gid the jailed worker drops to (nobody/nogroup).
+    const WORKER_UID: u32 = 65534;
+    const WORKER_GID: u32 = 65534;
+    /// Fixed fd numbers the worker inherits the KVM + TAP fds at.
+    const WORKER_KVM_FD: RawFd = 10;
+    const WORKER_TAP_FD: RawFd = 11;
 
     /// Path to the guest kernel (`MM_KERNEL`, else `<root>/vmlinux`).
     fn kernel_path() -> PathBuf {
@@ -128,11 +134,11 @@ mod linux {
             .unwrap_or_else(|| crate::commands::state_root().join("vmlinux"))
     }
 
-    /// Full `mm run` orchestration on Linux. Runs the VM in the foreground: it
-    /// returns when the guest powers off (background it with `&` to keep using the
-    /// CLI). Privileged host setup (bridge/TAP/NAT) happens first; the in-process
-    /// VMM is then hardened with cgroup limits and a per-thread seccomp filter
-    /// applied before any guest code runs.
+    /// Privileged `mm run`: build the rootfs, wire the bridge/TAP/NAT, open
+    /// `/dev/kvm`, prepare a per-VM chroot, then spawn the jailed `mm __vmm-worker`
+    /// child — passing it the KVM + TAP fds. The child confines itself
+    /// (namespaces/chroot/cgroup/seccomp/uid-drop) and runs the guest. This parent
+    /// records the machine and waits in the foreground (background with `&`).
     pub fn launch(args: &RunArgs, store: &Store) -> Result<()> {
         let root = crate::commands::state_root();
 
@@ -159,19 +165,31 @@ mod linux {
         let ip = ipam.allocate().context("guest IP pool exhausted")?;
         let gateway = ipam.gateway();
 
-        // 3. Privileged host networking (must precede any confinement, SPEC-1 C6).
+        // 3. Privileged host networking (must precede confinement, SPEC-1 C6).
         mm_net::ensure_bridge(BRIDGE, gateway, 24).context("ensuring bridge")?;
         let tap_name = format!("mm-{name}");
-        let _tap = mm_net::create_tap(&tap_name, BRIDGE).context("creating TAP")?;
+        let tap = mm_net::create_tap(&tap_name, BRIDGE).context("creating TAP")?;
         let egress = default_egress_iface().unwrap_or_else(|| "eth0".to_string());
         mm_net::enable_nat(SUBNET_CIDR, &egress).context("enabling NAT")?;
 
-        // 4. VM configuration.
-        let cfg = build_vm_config(
+        // 4. Open an inheritable /dev/kvm fd for the worker.
+        let kvm_fd = open_kvm_inheritable()?;
+
+        // 5. Prepare the chroot: hardlink (or copy) the kernel + rootfs in, so the
+        //    confined worker can open them at /vmlinux and /rootfs.ext4.
+        let jail = root.join("jails").join(&name);
+        let jail_root = jail.join("root");
+        std::fs::create_dir_all(&jail_root)
+            .with_context(|| format!("creating jail {}", jail_root.display()))?;
+        link_or_copy(&kernel_path(), &jail_root.join("vmlinux"))?;
+        link_or_copy(&rootfs, &jail_root.join("rootfs.ext4"))?;
+
+        // 6. Worker VM config with chroot-relative paths; serialized for the child.
+        let worker_cfg = build_vm_config(
             args.cpus,
             args.memory,
-            kernel_path(),
-            rootfs,
+            PathBuf::from("/vmlinux"),
+            PathBuf::from("/rootfs.ext4"),
             ip,
             gateway,
             NETMASK,
@@ -180,43 +198,26 @@ mod linux {
             mac_from_ip(ip),
             args.ssh,
         );
-        cfg.validate().context("validating VM config")?;
+        worker_cfg.validate().context("validating VM config")?;
+        let cfg_path = jail.join("config.json");
+        std::fs::write(&cfg_path, serde_json::to_vec(&worker_cfg)?)
+            .with_context(|| format!("writing {}", cfg_path.display()))?;
 
-        // 5. Hardening that composes with the in-process VMM:
-        //    (a) cgroup v2 cpu/memory caps; (b) per-thread seccomp before guest code.
-        // NOTE: M1 `mm run` is the privileged (root) path. The seccomp install in
-        // the vCPU hook relies on that privilege; it does NOT first set
-        // PR_SET_NO_NEW_PRIVS (that happens in the not-yet-wired jailer `confine`),
-        // so a rootless `mm run` would fail at the hook and abort the boot. See the
-        // M1 plan TODO 1 (wiring the full jailer into the in-process boot).
-        let cgroup = mm_sandbox::CgroupLimits {
-            name: format!("micro_machines/{name}"),
-            cpu_max: format!("{} 100000", u64::from(args.cpus) * 100_000),
-            memory_max_bytes: args.memory * 1024 * 1024,
-        };
-        if let Err(e) = mm_sandbox::apply_cgroup_limits(&cgroup) {
-            tracing::warn!("cgroup limits not applied ({e}); continuing without caps");
-        }
-        let rules = Arc::new(mm_sandbox::vmm_thread_rules());
-        let hook: VcpuHook = {
-            let rules = rules.clone();
-            Arc::new(move |_idx| {
-                rules
-                    .apply_to_current_thread()
-                    .map_err(|e| VmmError::Device(format!("seccomp install failed: {e}")))
-            })
-        };
+        // 7. Spawn the jailed worker, passing the KVM + TAP fds.
+        let cgroup = format!("micro_machines/{name}");
+        let cpu_max = format!("{} 100000", u64::from(args.cpus) * 100_000);
+        let mem_max = args.memory * 1024 * 1024;
+        let mut child = spawn_worker(
+            &cfg_path,
+            kvm_fd,
+            tap.as_raw_fd(),
+            &jail_root,
+            &cgroup,
+            &cpu_max,
+            mem_max,
+        )?;
 
-        // 6. Boot.
-        let mut machine = Machine::boot_with_hook(&cfg, Some(hook)).context("booting microVM")?;
-        let ready = machine
-            .wait_for_ready(Duration::from_secs(10))
-            .context("waiting for guest readiness")?;
-        if !ready {
-            tracing::warn!("guest did not signal readiness within 10s");
-        }
-
-        // 7. Record as running and report.
+        // 8. Record as running and report.
         let record = MachineRecord {
             meta: ObjectMeta::new(&name, "default", OffsetDateTime::now_utc()),
             state: State::Running,
@@ -225,17 +226,105 @@ mod linux {
             memory_mib: args.memory,
             ip: Some(ip),
             tap: Some(tap_name),
-            pid: Some(std::process::id()),
+            pid: Some(child.id()),
         };
         store.put(&record)?;
         println!("{name}\t{ip}");
 
-        // 8. Foreground: serve the guest until it powers off, then mark stopped.
-        machine.shutdown().context("running microVM")?;
+        // The child now owns its copies of the fds; the persistent TAP survives the
+        // parent dropping its handle.
+        // SAFETY: `kvm_fd` is the fd we opened; the child inherited its own copy.
+        unsafe { libc::close(kvm_fd) };
+        drop(tap);
+
+        // 9. Foreground: wait for the worker, then mark stopped.
+        let status = child.wait().context("waiting for the VMM worker")?;
+        if !status.success() {
+            tracing::warn!("VMM worker exited with {status}");
+        }
         let mut stopped = record;
         stopped.state = State::Stopped;
         stopped.pid = None;
         store.put(&stopped)?;
+        Ok(())
+    }
+
+    /// Spawn `mm __vmm-worker`, dup'ing the KVM + TAP fds to fixed numbers in the
+    /// child so they survive `exec` at predictable descriptors.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_worker(
+        config: &Path,
+        kvm_fd: RawFd,
+        tap_fd: RawFd,
+        chroot: &Path,
+        cgroup: &str,
+        cpu_max: &str,
+        mem_max: u64,
+    ) -> Result<Child> {
+        let exe = std::env::current_exe().context("locating current executable")?;
+        let mut cmd = Command::new(exe);
+        cmd.arg("__vmm-worker")
+            .arg("--config")
+            .arg(config)
+            .arg("--kvm-fd")
+            .arg(WORKER_KVM_FD.to_string())
+            .arg("--tap-fd")
+            .arg(WORKER_TAP_FD.to_string())
+            .arg("--chroot")
+            .arg(chroot)
+            .arg("--uid")
+            .arg(WORKER_UID.to_string())
+            .arg("--gid")
+            .arg(WORKER_GID.to_string())
+            .arg("--cgroup")
+            .arg(cgroup)
+            .arg("--cpu-max")
+            .arg(cpu_max)
+            .arg("--mem-max")
+            .arg(mem_max.to_string());
+
+        // SAFETY: `pre_exec` runs in the forked child before `exec`; `dup2` is
+        // async-signal-safe and clears CLOEXEC on the target, so 10/11 survive exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::dup2(kvm_fd, WORKER_KVM_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::dup2(tap_fd, WORKER_TAP_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        cmd.spawn().context("spawning VMM worker")
+    }
+
+    /// Open `/dev/kvm` read-write *without* CLOEXEC so the fd is inherited by the
+    /// re-exec'd worker.
+    fn open_kvm_inheritable() -> Result<RawFd> {
+        let path = std::ffi::CString::new("/dev/kvm").expect("static path has no NUL");
+        // SAFETY: `path` is a valid C string; we check the result.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
+        if fd < 0 {
+            return Err(anyhow::anyhow!(
+                "opening /dev/kvm: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(fd)
+    }
+
+    /// Hardlink `src` into `dst`, falling back to a copy across filesystems. A
+    /// pre-existing `dst` is reused.
+    fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
+        if dst.exists() {
+            return Ok(());
+        }
+        if std::fs::hard_link(src, dst).is_ok() {
+            return Ok(());
+        }
+        std::fs::copy(src, dst)
+            .with_context(|| format!("copying {} -> {}", src.display(), dst.display()))?;
         Ok(())
     }
 

@@ -31,6 +31,9 @@ enum Command {
     Rm(commands::rm::RmArgs),
     /// SSH into a machine by name.
     Ssh(commands::ssh::SshArgs),
+    /// (internal) Jailed VMM worker, spawned by `mm run`. Not for direct use.
+    #[command(name = "__vmm-worker", hide = true)]
+    Worker(commands::worker::WorkerArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -48,5 +51,6 @@ fn main() -> anyhow::Result<()> {
         Command::Stop(args) => commands::stop::run(args),
         Command::Rm(args) => commands::rm::run(args),
         Command::Ssh(args) => commands::ssh::run(args),
+        Command::Worker(args) => commands::worker::run(args),
     }
 }

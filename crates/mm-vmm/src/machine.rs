@@ -6,7 +6,7 @@
 //! kernel ([`crate::boot`]), configures the vCPUs for the boot protocol, and runs
 //! them. [`Machine::wait_for_ready`] blocks on the guest's vsock readiness signal.
 use std::fmt::Write as _;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -103,15 +103,25 @@ pub struct Machine {
     ready: Option<Arc<VsockReady>>,
     /// Optional per-vCPU-thread pre-run hook (e.g. seccomp install).
     vcpu_hook: Option<VcpuHook>,
+    /// Pre-opened TAP fds, consumed in order by configured net devices. Non-empty
+    /// only on the jailed boot path, where the (now unprivileged) VMM cannot open
+    /// the TAP itself — the privileged parent opened it and passed the fd in.
+    tap_fds: Vec<RawFd>,
 }
 
 impl Machine {
     /// Create the VM: validate the config, open `/dev/kvm`, allocate and map guest
     /// RAM, set up the in-kernel IRQ chip + PIT, and create the vCPUs.
     pub fn new(config: &VmConfig) -> Result<Self> {
+        Self::with_resources(config, Kvm::new()?, Vec::new())
+    }
+
+    /// Like [`Machine::new`] but uses a pre-opened `kvm` handle and pre-opened TAP
+    /// fds — the jailed boot path passes both in because the confined, unprivileged
+    /// VMM can no longer open `/dev/kvm` or `/dev/net/tun` itself.
+    fn with_resources(config: &VmConfig, kvm: Kvm, tap_fds: Vec<RawFd>) -> Result<Self> {
         config.validate()?;
 
-        let kvm = Kvm::new()?;
         let vm = kvm.create_vm()?;
 
         let guest_memory = Self::allocate_guest_memory(config.memory_mib)?;
@@ -140,6 +150,7 @@ impl Machine {
             bus: None,
             ready: None,
             vcpu_hook: None,
+            tap_fds,
         })
     }
 
@@ -157,6 +168,29 @@ impl Machine {
     /// (SPEC-1 FR-27).
     pub fn boot_with_hook(config: &VmConfig, vcpu_hook: Option<VcpuHook>) -> Result<Self> {
         let mut machine = Self::new(config)?;
+        machine.vcpu_hook = vcpu_hook;
+        machine.start()?;
+        Ok(machine)
+    }
+
+    /// Boot using resources opened by a privileged parent: an inherited `/dev/kvm`
+    /// fd and one inherited TAP fd per configured net device (in config order).
+    /// This is the entry point for the jailed worker, which has already been
+    /// confined (namespaces/chroot/cgroup/uid-drop) and therefore cannot open these
+    /// itself. `vcpu_hook` installs the per-thread seccomp filter before guest code.
+    ///
+    /// # Safety
+    /// `kvm_fd` and each entry of `tap_fds` must be valid, open file descriptors
+    /// that ownership is transferred to this call.
+    pub fn boot_jailed(
+        config: &VmConfig,
+        kvm_fd: RawFd,
+        tap_fds: Vec<RawFd>,
+        vcpu_hook: Option<VcpuHook>,
+    ) -> Result<Self> {
+        // SAFETY: the caller guarantees `kvm_fd` is an open /dev/kvm fd we now own.
+        let kvm = unsafe { Kvm::from_raw_fd(kvm_fd) };
+        let mut machine = Self::with_resources(config, kvm, tap_fds)?;
         machine.vcpu_hook = vcpu_hook;
         machine.start()?;
         Ok(machine)
@@ -199,13 +233,22 @@ impl Machine {
             Box::new(vsock),
         )?;
 
+        // Pre-opened TAP fds (jailed boot) are consumed in net-device order; an
+        // empty queue means the in-process boot opens the TAP by name itself.
+        let mut tap_fds = std::mem::take(&mut self.tap_fds).into_iter();
+
         // Configured devices: net (attach to its TAP). The boot vsock above already
         // covers M1's single vsock use; balloon is a tracked M1 TODO, so a config
         // that asks for it fails loudly rather than being silently dropped.
         for device in &self.config.devices {
             match device {
                 ConfigDevice::Net { tap_name, mac } => {
-                    let tap = open_tap(tap_name)?;
+                    let tap = match tap_fds.next() {
+                        // SAFETY: the parent passed us this open TAP fd via fd
+                        // inheritance; we take exclusive ownership of it here.
+                        Some(fd) => unsafe { std::fs::File::from_raw_fd(fd) },
+                        None => open_tap(tap_name)?,
+                    };
                     let net = Net::new(tap, parse_mac(mac)?);
                     self.attach_virtio(
                         &mut bus,

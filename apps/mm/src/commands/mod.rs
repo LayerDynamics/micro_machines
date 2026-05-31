@@ -4,6 +4,7 @@ pub mod rm;
 pub mod run;
 pub mod ssh;
 pub mod stop;
+pub mod worker;
 
 use std::path::PathBuf;
 
