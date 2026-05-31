@@ -184,6 +184,11 @@ mod linux {
 
         // 5. Hardening that composes with the in-process VMM:
         //    (a) cgroup v2 cpu/memory caps; (b) per-thread seccomp before guest code.
+        // NOTE: M1 `mm run` is the privileged (root) path. The seccomp install in
+        // the vCPU hook relies on that privilege; it does NOT first set
+        // PR_SET_NO_NEW_PRIVS (that happens in the not-yet-wired jailer `confine`),
+        // so a rootless `mm run` would fail at the hook and abort the boot. See the
+        // M1 plan TODO 1 (wiring the full jailer into the in-process boot).
         let cgroup = mm_sandbox::CgroupLimits {
             name: format!("micro_machines/{name}"),
             cpu_max: format!("{} 100000", u64::from(args.cpus) * 100_000),
