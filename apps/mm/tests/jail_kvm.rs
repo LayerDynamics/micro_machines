@@ -5,9 +5,12 @@
 //! production confinement path — cgroup v2 limits, mount/pid/net namespaces,
 //! chroot into a per-VM root, `no_new_privs`, drop to an unprivileged uid/gid, and
 //! a per-thread seccomp allowlist — and only then boots guest code using an
-//! inherited `/dev/kvm` fd (the confined process cannot open it itself). The
-//! worker exits 0 *only if* the jailed guest signalled readiness over vsock, so a
-//! clean exit is proof the whole jailed path works end to end.
+//! inherited `/dev/kvm` fd (the confined process cannot open it itself). Proof of
+//! a successful jailed boot is twofold: the worker exits 0 **and** its tracing
+//! reports the guest signalled readiness over vsock. The second check is load
+//! bearing — the worker exits 0 even on a readiness *timeout*, so exit code alone
+//! would pass a guest that never reached userspace (e.g. a device worker blocked
+//! by an over-tight seccomp filter).
 //!
 //! No net device is configured: the jail is tested in isolation, so the worker
 //! needs only the inherited KVM fd (the TAP fd is unused, passed as -1).
@@ -19,9 +22,10 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
+use std::io::Read;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use mm_vmm::{BlockDevice, VmConfig};
@@ -149,6 +153,11 @@ fn run_jailed_boot(tag: &str, user_namespace: bool) {
     if user_namespace {
         cmd.arg("--user-namespace");
     }
+    // Capture stderr (the worker's tracing) so we can prove the guest actually
+    // reached userspace — the worker exits 0 even on a readiness *timeout*, so a
+    // clean exit alone is not proof of boot. stdout (the guest serial console)
+    // stays inherited so it still shows in CI logs.
+    cmd.stderr(Stdio::piped());
 
     // SAFETY: pre_exec runs in the forked child before exec; dup2 is
     // async-signal-safe and clears CLOEXEC on fd 10 so it survives exec.
@@ -164,6 +173,15 @@ fn run_jailed_boot(tag: &str, user_namespace: bool) {
     let mut child = cmd.spawn().expect("spawn mm __vmm-worker");
     // SAFETY: kvm_fd is our copy; the child inherited its own dup at fd 10.
     unsafe { libc::close(kvm_fd) };
+
+    // Drain the worker's stderr concurrently so its pipe never fills, and so we can
+    // inspect it after exit. The reader returns when the worker closes stderr.
+    let mut stderr_pipe = child.stderr.take().expect("piped worker stderr");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr_pipe.read_to_string(&mut buf);
+        buf
+    });
 
     // Wait up to 60s for the jailed worker to boot the guest, observe readiness,
     // and exit. std has no timed wait, so poll.
@@ -181,7 +199,10 @@ fn run_jailed_boot(tag: &str, user_namespace: bool) {
         std::thread::sleep(Duration::from_millis(50));
     };
 
+    let stderr = stderr_reader.join().unwrap_or_default();
     cleanup(&work, &cgroup);
+    // Surface the worker's tracing in CI logs (stderr was piped, not inherited).
+    eprintln!("--- worker stderr (user_namespace={user_namespace}) ---\n{stderr}\n--- end ---");
 
     assert!(
         status.success(),
@@ -189,6 +210,14 @@ fn run_jailed_boot(tag: &str, user_namespace: bool) {
          code={:?} signal={:?}",
         status.code(),
         status.signal()
+    );
+    // A clean exit is not enough: the worker exits 0 even if readiness timed out.
+    // Require the positive readiness marker so a guest that never reaches userspace
+    // (e.g. a device worker blocked by an over-tight seccomp filter) fails the test.
+    assert!(
+        stderr.contains("guest signaled readiness over vsock"),
+        "jailed guest did not reach userspace (no readiness signal) — \
+         user_namespace={user_namespace}\nworker stderr:\n{stderr}"
     );
 }
 

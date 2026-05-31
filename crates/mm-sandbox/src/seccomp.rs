@@ -2,10 +2,16 @@
 //!
 //! Before a vCPU ever runs guest code, the thread that will host it is locked down
 //! to the minimal syscall set the VMM needs at steady state: KVM `ioctl`s, the
-//! eventfd/epoll machinery the device workers use, memory management, and the
-//! futex/signal primitives the runtime relies on. Everything else — crucially
-//! `execve`, `clone`, `ptrace`, `socket` — is denied, so a guest escape that hijacks
-//! a vCPU thread cannot spawn a shell or open new attack surface.
+//! eventfd/epoll machinery the device workers use, memory management, the
+//! futex/signal primitives the runtime relies on, and **thread creation** — virtio
+//! devices spawn their epoll worker thread from `activate()`, which the guest
+//! triggers (by writing `DRIVER_OK`) *after* this filter is installed, so the
+//! thread-spawn syscalls must be permitted or no device ever services its queues.
+//! The escalation primitives are still denied — crucially `execve`/`execveat`,
+//! `fork`/`vfork`, `ptrace`, and `socket` — so a guest escape that hijacks a vCPU
+//! thread still cannot spawn a shell or open new attack surface. (Tighter
+//! arg-filtering of `clone` to `CLONE_THREAD` only is a future hardening; it needs
+//! a per-syscall `clone3 -> ENOSYS` fallback the current backend does not express.)
 //!
 //! The allowlist itself is plain, cross-platform data (a set of syscall *names*),
 //! which keeps it unit-testable on any host. Compiling it to a BPF program and
@@ -31,9 +37,10 @@ impl SeccompAllowlist {
     }
 }
 
-/// The allowlist for a VMM/vCPU thread after the guest is running. Deliberately
-/// excludes `execve`/`fork`/`clone`/`ptrace`/`socket` (the guest VMM thread must
-/// never exec or fork).
+/// The allowlist for a VMM/vCPU thread after the guest is running. Permits thread
+/// creation (virtio device workers spawn under this filter) but deliberately
+/// excludes `execve`/`execveat`/`fork`/`vfork`/`ptrace`/`socket` — the guest VMM
+/// thread must never exec, fork a process, trace, or open a socket.
 pub fn vmm_thread_rules() -> SeccompAllowlist {
     let allowed = [
         // KVM control + general file I/O.
@@ -72,6 +79,14 @@ pub fn vmm_thread_rules() -> SeccompAllowlist {
         "mprotect",
         "madvise",
         "brk",
+        // Thread creation for virtio device workers (block/vsock/net/balloon each
+        // spawn an epoll worker thread from activate(), under this filter). These
+        // create *threads*, not processes; execve/fork/vfork stay denied below.
+        "clone",
+        "clone3",
+        "set_robust_list",
+        "rseq",
+        "prctl", // std sets the worker thread name via prctl(PR_SET_NAME)
         // Scheduling, synchronization, and signals.
         "futex",
         "sched_yield",
@@ -192,6 +207,11 @@ mod apply {
             "mprotect" => libc::SYS_mprotect,
             "madvise" => libc::SYS_madvise,
             "brk" => libc::SYS_brk,
+            "clone" => libc::SYS_clone,
+            "clone3" => libc::SYS_clone3,
+            "set_robust_list" => libc::SYS_set_robust_list,
+            "rseq" => libc::SYS_rseq,
+            "prctl" => libc::SYS_prctl,
             "futex" => libc::SYS_futex,
             "sched_yield" => libc::SYS_sched_yield,
             "rt_sigprocmask" => libc::SYS_rt_sigprocmask,
@@ -229,17 +249,17 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_denies_process_creation_and_tracing() {
+    fn allowlist_denies_exec_fork_trace_and_sockets() {
+        // The escalation primitives stay denied. `clone`/`clone3` are *not* here:
+        // they create the device workers' threads (see allowlist_permits_*).
         let rules = vmm_thread_rules();
-        for forbidden in [
-            "execve", "execveat", "fork", "vfork", "clone", "ptrace", "socket",
-        ] {
+        for forbidden in ["execve", "execveat", "fork", "vfork", "ptrace", "socket"] {
             assert!(!rules.allows(forbidden), "{forbidden} must be denied");
         }
     }
 
     #[test]
-    fn allowlist_permits_the_event_loop_primitives() {
+    fn allowlist_permits_the_event_loop_and_thread_creation() {
         let rules = vmm_thread_rules();
         for needed in [
             "ioctl",
@@ -249,6 +269,9 @@ mod tests {
             "futex",
             "mmap",
             "close",
+            // Device workers spawn threads from activate(), under this filter.
+            "clone",
+            "clone3",
         ] {
             assert!(rules.allows(needed), "{needed} must be allowed");
         }

@@ -110,7 +110,9 @@ mod linux {
         let ready = machine
             .wait_for_ready(Duration::from_secs(10))
             .context("waiting for guest readiness")?;
-        if !ready {
+        if ready {
+            tracing::info!("guest signaled readiness over vsock");
+        } else {
             tracing::warn!("guest did not signal readiness within 10s");
         }
 
