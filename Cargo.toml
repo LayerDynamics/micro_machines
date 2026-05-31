@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mm-api-types",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/layerdynamics/micro_machines"
+authors = ["The MicroMachines Authors"]
+rust-version = "1.74"
+
+[workspace.dependencies]
+# Shared third-party deps are declared here once; member crates reference them
+# with `serde = { workspace = true }`. Versions are managed in this single place.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
