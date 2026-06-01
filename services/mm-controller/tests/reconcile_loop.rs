@@ -127,6 +127,7 @@ async fn reconcile_schedules_boots_and_survives_restart() {
                             uid,
                             state: mm_controller::convert::api_state_to_proto(State::Running),
                             message: "booted".into(),
+                            ip: "10.0.0.99".into(),
                         })
                         .await;
                 }
@@ -164,6 +165,13 @@ async fn reconcile_schedules_boots_and_survives_restart() {
         }
     }
     assert!(converged, "machine never converged to Running (NFR-R4)");
+    // The agent's reported IP propagated into observed status.
+    let m = store.get_machine_by_uid(uid).await.unwrap().unwrap();
+    assert_eq!(
+        m.status.ip.as_deref(),
+        Some("10.0.0.99"),
+        "agent-reported IP recorded in status"
+    );
     let assignments_when_running = received.load(Ordering::SeqCst);
 
     // 7. Simulate a controller restart: a fresh registry (no in-flight state) plus a

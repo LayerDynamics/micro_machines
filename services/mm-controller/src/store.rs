@@ -186,6 +186,25 @@ impl Store {
         Ok(res.rows_affected())
     }
 
+    /// Set both the observed state and the guest IP (the agent learns the IP when it
+    /// boots the machine, so it reports both together). Returns rows changed.
+    pub async fn set_observed(&self, uid: Uuid, state: &str, ip: &str) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE machines
+             SET status = jsonb_set(
+                     jsonb_set(status, '{state}', to_jsonb($2::text)),
+                     '{ip}', to_jsonb($3::text)),
+                 updated_at = now()
+             WHERE uid = $1",
+        )
+        .bind(uid)
+        .bind(state)
+        .bind(ip)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Set `spec.running` (the `start`/`stop` verbs) and bump `updated_at`. Returns
     /// the number of rows changed (0 if the machine does not exist).
     pub async fn set_running(

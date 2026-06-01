@@ -228,12 +228,13 @@ async fn handle_assignment(
         };
         match actuator::boot(host, &req, reserved_ips(store)?) {
             Ok(machine) => {
+                let ip = machine.ip.clone().unwrap_or_default();
                 store.put(&machine)?;
-                report(hosts, &uid, State::Running, "booted").await;
+                report(hosts, &uid, State::Running, "booted", &ip).await;
             }
             Err(e) => {
                 tracing::warn!("booting {uid}: {e}");
-                report(hosts, &uid, State::Failed, &e.to_string()).await;
+                report(hosts, &uid, State::Failed, &e.to_string(), "").await;
             }
         }
     } else if let Some(machine) = existing {
@@ -244,17 +245,25 @@ async fn handle_assignment(
         stopped.state = "stopped".to_string();
         stopped.pid = None;
         store.put(&stopped)?;
-        report(hosts, &uid, State::Stopped, "stopped").await;
+        report(hosts, &uid, State::Stopped, "stopped", "").await;
     }
     Ok(())
 }
 
-/// Report a machine's observed state transition to the controller (best-effort).
-async fn report(hosts: &mut HostServiceClient<Channel>, uid: &str, state: State, message: &str) {
+/// Report a machine's observed state transition to the controller (best-effort). A
+/// `Running` event carries the guest IP the agent allocated at boot.
+async fn report(
+    hosts: &mut HostServiceClient<Channel>,
+    uid: &str,
+    state: State,
+    message: &str,
+    ip: &str,
+) {
     let event = MachineEvent {
         uid: uid.to_string(),
         state: state as i32,
         message: message.to_string(),
+        ip: ip.to_string(),
     };
     if let Err(e) = hosts.report_event(event).await {
         tracing::warn!("reporting event for {uid}: {e}");

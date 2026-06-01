@@ -44,4 +44,4 @@ message Machine { MachineRef ref = 1; MachineSpec spec = 2; MachineStatus status
 message Assignment { Machine machine = 1; }
 message Capacity { string host_id = 1; uint32 vcpus_total = 2; uint32 vcpus_free = 3;
   uint64 mem_mib_total = 4; uint64 mem_mib_free = 5; }
-message MachineEvent { string uid = 1; State state = 2; string message = 3; }
+message MachineEvent { string uid = 1; State state = 2; string message = 3; string ip = 4; }

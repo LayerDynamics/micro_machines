@@ -152,11 +152,15 @@ impl HostService for HostSvc {
         let uid = parse_uid(&ev.uid)?;
         let state = proto_state_name(ev.state)
             .ok_or_else(|| Status::invalid_argument("unknown machine state"))?;
-        self.store
-            .set_observed_state(uid, state)
-            .await
-            .map_err(internal)?;
-        tracing::info!(uid = %ev.uid, state, msg = %ev.message, "agent reported state");
+        // The agent learns the guest IP at boot, so a Running event carries it; other
+        // events leave the stored IP untouched.
+        if ev.ip.is_empty() {
+            self.store.set_observed_state(uid, state).await
+        } else {
+            self.store.set_observed(uid, state, &ev.ip).await
+        }
+        .map_err(internal)?;
+        tracing::info!(uid = %ev.uid, state, ip = %ev.ip, msg = %ev.message, "agent reported state");
         Ok(Response::new(ack()))
     }
 
