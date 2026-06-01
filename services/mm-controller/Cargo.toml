@@ -1,0 +1,24 @@
+[package]
+name = "mm-controller"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "MicroMachines control plane: REST API + scheduler + reconciler + Postgres store (M2)"
+
+[[bin]]
+name = "mm-controller"
+path = "src/main.rs"
+
+[dependencies]
+mm-api-types = { path = "../../crates/mm-api-types" }
+
+tokio = { workspace = true }
+sqlx = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

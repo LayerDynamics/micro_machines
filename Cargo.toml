@@ -9,6 +9,7 @@ members = [
     "crates/mm-image",
     "apps/mm",
     "crates/mm-proto",
+    "services/mm-controller",
 ]
 
 [workspace.package]
