@@ -535,4 +535,10 @@ mm --server $S snapshot m3 && mm --server $S fork m3 --count 100                
 - [ ] All pure-logic units have passing tests; KVM integration tests pass on the kvm runner; clippy + fmt clean; every task committed.
 - [ ] Running-sandbox BRANCH (FR-16) is recorded as a TODO, NOT implemented (out of M3 scope).
 
-**TODOs discovered during M3** (note, do NOT fix now): _record here (e.g. FR-16 running BRANCH via diff snapshots + UFFD_WP live copy; snapshot GC/retention; multi-arch fork fixtures)._
+**TODOs discovered during M3** (note, do NOT fix now):
+- **FR-16 running-sandbox BRANCH** (SHOULD, out of M3 scope) — branch a *running* (not paused) sandbox via diff snapshots + `UFFD_WP` live page copy, so the parent keeps running while children fork. M3 forks a paused parent only.
+- **Full N=100 fork fan-out sweep** — `fork_kvm.rs` proves the CoW mechanism + isolation at N=4 (~2 ms/child, far under NFR-P2's 150 ms p50); the explicit N=100-concurrent p50 number on a bare-metal host is a benchmark-coverage follow-up (100 live microVMs is heavy for the shared nested-KVM CI runner).
+- **In-guest fork independence via exec** — `fork_kvm.rs` proves CoW isolation by writing/reading each child's guest RAM directly; a richer check would `mm exec` a distinct command in 3 random children and assert independent results.
+- **Cluster exec forwarding (Task 8/55)** — controller→agent→guest `exec` over the control plane needs a reverse channel to the client-only agent; `MachineService.Exec` was deferred with its message contract kept (see machine.proto). Single-host `mm exec` is done + green.
+- **Snapshot GC/retention + cross-host restore** — snapshots accrete files under the state dir; restore currently assumes the same host (TSC/CPUID).
+- **userfaultfd UFFD_WP fork optimization** — M3's fork uses kernel `MAP_PRIVATE` CoW (proven, fast). The plan's `UFFD_WP` lazy-copy is an optional optimization to shrink the source-pause window further; not required for the proven core.
