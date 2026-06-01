@@ -846,11 +846,16 @@ impl VsockWorker {
 
 #[cfg(test)]
 mod tests {
+    use virtio_queue::desc::{split::Descriptor as SplitDescriptor, RawDescriptor};
     use virtio_queue::mock::MockSplitQueue;
     use vm_memory::GuestAddress;
 
     use super::*;
     use crate::devices::Interrupt;
+
+    /// virtio descriptor flag: buffer is device-writable (the rx direction). Defined
+    /// locally to avoid a direct virtio-bindings dependency.
+    const VRING_DESC_F_WRITE: u16 = 2;
 
     #[test]
     fn config_reports_cid() {
@@ -887,11 +892,22 @@ mod tests {
     /// and an empty tx queue. Used to inspect what the worker pushes to the guest.
     /// Returns the worker plus the host end of the UDS socketpair for a seeded conn.
     fn worker_with_rx(mem: Arc<GuestMemoryMmap>, rx_bufs: u16) -> VsockWorker {
-        // Build an rx queue with `rx_bufs` single-descriptor writable chains.
-        let mut rxq = MockSplitQueue::new(mem.as_ref(), 256);
-        for _ in 0..rx_bufs {
-            // Each chain: one writable buffer at a high address.
-            rxq.add_chain(1).unwrap();
+        // Build an rx queue with `rx_bufs` single-descriptor device-writable chains.
+        // Each is its own chain (no NEXT flag), with a distinct buffer well above the
+        // ring memory (the mock lays desc table at gpa 0 and the rings just above).
+        let rxq = MockSplitQueue::new(mem.as_ref(), 256);
+        let descs: Vec<RawDescriptor> = (0..rx_bufs)
+            .map(|i| {
+                RawDescriptor::from(SplitDescriptor::new(
+                    0x10_0000 + u64::from(i) * 0x1000,
+                    0x1000,
+                    VRING_DESC_F_WRITE,
+                    0,
+                ))
+            })
+            .collect();
+        if !descs.is_empty() {
+            rxq.add_desc_chains(&descs, 0).unwrap();
         }
         let rx_queue = rxq.create_queue::<Queue>().unwrap();
         let tx_queue = MockSplitQueue::new(mem.as_ref(), 256)
