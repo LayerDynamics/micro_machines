@@ -35,6 +35,37 @@ jobs:
       - run: pnpm -r typecheck
       - run: pnpm -r test
 
+  # Control-plane tests against a real PostgreSQL. The mm-controller crate uses
+  # sqlx's runtime query API (no compile-time DB needed), so unit tests build
+  # anywhere; the DB-backed integration tests (api_pg, and reconcile_loop later)
+  # run here against a postgres:16 service container. DATABASE_URL points the tests
+  # at it; they apply the embedded migrations themselves.
+  controller:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: dev
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgres://postgres:dev@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p mm-controller --all-targets
+      - run: cargo test -p mm-controller
+
   # KVM capability preflight: reports whether this runner can host microVMs.
   # GitHub-hosted ubuntu-latest exposes /dev/kvm with nested virtualization; the
   # device is present but owned root:kvm (the runner user must be granted access).
