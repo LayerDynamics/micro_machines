@@ -42,6 +42,8 @@ enum Command {
     Rm(commands::rm::RmArgs),
     /// SSH into a machine by name.
     Ssh(commands::ssh::SshArgs),
+    /// Run a command inside a running sandbox guest over vsock.
+    Exec(commands::exec::ExecArgs),
     /// (internal) Jailed VMM worker, spawned by `mm run`. Not for direct use.
     #[command(name = "__vmm-worker", hide = true)]
     Worker(commands::worker::WorkerArgs),
@@ -74,6 +76,9 @@ fn main() -> anyhow::Result<()> {
             Command::Ssh(_) => {
                 anyhow::bail!("`mm ssh` is not available in cluster mode; ssh to the host or use the guest IP from `mm --server ... ps`")
             }
+            Command::Exec(_) => {
+                anyhow::bail!("`mm exec` is not available in cluster mode yet (Task 55); run it on the host that owns the machine")
+            }
             Command::Worker(_) => unreachable!("handled above"),
         };
     }
@@ -85,6 +90,7 @@ fn main() -> anyhow::Result<()> {
         Command::Stop(args) => commands::stop::run(args),
         Command::Rm(args) => commands::rm::run(args),
         Command::Ssh(args) => commands::ssh::run(args),
+        Command::Exec(args) => commands::exec::run(args),
         Command::Worker(_) => unreachable!("handled above"),
     }
 }

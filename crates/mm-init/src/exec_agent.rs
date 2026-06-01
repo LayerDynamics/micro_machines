@@ -11,7 +11,8 @@
 use std::process::{Command, Stdio};
 
 /// The vsock port the guest exec agent listens on (the host connects to it).
-pub const EXEC_VSOCK_PORT: u32 = 1025;
+/// Sourced from the shared host/guest contract so the two cannot drift.
+pub const EXEC_VSOCK_PORT: u32 = mm_sandbox::exec::EXEC_PORT;
 
 /// Exit code reported when a command is killed for exceeding its timeout (matches
 /// coreutils `timeout`).
