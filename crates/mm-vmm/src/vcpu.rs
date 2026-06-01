@@ -258,6 +258,10 @@ impl Vcpu {
             })
             .collect();
 
+        // TSC frequency (kHz). Best-effort: hosts without KVM_CAP_GET_TSC_KHZ report
+        // 0, meaning "do not re-apply at restore".
+        let tsc_khz = self.fd.get_tsc_khz().unwrap_or(0);
+
         Ok(VcpuState {
             regs,
             sregs,
@@ -265,12 +269,20 @@ impl Vcpu {
             lapic,
             mp_state,
             msrs,
+            tsc_khz,
         })
     }
 
     /// Restore a captured [`VcpuState`] onto this (freshly created, not yet run)
     /// vCPU, the inverse of [`capture_state`](Self::capture_state).
     pub fn restore_state(&self, state: &VcpuState) -> Result<()> {
+        // Re-apply the TSC frequency first so the guest's time base matches the
+        // snapshot. Best-effort: only if captured and the host supports scaling.
+        if state.tsc_khz != 0 {
+            if let Err(e) = self.fd.set_tsc_khz(state.tsc_khz) {
+                tracing::warn!("restore: set_tsc_khz({}) failed: {e}", state.tsc_khz);
+            }
+        }
         self.fd.set_sregs(&state.sregs).map_err(VmmError::Kvm)?;
         self.fd
             .set_fpu(&fpu_from_bytes(&state.fpu)?)

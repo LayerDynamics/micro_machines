@@ -12,7 +12,7 @@
 //! Linux-only: the types embed `kvm_bindings`, which is a Linux-only dependency. The
 //! (de)serialization is pure (no KVM calls), so its round-trip is unit-tested on any
 //! Linux host without `/dev/kvm`.
-use kvm_bindings::{kvm_lapic_state, kvm_mp_state, kvm_regs, kvm_sregs};
+use kvm_bindings::{kvm_clock_data, kvm_lapic_state, kvm_mp_state, kvm_regs, kvm_sregs};
 use serde::{Deserialize, Serialize};
 use virtio_queue::QueueState;
 
@@ -53,6 +53,9 @@ pub struct VcpuState {
     pub mp_state: kvm_mp_state,
     /// Model-specific registers we save/restore (`KVM_GET_MSRS`).
     pub msrs: Vec<MsrEntry>,
+    /// TSC frequency in kHz (`KVM_GET_TSC_KHZ`), re-applied at restore so the guest's
+    /// time base matches; 0 means the host does not support querying/scaling it.
+    pub tsc_khz: u32,
 }
 
 /// A virtio queue's restorable cursor state — a `serde` mirror of
@@ -120,6 +123,10 @@ pub struct VmState {
     pub vcpus: Vec<VcpuState>,
     /// Per-device state, in device-attach order.
     pub devices: Vec<DeviceState>,
+    /// VM-wide kvm-clock master clock (`KVM_GET_CLOCK`). Restored so the guest's
+    /// paravirt clock does not jump forward by the snapshot's wall-clock age — the
+    /// classic restore hang (RCU stalls) if omitted.
+    pub clock: kvm_clock_data,
 }
 
 impl VmState {
@@ -162,12 +169,17 @@ mod tests {
                     data: 0x5678,
                 },
             ],
+            tsc_khz: 2_500_000,
         }
     }
 
     #[test]
     fn vm_state_round_trips_through_bincode() {
         let vm = VmState {
+            clock: kvm_clock_data {
+                clock: 0x1234_5678,
+                ..Default::default()
+            },
             vcpus: vec![sample_vcpu(), sample_vcpu()],
             devices: vec![DeviceState {
                 device_type: 2, // TYPE_BLOCK
@@ -195,6 +207,8 @@ mod tests {
         assert_eq!(back.vcpus.len(), 2);
         assert_eq!(back.vcpus[0].regs.rip, 0xdead_beef);
         assert_eq!(back.vcpus[0].msrs[1].index, 0xc000_0080);
+        assert_eq!(back.vcpus[0].tsc_khz, 2_500_000);
+        assert_eq!(back.clock.clock, 0x1234_5678);
         assert_eq!(back.devices[0].device_type, 2);
         assert_eq!(back.devices[0].queues[0].next_avail, 5);
         assert!(back.devices[0].queues[0].ready);

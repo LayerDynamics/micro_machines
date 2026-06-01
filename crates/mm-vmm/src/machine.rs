@@ -6,16 +6,21 @@
 //! kernel ([`crate::boot`]), configures the vCPUs for the boot protocol, and runs
 //! them. [`Machine::wait_for_ready`] blocks on the guest's vsock readiness signal.
 use std::fmt::Write as _;
+use std::fs::File;
+use std::io::{Read as _, Write as _IoWrite};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixListener;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use kvm_bindings::{kvm_pit_config, kvm_userspace_memory_region, KVM_PIT_SPEAKER_DUMMY};
+use kvm_bindings::{
+    kvm_clock_data, kvm_pit_config, kvm_userspace_memory_region, KVM_PIT_SPEAKER_DUMMY,
+};
 use kvm_ioctls::{Kvm, VmFd};
-use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::config::{ConfigError, VirtioDevice as ConfigDevice, VmConfig};
@@ -747,6 +752,66 @@ impl Machine {
     /// The configuration this machine was built from.
     pub fn config(&self) -> &VmConfig {
         &self.config
+    }
+
+    /// Capture the VM-wide kvm-clock master clock for a snapshot (SPEC-1 FR-14).
+    pub fn capture_clock(&self) -> Result<kvm_clock_data> {
+        self.vm.get_clock().map_err(VmmError::Kvm)
+    }
+
+    /// Restore the VM-wide kvm-clock master clock at restore time.
+    pub fn restore_clock(&self, clock: &kvm_clock_data) -> Result<()> {
+        self.vm.set_clock(clock).map_err(VmmError::Kvm)
+    }
+
+    /// Dump all guest RAM regions, in ascending address order, to `path` — the
+    /// snapshot `memory_file`. Streamed in 1 MiB chunks so large guests don't need a
+    /// full-size host buffer.
+    pub fn dump_guest_memory(&self, path: &Path) -> Result<()> {
+        let mut file = File::create(path).map_err(VmmError::Io)?;
+        let mut buf = vec![0u8; 1 << 20];
+        for region in self.guest_memory.iter() {
+            let start = region.start_addr();
+            let len = region.len();
+            let mut offset = 0u64;
+            while offset < len {
+                let n = ((len - offset) as usize).min(buf.len());
+                let addr = start
+                    .checked_add(offset)
+                    .ok_or_else(|| VmmError::Memory("dump: address overflow".to_string()))?;
+                self.guest_memory
+                    .read_slice(&mut buf[..n], addr)
+                    .map_err(|e| VmmError::Memory(format!("dump read: {e}")))?;
+                file.write_all(&buf[..n]).map_err(VmmError::Io)?;
+                offset += n as u64;
+            }
+        }
+        file.flush().map_err(VmmError::Io)?;
+        Ok(())
+    }
+
+    /// Load guest RAM from a snapshot `memory_file` (the inverse of
+    /// [`dump_guest_memory`](Self::dump_guest_memory)), in the same region order.
+    pub fn load_guest_memory(&self, path: &Path) -> Result<()> {
+        let mut file = File::open(path).map_err(VmmError::Io)?;
+        let mut buf = vec![0u8; 1 << 20];
+        for region in self.guest_memory.iter() {
+            let start = region.start_addr();
+            let len = region.len();
+            let mut offset = 0u64;
+            while offset < len {
+                let n = ((len - offset) as usize).min(buf.len());
+                file.read_exact(&mut buf[..n]).map_err(VmmError::Io)?;
+                let addr = start
+                    .checked_add(offset)
+                    .ok_or_else(|| VmmError::Memory("load: address overflow".to_string()))?;
+                self.guest_memory
+                    .write_slice(&buf[..n], addr)
+                    .map_err(|e| VmmError::Memory(format!("load write: {e}")))?;
+                offset += n as u64;
+            }
+        }
+        Ok(())
     }
 }
 

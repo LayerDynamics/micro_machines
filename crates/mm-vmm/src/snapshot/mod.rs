@@ -17,3 +17,10 @@ pub use manifest::{SnapshotKind, SnapshotManifest};
 pub mod state;
 #[cfg(target_os = "linux")]
 pub use state::{DeviceState, MsrEntry, QueueCursor, StateError, VcpuState, VmState};
+
+/// Snapshot/restore engine (Linux/KVM-only): drives the live VM's pause/capture and
+/// the KVM state ioctls to write/read a snapshot directory.
+#[cfg(target_os = "linux")]
+pub mod engine;
+#[cfg(target_os = "linux")]
+pub use engine::{load_manifest, load_state, snapshot};
