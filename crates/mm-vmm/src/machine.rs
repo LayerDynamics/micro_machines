@@ -7,6 +7,7 @@
 //! them. [`Machine::wait_for_ready`] blocks on the guest's vsock readiness signal.
 use std::fmt::Write as _;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -113,6 +114,11 @@ pub struct Machine {
     /// only on the jailed boot path, where the (now unprivileged) VMM cannot open
     /// the TAP itself — the privileged parent opened it and passed the fd in.
     tap_fds: Vec<RawFd>,
+    /// Host UDS listener for the vsock exec bridge (SPEC-1 FR-13). Set only on the
+    /// jailed boot path: the privileged parent binds it outside the chroot and passes
+    /// the fd in, so the confined worker can `accept()` host exec connections without
+    /// touching the filesystem. `None` -> the vsock device is readiness-only (M1).
+    vsock_listener: Option<UnixListener>,
     /// Set by `shutdown` to ask the vCPU threads to stop.
     vcpu_stop: Arc<AtomicBool>,
     /// pthread ids of the running vCPU threads, so `shutdown` can signal them out
@@ -200,6 +206,7 @@ impl Machine {
             ready: None,
             vcpu_hook: None,
             tap_fds,
+            vsock_listener: None,
             vcpu_stop: Arc::new(AtomicBool::new(false)),
             vcpu_tids: Arc::new(Mutex::new(Vec::new())),
         })
@@ -230,18 +237,29 @@ impl Machine {
     /// confined (namespaces/chroot/cgroup/uid-drop) and therefore cannot open these
     /// itself. `vcpu_hook` installs the per-thread seccomp filter before guest code.
     ///
+    /// When present, `vsock_listener_fd` is an inherited UDS listener (already bound
+    /// and listening outside the chroot) that the vsock device bridges host exec
+    /// connections through (SPEC-1 FR-13). `None` keeps the vsock device
+    /// readiness-only.
+    ///
     /// # Safety
-    /// `kvm_fd` and each entry of `tap_fds` must be valid, open file descriptors
-    /// that ownership is transferred to this call.
+    /// `kvm_fd`, each entry of `tap_fds`, and `vsock_listener_fd` must be valid, open
+    /// file descriptors that ownership is transferred to this call.
     pub fn boot_jailed(
         config: &VmConfig,
         kvm_fd: RawFd,
         tap_fds: Vec<RawFd>,
+        vsock_listener_fd: Option<RawFd>,
         vcpu_hook: Option<VcpuHook>,
     ) -> Result<Self> {
         // SAFETY: the caller guarantees `kvm_fd` is an open /dev/kvm fd we now own.
         let kvm = unsafe { Kvm::from_raw_fd(kvm_fd) };
         let mut machine = Self::with_resources(config, kvm, tap_fds)?;
+        if let Some(fd) = vsock_listener_fd {
+            // SAFETY: the caller transfers ownership of an open, bound, listening UDS
+            // fd; we wrap it so the vsock device can accept on it post-confinement.
+            machine.vsock_listener = Some(unsafe { UnixListener::from_raw_fd(fd) });
+        }
         machine.vcpu_hook = vcpu_hook;
         machine.start()?;
         Ok(machine)
@@ -279,8 +297,13 @@ impl Machine {
             Box::new(block),
         )?;
 
-        // Boot vsock channel (always present): carries the guest "ready" signal.
-        let vsock = Vsock::new(DEFAULT_GUEST_CID)?;
+        // Boot vsock channel (always present): carries the guest "ready" signal, and
+        // — when the jailed parent passed a host UDS listener — bridges Sandbox exec
+        // connections to the guest (SPEC-1 FR-13).
+        let vsock = match self.vsock_listener.take() {
+            Some(listener) => Vsock::with_host_bridge(DEFAULT_GUEST_CID, listener)?,
+            None => Vsock::new(DEFAULT_GUEST_CID)?,
+        };
         self.ready = Some(vsock.ready_signal());
         self.attach_virtio(
             &mut bus,

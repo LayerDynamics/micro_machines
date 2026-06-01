@@ -6,7 +6,8 @@
 //! cluster agent reuses the exact same boot path. It is decoupled from any registry:
 //! the caller supplies a [`LaunchSpec`] (including the IPs already in use) and
 //! receives a [`LaunchOutcome`] to persist however it likes.
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -24,9 +25,10 @@ const BRIDGE: &str = "mm-br0";
 /// Unprivileged uid/gid the jailed worker drops to (nobody/nogroup).
 const WORKER_UID: u32 = 65534;
 const WORKER_GID: u32 = 65534;
-/// Fixed fd numbers the worker inherits the KVM + TAP fds at.
+/// Fixed fd numbers the worker inherits the KVM + TAP + vsock-listener fds at.
 const WORKER_KVM_FD: RawFd = 10;
 const WORKER_TAP_FD: RawFd = 11;
+const WORKER_VSOCK_FD: RawFd = 12;
 
 /// Encode an argv as the `mm.workload_argv` cmdline value: NUL-join the elements
 /// (NUL can't appear in argv) and hex-encode, so arguments with spaces or commas
@@ -120,7 +122,13 @@ pub fn launch(spec: &LaunchSpec) -> Result<LaunchOutcome> {
     std::fs::write(&cfg_path, serde_json::to_vec(&worker_cfg)?)
         .with_context(|| format!("writing {}", cfg_path.display()))?;
 
-    // 7. Spawn the jailed worker, passing the KVM + TAP fds.
+    // 7. Bind the host vsock exec bridge UDS *outside* the chroot (in the per-VM jail
+    //    dir, reachable by the launcher/agent) and pass its fd to the worker, which
+    //    accepts on it after confinement (SPEC-1 FR-13).
+    let vsock_path = jail.join("vsock.sock");
+    let vsock_listener = bind_vsock_listener(&vsock_path)?;
+
+    // 8. Spawn the jailed worker, passing the KVM + TAP + vsock-listener fds.
     let cgroup = format!("micro_machines/{name}");
     let cpu_max = format!("{} 100000", u64::from(spec.cpus) * 100_000);
     let mem_max = spec.memory_mib * 1024 * 1024;
@@ -129,6 +137,7 @@ pub fn launch(spec: &LaunchSpec) -> Result<LaunchOutcome> {
         &cfg_path,
         kvm_fd,
         tap.as_raw_fd(),
+        vsock_listener.as_raw_fd(),
         &jail_root,
         &cgroup,
         &cpu_max,
@@ -139,10 +148,11 @@ pub fn launch(spec: &LaunchSpec) -> Result<LaunchOutcome> {
     let pid = child.id();
 
     // The child now owns its copies of the fds; the persistent TAP survives the
-    // parent dropping its handle.
+    // parent dropping its handle, and the bound UDS survives via the worker's copy.
     // SAFETY: `kvm_fd` is the fd we opened; the child inherited its own copy.
     unsafe { libc::close(kvm_fd) };
     drop(tap);
+    drop(vsock_listener);
 
     Ok(LaunchOutcome {
         name,
@@ -150,6 +160,7 @@ pub fn launch(spec: &LaunchSpec) -> Result<LaunchOutcome> {
         tap_name,
         pid,
         console_log,
+        vsock_path,
         child,
     })
 }
@@ -164,6 +175,7 @@ fn spawn_worker(
     config: &Path,
     kvm_fd: RawFd,
     tap_fd: RawFd,
+    vsock_fd: RawFd,
     chroot: &Path,
     cgroup: &str,
     cpu_max: &str,
@@ -180,6 +192,8 @@ fn spawn_worker(
         .arg(WORKER_KVM_FD.to_string())
         .arg("--tap-fd")
         .arg(WORKER_TAP_FD.to_string())
+        .arg("--vsock-fd")
+        .arg(WORKER_VSOCK_FD.to_string())
         .arg("--chroot")
         .arg(chroot)
         .arg("--uid")
@@ -223,6 +237,9 @@ fn spawn_worker(
             if libc::dup2(tap_fd, WORKER_TAP_FD) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            if libc::dup2(vsock_fd, WORKER_VSOCK_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             if detach && libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -230,6 +247,23 @@ fn spawn_worker(
         });
     }
     cmd.spawn().context("spawning VMM worker")
+}
+
+/// Bind the host vsock exec bridge UDS at `path`, replacing any stale socket left by
+/// a previous run of the same machine. Returns the listening socket; its fd is passed
+/// to the jailed worker (which accepts on it post-confinement) while the host side
+/// connects to `path`.
+fn bind_vsock_listener(path: &Path) -> Result<UnixListener> {
+    // A leftover socket file from a prior boot would make bind fail with EADDRINUSE;
+    // it is our own managed runtime artifact in the per-VM jail dir, so clear it.
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        use std::os::unix::fs::FileTypeExt;
+        if meta.file_type().is_socket() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    UnixListener::bind(path)
+        .with_context(|| format!("binding vsock bridge socket {}", path.display()))
 }
 
 /// Open `/dev/kvm` read-write *without* CLOEXEC so the fd is inherited by the

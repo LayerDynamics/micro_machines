@@ -60,6 +60,9 @@ pub struct LaunchOutcome {
     pub pid: u32,
     /// File the detached guest console is written to.
     pub console_log: PathBuf,
+    /// Host Unix-domain socket the vsock exec bridge listens on; connect here and
+    /// speak the `CONNECT <port>\n` handshake to reach a guest vsock port (FR-13).
+    pub vsock_path: PathBuf,
     /// Handle to the spawned jailed worker. Wait on it to serve the guest in the
     /// foreground; drop it to leave the detached worker running in its own session.
     pub child: Child,

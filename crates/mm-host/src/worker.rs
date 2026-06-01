@@ -25,6 +25,10 @@ pub struct WorkerArgs {
     /// Inherited TAP file descriptor number.
     #[arg(long)]
     pub tap_fd: i32,
+    /// Inherited host vsock UDS listener fd number (the exec bridge); absent on the
+    /// readiness-only path.
+    #[arg(long)]
+    pub vsock_fd: Option<i32>,
     /// Per-VM chroot root.
     #[arg(long)]
     pub chroot: PathBuf,
@@ -110,8 +114,14 @@ mod linux {
 
         // Boot using the inherited KVM + TAP fds (the confined process cannot open
         // them itself).
-        let mut machine = Machine::boot_jailed(&config, args.kvm_fd, vec![args.tap_fd], Some(hook))
-            .context("booting jailed microVM")?;
+        let mut machine = Machine::boot_jailed(
+            &config,
+            args.kvm_fd,
+            vec![args.tap_fd],
+            args.vsock_fd,
+            Some(hook),
+        )
+        .context("booting jailed microVM")?;
         let ready = machine
             .wait_for_ready(Duration::from_secs(10))
             .context("waiting for guest readiness")?;
