@@ -577,18 +577,19 @@ the project does not stand up local containers (verification is deferred to CI).
 
 - [✅] Create a machine via REST → scheduler places it → agent reconciles and boots it on a Linux/KVM host (FR-17, FR-18, FR-19) — **verified end-to-end** by the `cluster-integration` CI job (`scripts/cluster-e2e.sh`): a real `mm-controller` + a real `mm-agent` over mutual-TLS (Postgres-backed) on the `/dev/kvm` runner, `mm --server run --ssh` creates a machine, the scheduler places it, the agent **launches a real busybox microVM** via the shared `mm_host::launch` path, and `mm ps` shows it `running` with IP `10.0.0.2`. (The cluster job asserts the orchestration drove a real launch + IP allocation + restart survival; that the guest reaches *userspace* is verified by the M1 KVM jobs, which run the identical `mm_host` boot path.) The faster in-process `reconcile_loop.rs` (fake agent) additionally covers the scheduling/reporting logic against real Postgres + real mTLS.
 - [✅] Desired + observed state persist in Postgres; data plane survives a control-plane restart with no duplicate assignment (FR-22, NFR-R2) — **verified by `cluster-integration`**: after the controller process is **killed and restarted**, the running microVM is still `Running` (`mm ps` reads its persisted status from Postgres) and is not re-assigned. `reconcile_loop.rs` additionally proves the idempotency rule directly (a `Running` machine yields `decide → None`).
-- [🟡] OIDC/JWT auth enforced; namespace RBAC denies cross-namespace access; controller↔agent traffic is mTLS (FR-29, FR-30) — **JWT verification + namespace RBAC (cross-ns → 403) verified** by `api_pg.rs`; **mTLS verified** by `reconcile_loop.rs` (the server requires a CA-signed client cert). The verifying key is supplied by configuration (HS256) — full **OIDC discovery / JWKS fetch is deferred** (this is the deliberate test seam, so CI can mint accepted tokens offline).
-- [🟡] Reconcile convergence < 30 s under normal load (NFR-R4); API p95 < 200 ms tracked (NFR-P4) — **convergence verified** (~1.7 s in `reconcile_loop`). **API p95 latency tracking is deferred** (the per-request metrics + rate-limit tower middleware was not built).
+- [✅] OIDC/JWT auth enforced; namespace RBAC denies cross-namespace access; controller↔agent traffic is mTLS (FR-29, FR-30) — **namespace RBAC (cross-ns → 403) verified** by `api_pg.rs`; **mTLS verified** by `reconcile_loop.rs` (the server requires a CA-signed client cert). The verifier accepts **both** an HS256 config secret (service/dev tokens) **and RS256 tokens validated against a JWKS fetched from an OIDC issuer's discovery document** (`auth::fetch_oidc_jwks`) — verified by unit tests that mint RS256 tokens against a JWKS (accept valid / reject wrong-issuer / reject unknown-kid) and a test that stands up a local discovery + JWKS server and verifies a token end to end.
+- [✅] Reconcile convergence < 30 s under normal load (NFR-R4); API p95 < 200 ms tracked (NFR-P4) — **convergence verified** (~1.7 s in `reconcile_loop`); **API latency is tracked**: a middleware records every request's duration into an HdrHistogram and `GET /metrics` exposes p50/p95/p99 in Prometheus format (`metrics.rs`), unit-tested for percentile accuracy and asserted live by `api_pg.rs`.
 - [✅] All pure-logic crates have passing unit tests; integration tests pass against real Postgres + a real gRPC round-trip; clippy + fmt clean; every task committed — 85 workspace unit tests + `api_pg` + `reconcile_loop` green in CI; clippy + fmt clean; per-task commits.
 
 **TODOs discovered during M2** (deliberately deferred — not blockers for the M2 core):
-1. **OIDC discovery / JWKS** — currently an HS256 config key; add issuer discovery + JWKS verification for production identity providers (FR-29 full).
-2. **API p95 metrics + per-tenant rate limiting** — the tower middleware for NFR-P4 tracking + quota enforcement.
-3. **Fleet REST endpoints** (`api/fleets.rs`) — machines already carry a `fleet` field and the `fleets` table exists; dedicated fleet CRUD was not built.
-4. **Destroy-on-delete agent teardown** — REST `DELETE` removes the row + (in cluster mode) the CLI stops first; wiring the controller to drive agent-side TAP/overlay teardown via the assignment stream on delete is follow-on.
-5. **HA leader election** — M4 (M2 ships a single control-plane instance whose state survives restart).
+1. **Per-tenant rate limiting** — quota enforcement (the latency-metrics half of this
+   item is now built; see criterion #4).
+2. **Fleet REST endpoints** (`api/fleets.rs`) — machines already carry a `fleet` field and the `fleets` table exists; dedicated fleet CRUD was not built.
+3. **Destroy-on-delete agent teardown** — REST `DELETE` removes the row + (in cluster mode) the CLI stops first; wiring the controller to drive agent-side TAP/overlay teardown via the assignment stream on delete is follow-on.
+4. **HA leader election** — M4 (M2 ships a single control-plane instance whose state survives restart).
 
-(The `retry_count`-never-increments gap the cluster e2e surfaced is now **fixed** —
-the reconcile loop increments `status.retry_count` on each `Retry`, so the
-`max_retries` budget is finite and a persistently-failing machine rests instead of
-re-assigning forever.)
+(Two earlier deferrals are now **implemented**: full **OIDC discovery / JWKS**
+verification — RS256 tokens validated against an OIDC issuer's JWKS alongside the
+HS256 config key — and **API p95 latency tracking** — an HdrHistogram-backed
+`/metrics` endpoint. See criteria #3 and #4. The `retry_count`-never-increments gap
+the cluster e2e surfaced is also fixed.)

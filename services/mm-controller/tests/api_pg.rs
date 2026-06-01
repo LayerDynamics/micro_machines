@@ -99,6 +99,7 @@ async fn rest_crud_roundtrip_and_cross_namespace_is_denied() {
     let state = AppState {
         store,
         verifier: Arc::new(JwtVerifier::hs256(SECRET)),
+        metrics: Arc::new(mm_controller::metrics::Metrics::new()),
     };
     let app = router(state);
 
@@ -248,6 +249,22 @@ async fn rest_crud_roundtrip_and_cross_namespace_is_denied() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "machine gone after delete");
+
+    // /metrics (NFR-P4) is public and has recorded the requests above. It returns
+    // Prometheus text (not JSON), so read it raw.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.expect("metrics oneshot");
+    assert_eq!(resp.status(), StatusCode::OK, "/metrics is public");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let metrics = String::from_utf8_lossy(&bytes);
+    assert!(
+        metrics.contains("mm_api_request_duration_ms") && metrics.contains("quantile=\"0.95\""),
+        "metrics missing latency summary:\n{metrics}"
+    );
 
     // Clean up.
     sqlx::query("DELETE FROM namespaces WHERE name IN ('team-a','team-b')")

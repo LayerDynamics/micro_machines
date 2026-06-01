@@ -19,6 +19,7 @@ use serde_json::json;
 
 use crate::auth::JwtVerifier;
 use crate::authz::{self, Claims, Verb};
+use crate::metrics::Metrics;
 use crate::store::Store;
 
 mod machines;
@@ -29,6 +30,7 @@ mod namespaces;
 pub struct AppState {
     pub store: Store,
     pub verifier: Arc<JwtVerifier>,
+    pub metrics: Arc<Metrics>,
 }
 
 /// API error → HTTP status. Unauthenticated requests get 401, RBAC denials 403,
@@ -98,8 +100,36 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        // Latency percentiles (NFR-P4). Public so a scraper needs no token.
+        .route("/metrics", get(metrics_handler))
         .merge(protected)
+        // Time every request (including auth failures + /metrics) into the histogram.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            track_latency,
+        ))
         .with_state(state)
+}
+
+/// `GET /metrics` — Prometheus-format API latency summary (p50/p95/p99).
+async fn metrics_handler(State(state): State<AppState>) -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        state.metrics.prometheus(),
+    )
+        .into_response()
+}
+
+/// Latency middleware: record each request's wall-clock duration so the `/metrics`
+/// endpoint can report API p95 (NFR-P4).
+async fn track_latency(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
+    let start = std::time::Instant::now();
+    let response = next.run(req).await;
+    state.metrics.record_ms(start.elapsed().as_millis() as u64);
+    response
 }
 
 /// Authentication middleware: require a valid `Authorization: Bearer <jwt>`, verify

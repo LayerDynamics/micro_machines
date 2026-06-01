@@ -39,9 +39,15 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:50051")]
     grpc_listen: String,
 
-    /// HS256 secret used to verify bearer tokens (configured, not from OIDC).
+    /// HS256 secret for verifying service/dev bearer tokens. Optional if an OIDC
+    /// issuer is configured; at least one of the two must be set.
     #[arg(long, env = "JWT_HS256_SECRET")]
-    jwt_hs256_secret: String,
+    jwt_hs256_secret: Option<String>,
+
+    /// OIDC issuer URL. When set, the controller fetches the issuer's JWKS via its
+    /// discovery document at startup and verifies RS256 tokens against it (FR-29).
+    #[arg(long, env = "OIDC_ISSUER")]
+    oidc_issuer: Option<String>,
 
     /// Directory holding the mTLS CA + controller cert/key (`ca.pem`, `server.pem`,
     /// `server.key`). When `ca.pem` is present the gRPC server requires client certs.
@@ -71,10 +77,31 @@ async fn main() -> Result<()> {
 
     let registry = AgentRegistry::default();
 
+    // Build the token verifier: an HS256 secret and/or an OIDC issuer's JWKS
+    // (fetched once via the issuer's discovery document). At least one is required.
+    let jwks = match &args.oidc_issuer {
+        Some(issuer) => {
+            tracing::info!(%issuer, "fetching OIDC JWKS");
+            Some(
+                mm_controller::auth::fetch_oidc_jwks(issuer)
+                    .await
+                    .context("OIDC discovery / JWKS fetch")?,
+            )
+        }
+        None => None,
+    };
+    let verifier = JwtVerifier::new(
+        args.jwt_hs256_secret.as_deref().map(str::as_bytes),
+        jwks.as_ref(),
+        args.oidc_issuer.clone(),
+    )
+    .context("configuring token verification")?;
+
     // REST API over the store.
     let state = AppState {
         store: store.clone(),
-        verifier: Arc::new(JwtVerifier::hs256(args.jwt_hs256_secret.as_bytes())),
+        verifier: Arc::new(verifier),
+        metrics: Arc::new(mm_controller::metrics::Metrics::new()),
     };
     let rest_listener = tokio::net::TcpListener::bind(&args.listen)
         .await

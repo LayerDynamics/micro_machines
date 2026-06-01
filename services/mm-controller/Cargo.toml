@@ -33,7 +33,9 @@ axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 jsonwebtoken = { workspace = true }
+reqwest = { workspace = true } # OIDC discovery + JWKS fetch
 futures = { workspace = true }
+hdrhistogram = "7" # API request-latency percentiles (NFR-P4)
 
 [dev-dependencies]
 # Integration tests drive the router in-process (tower oneshot) and mint their own

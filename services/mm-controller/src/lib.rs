@@ -21,6 +21,7 @@ pub mod convert;
 pub mod grpc;
 #[path = "loop.rs"]
 pub mod r#loop;
+pub mod metrics;
 pub mod model;
 pub mod reconcile;
 pub mod scheduler;
