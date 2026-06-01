@@ -4,7 +4,9 @@
 //! independently-testable modules:
 //!
 //! - [`reconcile`] — the pure desired-vs-observed decision (no IO).
+//! - [`scheduler`] — pure host placement for a machine's resource demand.
 //!
-//! Later M2 tasks add `scheduler`, `authz`, `store`, the `api` routers, the gRPC
-//! servers, and the reconcile loop alongside these.
+//! Later M2 tasks add `authz`, `store`, the `api` routers, the gRPC servers, and
+//! the reconcile loop alongside these.
 pub mod reconcile;
+pub mod scheduler;
