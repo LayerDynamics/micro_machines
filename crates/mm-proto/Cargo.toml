@@ -1,0 +1,18 @@
+[package]
+name = "mm-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Generated controller<->agent gRPC contract (SPEC-1 FR-19, App. B.4)"
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+# Vendor a protoc binary so the build needs no system protobuf compiler — here or
+# in CI. protoc-bin-vendored ships per-platform binaries (macOS arm64, linux x86_64).
+protoc-bin-vendored = "3"

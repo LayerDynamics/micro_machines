@@ -1,0 +1,43 @@
+// Controller <-> agent gRPC contract (SPEC-1 FR-19, Appendix B.4).
+//
+// The controller owns desired state and pushes Assignments to agents; agents own
+// a host, actuate microVMs via the M1 VMM stack, and report observed state back.
+syntax = "proto3";
+package micromachines.v1alpha1;
+
+// MachineService: the controller assigns/queries machines on an agent's host.
+service MachineService {
+  rpc Assign(Assignment) returns (MachineStatus);
+  rpc Delete(MachineRef) returns (Ack);
+  rpc Get(MachineRef) returns (Machine);
+  rpc WatchAssignments(HostRef) returns (stream Assignment); // controller -> agent
+}
+
+// HostService: the agent reports capacity/health and streams machine events.
+service HostService {
+  rpc ReportCapacity(Capacity) returns (Ack);
+  rpc Heartbeat(HostRef) returns (Ack);
+  rpc StreamEvents(HostRef) returns (stream MachineEvent);
+}
+
+message MachineRef { string uid = 1; string namespace = 2; }
+message HostRef { string host_id = 1; }
+message Ack { bool ok = 1; string message = 2; }
+
+message MachineSpec {
+  string image = 1; string kernel = 2; uint32 vcpus = 3; uint64 memory_mib = 4;
+  bool ssh = 5; Workload workload = 6; Networking net = 7; bool running = 8;
+}
+message Workload { string entrypoint = 1; repeated string args = 2; map<string,string> env = 3; }
+message Networking { string mode = 1; } // "auto"
+
+enum State { CREATED=0; PREPARING=1; STARTING=2; RUNNING=3; PAUSED=4;
+  STOPPING=5; STOPPED=6; FAILED=7; DESTROYING=8; DESTROYED=9; }
+
+message MachineStatus { State state = 1; string ip = 2; string health = 3;
+  string host_id = 4; uint32 retry_count = 5; }
+message Machine { MachineRef ref = 1; MachineSpec spec = 2; MachineStatus status = 3; }
+message Assignment { Machine machine = 1; }
+message Capacity { string host_id = 1; uint32 vcpus_total = 2; uint32 vcpus_free = 3;
+  uint64 mem_mib_total = 4; uint64 mem_mib_free = 5; }
+message MachineEvent { string uid = 1; State state = 2; string message = 3; }
