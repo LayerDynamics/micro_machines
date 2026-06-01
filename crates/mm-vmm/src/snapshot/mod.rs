@@ -24,3 +24,10 @@ pub use state::{DeviceState, MsrEntry, QueueCursor, StateError, VcpuState, VmSta
 pub mod engine;
 #[cfg(target_os = "linux")]
 pub use engine::{load_manifest, load_state, restore, snapshot};
+
+/// Copy-on-write fork engine (Linux/KVM-only): fan children off a parent snapshot via
+/// MAP_PRIVATE guest memory (SPEC-1 FR-15, NFR-P2).
+#[cfg(target_os = "linux")]
+pub mod fork_engine;
+#[cfg(target_os = "linux")]
+pub use fork_engine::fork_children;

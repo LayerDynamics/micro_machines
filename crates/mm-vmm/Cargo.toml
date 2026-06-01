@@ -28,6 +28,8 @@ tracing = { workspace = true }
 # Enables virtio-queue's MockSplitQueue so device unit tests can build descriptor
 # chains in guest memory without a real guest (runs in CI's Linux test job).
 virtio-queue = { workspace = true, features = ["test-utils"] }
+# The fork integration test reads/writes guest RAM directly to prove CoW isolation.
+vm-memory = { workspace = true }
 
 [features]
 # KVM-dependent integration tests, run only on linux+kvm hosts.

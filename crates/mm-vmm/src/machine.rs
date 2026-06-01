@@ -20,7 +20,9 @@ use kvm_bindings::{
     kvm_clock_data, kvm_pit_config, kvm_userspace_memory_region, KVM_PIT_SPEAKER_DUMMY,
 };
 use kvm_ioctls::{Kvm, VmFd};
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{
+    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
+};
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::config::{ConfigError, VirtioDevice as ConfigDevice, VmConfig};
@@ -184,6 +186,19 @@ impl Machine {
     /// fds — the jailed boot path passes both in because the confined, unprivileged
     /// VMM can no longer open `/dev/kvm` or `/dev/net/tun` itself.
     fn with_resources(config: &VmConfig, kvm: Kvm, tap_fds: Vec<RawFd>) -> Result<Self> {
+        let guest_memory = Self::allocate_guest_memory(config.memory_mib)?;
+        Self::with_resources_memory(config, kvm, tap_fds, guest_memory)
+    }
+
+    /// Like [`with_resources`](Self::with_resources) but takes pre-built guest memory
+    /// — the seam the CoW fork path uses to hand in a `MAP_PRIVATE` file-backed
+    /// mapping instead of a fresh anonymous one.
+    fn with_resources_memory(
+        config: &VmConfig,
+        kvm: Kvm,
+        tap_fds: Vec<RawFd>,
+        guest_memory: GuestMemoryMmap,
+    ) -> Result<Self> {
         config.validate()?;
         install_vcpu_stop_handler();
 
@@ -197,7 +212,6 @@ impl Machine {
         vm.set_identity_map_address(IDENTITY_MAP_ADDR)?;
         vm.set_tss_address(TSS_ADDR as usize)?;
 
-        let guest_memory = Self::allocate_guest_memory(config.memory_mib)?;
         Self::register_memory(&vm, &guest_memory)?;
 
         // In-kernel interrupt controller + programmable interval timer. These let
@@ -858,15 +872,82 @@ impl Machine {
         Ok(machine)
     }
 
+    /// Fork a running child microVM from a snapshot via copy-on-write memory
+    /// (SPEC-1 FR-15). The child's guest RAM is a `MAP_PRIVATE` mapping of the
+    /// parent's `memory_file`, so unmodified pages stay shared and only written pages
+    /// are copied — the fast path for fanning many children off one warmed parent
+    /// (NFR-P2). The RAM is *not* loaded byte-by-byte (the mapping already is the
+    /// RAM); the child then restores device/clock/vCPU state and resumes. Opens
+    /// `/dev/kvm` itself (non-jailed); `config` must match the snapshot.
+    pub fn fork(config: &VmConfig, state: VmState, mem_path: &Path) -> Result<Self> {
+        let guest_memory = Self::allocate_cow_guest_memory(config.memory_mib, mem_path)?;
+        let mut machine =
+            Self::with_resources_memory(config, Kvm::new()?, Vec::new(), guest_memory)?;
+        machine.resume_from_state(state)?;
+        Ok(machine)
+    }
+
+    /// Build CoW guest memory backed by the snapshot `memory_file`: each RAM region is
+    /// `mmap(MAP_PRIVATE)` of the corresponding slice of the file, so forked children
+    /// share the parent's pages until they write (SPEC-1 FR-15). The region layout
+    /// mirrors [`allocate_guest_memory`](Self::allocate_guest_memory); the file holds
+    /// the regions concatenated in ascending-address order (as written by
+    /// [`dump_guest_memory`](Self::dump_guest_memory)).
+    fn allocate_cow_guest_memory(memory_mib: u64, mem_path: &Path) -> Result<GuestMemoryMmap> {
+        use vm_memory::mmap::MmapRegionBuilder;
+        use vm_memory::FileOffset;
+
+        let file = File::open(mem_path).map_err(VmmError::Io)?;
+        let mem_size = memory_mib
+            .checked_mul(1 << 20)
+            .ok_or_else(|| VmmError::Memory(format!("memory size {memory_mib} MiB overflows")))?;
+        let ranges = if mem_size <= MMIO_GAP_START {
+            vec![(GuestAddress(0), mem_size as usize)]
+        } else {
+            vec![
+                (GuestAddress(0), MMIO_GAP_START as usize),
+                (
+                    GuestAddress(RAM_64BIT_START),
+                    (mem_size - MMIO_GAP_START) as usize,
+                ),
+            ]
+        };
+
+        let mut regions = Vec::with_capacity(ranges.len());
+        let mut file_offset = 0u64;
+        for (gpa, size) in ranges {
+            let fo = FileOffset::new(file.try_clone().map_err(VmmError::Io)?, file_offset);
+            let region = MmapRegionBuilder::new(size)
+                .with_mmap_flags(libc::MAP_NORESERVE | libc::MAP_PRIVATE)
+                .with_file_offset(fo)
+                .build()
+                .map_err(|e| VmmError::Memory(format!("cow mmap: {e:?}")))?;
+            regions.push(
+                GuestRegionMmap::new(region, gpa)
+                    .map_err(|e| VmmError::Memory(format!("cow region: {e:?}")))?,
+            );
+            file_offset += size as u64;
+        }
+        GuestMemoryMmap::from_regions(regions)
+            .map_err(|e| VmmError::Memory(format!("cow from_regions: {e:?}")))
+    }
+
+    /// Restore a snapshot whose RAM lives in a file: load it into anonymous guest
+    /// memory, then resume. The CoW fork path skips the load (its memory *is* the
+    /// file, mapped `MAP_PRIVATE`) and calls [`resume_from_state`](Self::resume_from_state) directly.
+    fn restore_start(&mut self, state: VmState, mem_path: &Path) -> Result<()> {
+        // Guest RAM (kernel, page tables, and the virtqueue rings all live here).
+        self.load_guest_memory(mem_path)?;
+        self.resume_from_state(state)
+    }
+
     /// Wire the device model + vCPUs from a snapshot and resume — the restore
-    /// counterpart to [`start`](Self::start). Loads RAM, attaches each device and
-    /// re-activates it from its saved cursors (bypassing the guest's `DRIVER_OK`
+    /// counterpart to [`start`](Self::start), assuming guest RAM is already in place
+    /// (loaded from a file by restore, or CoW-mapped by fork). Attaches each device
+    /// and re-activates it from its saved cursors (bypassing the guest's `DRIVER_OK`
     /// handshake, since the guest is mid-execution), restores vCPU + clock state, and
     /// spawns the (already-running) vCPU threads. No kernel load, no `configure_boot`.
-    fn restore_start(&mut self, state: VmState, mem_path: &Path) -> Result<()> {
-        // 1. Guest RAM (kernel, page tables, and the virtqueue rings all live here).
-        self.load_guest_memory(mem_path)?;
-
+    fn resume_from_state(&mut self, state: VmState) -> Result<()> {
         let mut bus = Bus::new();
         // The cmdline is discarded on restore — the guest already booted and its
         // drivers are bound to the (deterministic) MMIO addresses recreated below.
