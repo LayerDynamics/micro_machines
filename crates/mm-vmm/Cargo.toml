@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 mm-api-types = { path = "../mm-api-types" }
 serde = { workspace = true }
+serde_json = { workspace = true } # snapshot manifest (de)serialization
 thiserror = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

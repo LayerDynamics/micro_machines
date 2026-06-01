@@ -9,6 +9,11 @@
 pub mod config;
 pub use config::{BlockDevice, ConfigError, VirtioDevice, VmConfig, FAST_BOOT_ARGS};
 
+/// Snapshot manifest + fork accounting (cross-platform); the KVM engines are added
+/// behind `cfg(target_os = "linux")` inside the module.
+pub mod snapshot;
+pub use snapshot::{SnapshotKind, SnapshotManifest};
+
 // Linux-only KVM machinery (Tasks 5–8), behind `cfg(target_os = "linux")`.
 #[cfg(target_os = "linux")]
 pub mod boot;
