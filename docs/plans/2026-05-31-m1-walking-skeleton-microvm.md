@@ -856,11 +856,11 @@ Status legend: ✅ done & verified · 🟢 **runtime-verified on real KVM in CI*
 specific path is not yet exercised by an executing test.
 
 - [🟢] A real microVM **boots to userspace on KVM** (FR-1, FR-2, FR-3 blk/vsock/serial, FR-6 ext4 rootfs) — **verified: the `kvm-integration` job passes**. The guest boots the kernel (64-bit boot protocol, kvm-clock, in-kernel irqchip+PIT), mounts an ext4 rootfs over virtio-blk, runs `mm-init` as PID 1, and signals readiness over **virtio-vsock**; boot-to-userspace **p50 ≈ 1.02 s** (min 0.98 s, max 1.10 s over 30 iterations). virtio-net is implemented + compile-verified but not exercised by this test (no net device in the boot fixture). `mm run`'s OCI→rootfs orchestration is compile-verified (the test uses a minimal fixture rootfs, not a pulled OCI image).
-- [🟡] The guest gets an IP automatically via kernel `ip=` (FR-10, FR-11); `mm ssh` works with no manual sshd/key setup (FR-12) — IPAM + `ip=` generation unit-tested (✅); bridge/TAP/NAT, virtio-net, and `mm ssh` compile-verified for Linux; not exercised by the boot test (it has no net device).
-- [🟡] The VMM runs jailed (namespaces + chroot + cgroup v2) with a per-thread seccomp-BPF filter applied before guest code (FR-27) — **fully wired** via the fd-passing re-exec model: `mm run` re-execs `mm __vmm-worker`, which calls `mm_sandbox::confine` (cgroup v2 + mount/pid/net namespaces + chroot + `no_new_privs` + uid/gid drop) then installs seccomp before guest code, then `Machine::boot_jailed`. Compile-verified; the boot test uses the un-jailed `Machine::boot` path, so the jail itself is not yet runtime-exercised.
+- [🟢] The guest gets an IP automatically via kernel `ip=` (FR-10, FR-11); `mm ssh` works with no manual sshd/key setup (FR-12) — **runtime-verified on real KVM**: the `net-integration` job boots a guest with a virtio-net device on a host bridge/TAP/NAT and confirms L3 reachability, and the `ssh-integration` job runs `mm run --ssh` then `mm ssh <name> -- echo <token>` and asserts the **token round-trips** over a real key-auth SSH session (dropbear injected into the rootfs; mm-init installs the managed pubkey and seeds the guest CRNG via `RNDADDENTROPY` so `getrandom(2)` doesn't block the SSH host-key generation). IPAM + `ip=` generation also unit-tested (✅).
+- [🟢] The VMM runs jailed (namespaces + chroot + cgroup v2) with a per-thread seccomp-BPF filter applied before guest code (FR-27) — **runtime-verified on real KVM**: the `jail-integration` job boots through the fd-passing re-exec model (`mm run` → `mm __vmm-worker` → `mm_sandbox::confine`: cgroup v2 + mount/pid namespaces + chroot + `no_new_privs` + uid/gid drop or userns, then seccomp before guest code, then `Machine::boot_jailed`) and reaches userspace inside the jail. (The net namespace is intentionally *not* unshared — it would detach the host TAP.)
 - [🟢] Boot-to-userspace is recorded; NFR-P1 (< 125 ms p50) tracked — the bench reports **p50 ≈ 1024 ms** and notes it exceeds the 125 ms target (boot-time optimization is the tracked follow-on). The hard gate (< 10 s) passes.
-- [🟡] `mm ps/stop/rm` manage lifecycle and clean up fully — store round-trip unit-tested (✅); TAP/overlay teardown compile-verified for Linux.
-- [✅] All pure-logic crates have passing unit tests (42 across the workspace); clippy + fmt clean; each task committed; **the full CI run (rust + node + kvm-preflight + kvm-integration) is green on GitHub-hosted runners**.
+- [🟢] `mm ps/stop/rm` manage lifecycle and clean up fully — **runtime-verified on real KVM**: the `mm-run-integration` job boots a pulled OCI image, then asserts `mm ps` lists the machine with its allocated `10.0.0.x` IP, `mm stop` tears down the VMM fork-tree (PR_SET_PDEATHSIG cascade) and releases the TAP, and `mm rm` removes the record + host resources so `mm ps` no longer lists it. Store round-trip also unit-tested (✅).
+- [✅] All pure-logic crates have passing unit tests; clippy + fmt clean; each task committed; **the full CI run is green on GitHub-hosted runners across all 10 jobs (rust, node, kvm-preflight, kvm-integration, net-integration, jail-integration, mm-run-integration, ssh-integration, ssh-build-probe, net-jail-preflight)**.
 
 **TODOs discovered during M1** — all subsequently implemented (compile-verified
 for Linux; runtime paths validated on the KVM runner):
@@ -888,9 +888,15 @@ job runs the real boot. Getting it green surfaced a series of bugs invisible to
 
 Result: **boot-to-userspace + vsock readiness + clean shutdown pass on CI**, p50 ≈ 1.02 s.
 
+**Update (runtime verification completed):** the net/SSH and jailer paths that
+were compile-only at first draft are now exercised on the KVM runner by dedicated
+CI jobs — `net-integration` (virtio-net + bridge/TAP/NAT), `jail-integration`
+(jailed boot to userspace), `mm-run-integration` (pull a real OCI image → boot →
+`mm ps`/`stop`/`rm` lifecycle), and `ssh-integration` (`mm ssh` token round-trip
+against an injected static dropbear, with the guest CRNG seeded from host entropy
+so host-key generation doesn't block). All M1 exit criteria above are 🟢.
+
 **Remaining (genuinely later milestones):** boot-time optimization toward NFR-P1
 (125 ms; currently ≈1 s — the generic 4.14 fixture kernel + legacy device probes
-dominate); runtime exercise of the net/SSH and jailer paths on the runner (the
-boot fixture has no net device and uses the un-jailed `Machine::boot`); SSH
-end-to-end also needs an in-guest sshd (image-provided); aarch64 VMM
-boot-protocol support.
+dominate, and the 125 ms target needs a minimal purpose-built guest kernel);
+aarch64 VMM boot-protocol support.
