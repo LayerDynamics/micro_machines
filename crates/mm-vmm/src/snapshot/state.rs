@@ -12,7 +12,7 @@
 //! Linux-only: the types embed `kvm_bindings`, which is a Linux-only dependency. The
 //! (de)serialization is pure (no KVM calls), so its round-trip is unit-tested on any
 //! Linux host without `/dev/kvm`.
-use kvm_bindings::{kvm_lapic_state, kvm_mp_state, kvm_regs, kvm_sregs, kvm_xsave};
+use kvm_bindings::{kvm_lapic_state, kvm_mp_state, kvm_regs, kvm_sregs};
 use serde::{Deserialize, Serialize};
 use virtio_queue::QueueState;
 
@@ -34,18 +34,19 @@ pub struct MsrEntry {
     pub data: u64,
 }
 
-/// Everything KVM needs to recreate one vCPU's execution context. Not `Clone`: the
-/// embedded `kvm_xsave` carries a flexible array member. Snapshot state is moved and
-/// (de)serialized, never cloned.
-#[derive(Serialize, Deserialize)]
+/// Everything KVM needs to recreate one vCPU's execution context.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct VcpuState {
     /// General-purpose + instruction-pointer registers (`KVM_GET_REGS`).
     pub regs: kvm_regs,
     /// Segment/control registers (`KVM_GET_SREGS`).
     pub sregs: kvm_sregs,
-    /// Extended FPU/SSE/AVX state (`KVM_GET_XSAVE`). The complete, serde-capable
-    /// superset of the legacy `kvm_fpu`, and what restore feeds to `KVM_SET_XSAVE`.
-    pub xsave: kvm_xsave,
+    /// FPU/SSE state as the raw bytes of a `kvm_fpu` (`KVM_GET_FPU` /
+    /// `KVM_SET_FPU`). Stored as bytes because `kvm_fpu` has no serde impl and
+    /// kvm-ioctls 0.24 exposes no `set_xsave` to restore the richer `kvm_xsave`;
+    /// `kvm_fpu` is a fixed-size POD, so its bytes round-trip exactly. Length is
+    /// `size_of::<kvm_fpu>()`; the capture/restore boundary (vcpu.rs) validates it.
+    pub fpu: Vec<u8>,
     /// Local APIC state (`KVM_GET_LAPIC`).
     pub lapic: kvm_lapic_state,
     /// Run state, e.g. runnable vs halted (`KVM_GET_MP_STATE`).
@@ -113,7 +114,7 @@ pub struct DeviceState {
 }
 
 /// The full non-RAM state of a paused microVM — the serialized `state_file`.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct VmState {
     /// Per-vCPU state, in vCPU-index order.
     pub vcpus: Vec<VcpuState>,
@@ -146,7 +147,9 @@ mod tests {
         VcpuState {
             regs,
             sregs: kvm_sregs::default(),
-            xsave: kvm_xsave::default(),
+            // Arbitrary stand-in bytes; the real length is size_of::<kvm_fpu>() and
+            // is validated at the vcpu.rs capture/restore boundary.
+            fpu: vec![0xab; 16],
             lapic: kvm_lapic_state::default(),
             mp_state: kvm_mp_state::default(),
             msrs: vec![
