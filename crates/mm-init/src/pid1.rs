@@ -446,11 +446,13 @@ fn run_workload(cfg: &InitConfig) -> ExitCode {
     }
 }
 
-/// Sandbox mode: the machine is an SSH-reachable box with no foreground workload,
-/// so PID 1 just stays alive (reaping orphaned children) while the sshd started
-/// above serves connections. The VM lives until the host tears it down (`mm stop`).
-/// Unlike workload mode, there is nothing whose exit should power the guest off.
+/// Sandbox mode: the machine is an exec/SSH-reachable box with no foreground
+/// workload. PID 1 starts the vsock exec agent (so the host can run commands inside,
+/// SPEC-1 FR-13) and then stays alive reaping orphaned children while the agent +
+/// sshd serve. The VM lives until the host tears it down (`mm stop`).
 fn run_sandbox(_cfg: &InitConfig) -> ExitCode {
+    // Serve exec requests over vsock in the background; never blocks the reaper.
+    std::thread::spawn(|| crate::exec_agent::serve(crate::exec_agent::EXEC_VSOCK_PORT));
     reap_forever();
 }
 

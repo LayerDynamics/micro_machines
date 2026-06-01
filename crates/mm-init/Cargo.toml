@@ -9,7 +9,10 @@ name = "mm-init"
 path = "src/main.rs"
 
 [dependencies]
-# Intentionally tiny. No async runtime, no serde in the hot path.
+# Intentionally tiny. No async runtime. The exec agent (Sandbox Mode) speaks the
+# shared vsock exec protocol from mm-sandbox (serde frames) — the one place the
+# guest needs serde.
+mm-sandbox = { path = "../mm-sandbox" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true }
