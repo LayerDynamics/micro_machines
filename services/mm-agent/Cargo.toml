@@ -1,0 +1,37 @@
+[package]
+name = "mm-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "MicroMachines host agent: reconciles controller assignments to real microVMs (M2)"
+
+[lib]
+name = "mm_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mm-agent"
+path = "src/main.rs"
+
+[dependencies]
+mm-host = { path = "../../crates/mm-host" }   # shared launch + jailed-worker boot path
+mm-proto = { path = "../../crates/mm-proto" } # controller<->agent gRPC contract
+mm-net = { path = "../../crates/mm-net" }     # TAP teardown on destroy
+mm-image = { path = "../../crates/mm-image" } # overlay teardown on destroy
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+redb = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }

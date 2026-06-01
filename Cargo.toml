@@ -11,6 +11,7 @@ members = [
     "crates/mm-host",
     "crates/mm-proto",
     "services/mm-controller",
+    "services/mm-agent",
 ]
 
 [workspace.package]

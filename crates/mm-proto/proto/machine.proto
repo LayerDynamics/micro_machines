@@ -13,10 +13,14 @@ service MachineService {
   rpc WatchAssignments(HostRef) returns (stream Assignment); // controller -> agent
 }
 
-// HostService: the agent reports capacity/health and streams machine events.
+// HostService: the agent reports capacity/health and machine state transitions.
 service HostService {
   rpc ReportCapacity(Capacity) returns (Ack);
   rpc Heartbeat(HostRef) returns (Ack);
+  // The agent reports a machine's observed state transition (agent -> controller),
+  // which the controller records as the machine's status. This is how observed
+  // state flows back from the data plane.
+  rpc ReportEvent(MachineEvent) returns (Ack);
   rpc StreamEvents(HostRef) returns (stream MachineEvent);
 }
 
