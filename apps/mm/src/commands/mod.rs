@@ -1,5 +1,6 @@
 //! `mm` subcommands and shared state-location helpers.
 pub mod ps;
+pub mod remote;
 pub mod rm;
 pub mod run;
 pub mod ssh;
