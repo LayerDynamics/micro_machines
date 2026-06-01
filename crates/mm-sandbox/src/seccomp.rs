@@ -105,9 +105,14 @@ pub fn vmm_thread_rules() -> SeccompAllowlist {
         "getrandom",
         "exit",
         "exit_group",
-        // Local message passing (vsock/uds helpers in later milestones).
+        // Local message passing over the vsock exec bridge: the device worker
+        // accepts host UDS connections (`accept4`) and reads/writes them with
+        // std `UnixStream`, whose I/O goes through `recv`/`send` (the `recvfrom`/
+        // `sendto` syscalls), not `read`/`write` (SPEC-1 FR-13).
         "recvmsg",
         "sendmsg",
+        "recvfrom",
+        "sendto",
         "accept4",
     ]
     .into_iter()
@@ -229,6 +234,8 @@ mod apply {
             "exit_group" => libc::SYS_exit_group,
             "recvmsg" => libc::SYS_recvmsg,
             "sendmsg" => libc::SYS_sendmsg,
+            "recvfrom" => libc::SYS_recvfrom,
+            "sendto" => libc::SYS_sendto,
             "accept4" => libc::SYS_accept4,
             _ => return None,
         };
@@ -272,8 +279,16 @@ mod tests {
             // Device workers spawn threads from activate(), under this filter.
             "clone",
             "clone3",
+            // The vsock exec bridge accepts host UDS connections and does std
+            // UnixStream I/O, which uses recv/send (recvfrom/sendto), not read/write.
+            "accept4",
+            "recvfrom",
+            "sendto",
         ] {
             assert!(rules.allows(needed), "{needed} must be allowed");
         }
+        // ...but creating *new* sockets stays denied — the bridge only accepts on
+        // an inherited listener fd, it never calls socket(2).
+        assert!(!rules.allows("socket"), "socket(2) must stay denied");
     }
 }
