@@ -73,11 +73,7 @@ pub fn run(args: RunArgs) -> Result<()> {
         anyhow::bail!("a machine named {name} already exists");
     }
     // Seed the IP pool from already-known machines so the new one gets a free IP.
-    let reserved_ips = store
-        .list()?
-        .into_iter()
-        .filter_map(|rec| rec.ip)
-        .collect();
+    let reserved_ips = store.list()?.into_iter().filter_map(|rec| rec.ip).collect();
 
     let spec = LaunchSpec {
         image: args.image.clone(),

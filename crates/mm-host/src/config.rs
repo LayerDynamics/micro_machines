@@ -108,7 +108,9 @@ mod tests {
         assert!(cfg
             .kernel_cmdline
             .contains("ip=10.0.0.2::10.0.0.1:255.255.255.0:web-1:eth0:off"));
-        assert!(cfg.kernel_cmdline.contains("mm.workload_argv=2f62696e2f7368"));
+        assert!(cfg
+            .kernel_cmdline
+            .contains("mm.workload_argv=2f62696e2f7368"));
         assert!(cfg.rootfs.read_only);
         assert_eq!(
             cfg.devices,
