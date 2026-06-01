@@ -1,0 +1,81 @@
+//! `mm-host` — shared host actuation for MicroMachines.
+//!
+//! Turns an OCI image into a booted, jailed, network-reachable microVM by composing
+//! the M1 crates ([`mm_image`], [`mm_net`], [`mm_sandbox`], [`mm_vmm`]). This is the
+//! exact boot path `mm run` used in M1, lifted out of the CLI binary so the cluster
+//! agent (M2) reuses it verbatim rather than re-deriving the privileged
+//! parent/jailed-worker/fd-passing machinery.
+//!
+//! Two entry points, decoupled from any registry:
+//! - [`launch`] — the privileged parent: build + wire + spawn the jailed worker,
+//!   returning a [`LaunchOutcome`] the caller persists however it likes.
+//! - [`run_worker`] — the body of the internal `__vmm-worker` re-exec target; the
+//!   binary that calls [`launch`] must also expose this subcommand, since `launch`
+//!   re-execs `current_exe() __vmm-worker`.
+use std::net::Ipv4Addr;
+use std::path::PathBuf;
+use std::process::Child;
+
+mod config;
+#[cfg(target_os = "linux")]
+mod launch;
+mod worker;
+
+pub use config::{build_vm_config, default_name, mac_from_ip, NETMASK};
+pub use worker::{run as run_worker, WorkerArgs};
+
+/// Everything needed to boot one microVM, decoupled from any registry. The caller
+/// resolves the machine name + the IPs already in use (so launch never reads a
+/// store) and the on-disk locations of the kernel, mm-init, and optional sshd.
+pub struct LaunchSpec {
+    /// OCI image reference to boot.
+    pub image: String,
+    /// Machine name (already resolved + collision-checked by the caller).
+    pub name: String,
+    pub cpus: u8,
+    pub memory_mib: u64,
+    /// Boot an SSH-reachable sandbox shell rather than the image's workload.
+    pub ssh: bool,
+    /// Run the worker in its own session (background) and return immediately.
+    pub detach: bool,
+    /// Root directory for host state (images cache + per-VM jails + managed SSH key).
+    pub state_root: PathBuf,
+    /// Guest kernel image (hardlinked/copied into the jail as `/vmlinux`).
+    pub kernel_path: PathBuf,
+    /// Guest `mm-init` binary, injected into the rootfs as `/init`.
+    pub mm_init_path: PathBuf,
+    /// Optional static sshd injected as `/sbin/dropbear`; `None` boots without SSH.
+    pub sshd_path: Option<PathBuf>,
+    /// IPs already allocated to other machines, used to seed the IPAM pool so the new
+    /// machine gets a free address.
+    pub reserved_ips: Vec<Ipv4Addr>,
+}
+
+/// The result of a successful [`launch`] — what the caller persists.
+pub struct LaunchOutcome {
+    pub name: String,
+    pub ip: Ipv4Addr,
+    pub tap_name: String,
+    /// PID of the spawned jailed worker (the handle a caller's `stop` signals).
+    pub pid: u32,
+    /// File the detached guest console is written to.
+    pub console_log: PathBuf,
+    /// Handle to the spawned jailed worker. Wait on it to serve the guest in the
+    /// foreground; drop it to leave the detached worker running in its own session.
+    pub child: Child,
+}
+
+/// Boot a microVM per `spec`, returning the running outcome. Linux/KVM only; on
+/// other platforms this returns an error (the rest of the library still compiles so
+/// logic/unit tests run anywhere).
+pub fn launch(spec: &LaunchSpec) -> anyhow::Result<LaunchOutcome> {
+    #[cfg(target_os = "linux")]
+    {
+        launch::launch(spec)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = spec;
+        anyhow::bail!("booting a microVM requires a Linux/KVM host")
+    }
+}

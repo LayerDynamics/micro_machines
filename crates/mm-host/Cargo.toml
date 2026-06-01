@@ -1,0 +1,22 @@
+[package]
+name = "mm-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared host actuation: build a rootfs, wire networking, jail, and boot a microVM (M1 launch + worker, reusable by the CLI and the cluster agent)"
+
+[dependencies]
+mm-vmm = { path = "../mm-vmm" } # VmConfig is cross-platform; Machine is linux-only
+mm-net = { path = "../mm-net" }
+mm-image = { path = "../mm-image" }
+mm-sandbox = { path = "../mm-sandbox" }
+clap = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }

@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 mm-api-types = { path = "../../crates/mm-api-types" }
+mm-host = { path = "../../crates/mm-host" }    # shared launch + jailed-worker boot path
 mm-vmm = { path = "../../crates/mm-vmm" }     # VmConfig is cross-platform; Machine is linux-only
 mm-net = { path = "../../crates/mm-net" }
 mm-image = { path = "../../crates/mm-image" }

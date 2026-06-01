@@ -1174,6 +1174,7 @@ dependencies = [
  "clap",
  "libc",
  "mm-api-types",
+ "mm-host",
  "mm-image",
  "mm-net",
  "mm-sandbox",
@@ -1218,6 +1219,22 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "mm-host"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "mm-image",
+ "mm-net",
+ "mm-sandbox",
+ "mm-vmm",
+ "serde_json",
+ "tracing",
  "uuid",
 ]
 

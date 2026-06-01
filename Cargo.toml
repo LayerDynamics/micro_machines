@@ -8,6 +8,7 @@ members = [
     "crates/mm-sandbox",
     "crates/mm-image",
     "apps/mm",
+    "crates/mm-host",
     "crates/mm-proto",
     "services/mm-controller",
 ]
