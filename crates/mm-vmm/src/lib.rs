@@ -14,6 +14,11 @@ pub use config::{BlockDevice, ConfigError, VirtioDevice, VmConfig, FAST_BOOT_ARG
 pub mod snapshot;
 pub use snapshot::{SnapshotKind, SnapshotManifest};
 
+/// Token-bucket rate limiter (cross-platform); the Linux virtio block/net devices
+/// drive it to enforce per-device throughput limits (FR-28).
+pub mod ratelimit;
+pub use ratelimit::TokenBucket;
+
 // Linux-only KVM machinery (Tasks 5–8), behind `cfg(target_os = "linux")`.
 #[cfg(target_os = "linux")]
 pub mod boot;
