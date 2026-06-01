@@ -25,9 +25,13 @@ AGENT_BIN="${AGENT_BIN:-$ROOT/target/debug/mm-agent}"
 MM_BIN="${MM_BIN:-$ROOT/target/debug/mm}"
 
 WORK="$(mktemp -d)"
+# mktemp creates 0700; the jailed worker drops to uid 65534 and must traverse the
+# whole path down to its chroot, so make the state tree world-traversable.
+chmod 0755 "$WORK"
 CERTS="$WORK/certs"
 STATE="$WORK/state"
 mkdir -p "$STATE"
+chmod 0755 "$STATE"
 
 # Dev mTLS certs (server SAN includes IP:127.0.0.1, which the agent dials).
 CONTROLLER_DNS=localhost bash "$ROOT/scripts/dev-certs.sh" "$CERTS"
