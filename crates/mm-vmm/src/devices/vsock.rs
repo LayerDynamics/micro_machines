@@ -894,8 +894,11 @@ mod tests {
     fn worker_with_rx(mem: Arc<GuestMemoryMmap>, rx_bufs: u16) -> VsockWorker {
         // Build an rx queue with `rx_bufs` single-descriptor device-writable chains.
         // Each is its own chain (no NEXT flag), with a distinct buffer well above the
-        // ring memory (the mock lays desc table at gpa 0 and the rings just above).
-        let rxq = MockSplitQueue::new(mem.as_ref(), 256);
+        // ring memory. The rx and tx mocks MUST sit at different guest-physical bases:
+        // each MockSplitQueue constructor zeroes its avail-ring idx, so two mocks at
+        // the same default base (gpa 0) would alias and the second would wipe the rx
+        // avail idx we just populated — leaving nothing to pop.
+        let rxq = MockSplitQueue::create(mem.as_ref(), GuestAddress(0), 256);
         let descs: Vec<RawDescriptor> = (0..rx_bufs)
             .map(|i| {
                 RawDescriptor::from(SplitDescriptor::new(
@@ -910,7 +913,8 @@ mod tests {
             rxq.add_desc_chains(&descs, 0).unwrap();
         }
         let rx_queue = rxq.create_queue::<Queue>().unwrap();
-        let tx_queue = MockSplitQueue::new(mem.as_ref(), 256)
+        // tx queue at a separate base (8 MiB), clear of the rx rings + rx buffers.
+        let tx_queue = MockSplitQueue::create(mem.as_ref(), GuestAddress(0x80_0000), 256)
             .create_queue::<Queue>()
             .unwrap();
         let interrupt = Arc::new(Interrupt::new(EventFd::new(0).unwrap()));
