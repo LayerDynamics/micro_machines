@@ -11,7 +11,15 @@ service MachineService {
   rpc Delete(MachineRef) returns (Ack);
   rpc Get(MachineRef) returns (Machine);
   rpc WatchAssignments(HostRef) returns (stream Assignment); // controller -> agent
+  // Run a command in a sandbox guest over vsock, streaming stdout/stderr back and
+  // ending with the exit code (SPEC-1 FR-13). controller -> agent -> guest.
+  rpc Exec(ExecRequest) returns (stream ExecChunk);
 }
+
+message ExecRequest { MachineRef ref = 1; repeated string cmd = 2; uint64 timeout_ms = 3; }
+// A streamed exec result: an output chunk (stdout/stderr), or — when `done` — the
+// terminal frame carrying `exit_code`.
+message ExecChunk { string stream = 1; bytes data = 2; int32 exit_code = 3; bool done = 4; }
 
 // HostService: the agent reports capacity/health and machine state transitions.
 service HostService {
