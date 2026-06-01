@@ -5,5 +5,5 @@
 pub mod client;
 pub mod protocol;
 
-pub use client::{run_exec, ExecResult};
+pub use client::{run_exec, run_exec_over_uds, vsock_connect, ExecResult};
 pub use protocol::{decode, encode, Frame, Stream};
