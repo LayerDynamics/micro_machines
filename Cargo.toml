@@ -54,6 +54,13 @@ seccompiler = "0.5"
 # Host-side syscalls / namespaces / mounts (linux-only consumers).
 nix = { version = "0.30", features = ["mount", "sched", "user", "net", "fs", "reboot", "ioctl", "process"] }
 
+# --- M3 sandbox / snapshot / fork deps (linux-only consumers) ---
+# userfaultfd: page-fault-driven copy-on-write for fork fan-out (kernel >=5.7 UFFD_WP).
+# tokio-vsock: async host<->guest vsock for the exec client. Both are referenced only
+# from linux-cfg'd tables, so non-Linux hosts never compile them.
+userfaultfd = "0.8"
+tokio-vsock = "0.5"
+
 # CLI + observability + ergonomics (cross-platform).
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"

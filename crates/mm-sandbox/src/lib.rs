@@ -12,6 +12,9 @@
 pub mod seccomp;
 pub use seccomp::{vmm_thread_rules, SeccompAllowlist, SeccompError};
 
+/// Host<->guest exec wire protocol for Sandbox Mode (cross-platform).
+pub mod exec;
+
 #[cfg(target_os = "linux")]
 pub mod jailer;
 #[cfg(target_os = "linux")]
