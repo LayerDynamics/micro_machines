@@ -19,6 +19,11 @@ pub use snapshot::{SnapshotKind, SnapshotManifest};
 pub mod ratelimit;
 pub use ratelimit::TokenBucket;
 
+/// Pure virtio-vsock protocol primitives (cross-platform); the Linux vsock device
+/// drives them to bridge the guest's exec agent to the host (FR-13).
+pub mod vsock_proto;
+pub use vsock_proto::{CreditTracker, VsockHeader};
+
 // Linux-only KVM machinery (Tasks 5–8), behind `cfg(target_os = "linux")`.
 #[cfg(target_os = "linux")]
 pub mod boot;
