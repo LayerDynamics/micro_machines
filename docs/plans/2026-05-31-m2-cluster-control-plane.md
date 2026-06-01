@@ -570,10 +570,21 @@ mm --server https://<controller>:443 rm c1
 → Expected: machine scheduled onto the agent and boots; survives controller restart; cross-namespace API call denied (403); reconvergence < 30 s.
 
 **Exit criteria (M2 complete when ALL true):**
-- [ ] Create a machine via REST → scheduler places it → agent reconciles and boots it on a Linux/KVM host (FR-17, FR-18, FR-19).
-- [ ] Desired + observed state persist in Postgres; data plane survives a control-plane restart with no duplicate assignment (FR-22, NFR-R2).
-- [ ] OIDC/JWT auth enforced; namespace RBAC denies cross-namespace access; controller↔agent traffic is mTLS (FR-29, FR-30).
-- [ ] Reconcile convergence < 30 s under normal load (NFR-R4); API p95 < 200 ms tracked (NFR-P4).
-- [ ] All pure-logic crates have passing unit tests; integration tests pass against real Postgres + a real gRPC round-trip; clippy + fmt clean; every task committed.
 
-**TODOs discovered during M2** (note, do NOT fix now): _record here (e.g. HA leader election is M4; metrics dashboards; pagination on list)._
+Status legend: ✅ done & verified in CI · 🟡 core verified, a sub-part deferred (see
+TODOs). DB-backed gates run in the `controller` CI job (a `postgres:16` service);
+the project does not stand up local containers (verification is deferred to CI).
+
+- [🟡] Create a machine via REST → scheduler places it → agent reconciles and boots it on a Linux/KVM host (FR-17, FR-18, FR-19) — **REST create → `scheduler::place` → assignment pushed to the agent over mTLS → agent reports `Running` → status converges is verified end-to-end** by `reconcile_loop.rs` (real Postgres + real mTLS gRPC, ~1.7 s). The agent's *actual* boot reuses the KVM-verified `mm_host::launch` path (the same one `mm run` uses — green in the M1 KVM jobs), but the full controller→agent→**real-VM-on-KVM** chain is not run in CI: the cluster test uses an in-process fake agent that reports `Running` without booting. Booting a real VM through the cluster is the manual Step-2 gate (1 controller + a live linux/kvm agent).
+- [✅] Desired + observed state persist in Postgres; data plane survives a control-plane restart with no duplicate assignment (FR-22, NFR-R2) — verified by `reconcile_loop.rs`: status is re-read from Postgres after a fresh registry, and a `Running` machine yields `decide → None` so no assignment is re-issued.
+- [🟡] OIDC/JWT auth enforced; namespace RBAC denies cross-namespace access; controller↔agent traffic is mTLS (FR-29, FR-30) — **JWT verification + namespace RBAC (cross-ns → 403) verified** by `api_pg.rs`; **mTLS verified** by `reconcile_loop.rs` (the server requires a CA-signed client cert). The verifying key is supplied by configuration (HS256) — full **OIDC discovery / JWKS fetch is deferred** (this is the deliberate test seam, so CI can mint accepted tokens offline).
+- [🟡] Reconcile convergence < 30 s under normal load (NFR-R4); API p95 < 200 ms tracked (NFR-P4) — **convergence verified** (~1.7 s in `reconcile_loop`). **API p95 latency tracking is deferred** (the per-request metrics + rate-limit tower middleware was not built).
+- [✅] All pure-logic crates have passing unit tests; integration tests pass against real Postgres + a real gRPC round-trip; clippy + fmt clean; every task committed — 85 workspace unit tests + `api_pg` + `reconcile_loop` green in CI; clippy + fmt clean; per-task commits.
+
+**TODOs discovered during M2** (deliberately deferred — not blockers for the M2 core):
+1. **Full cluster e2e on real KVM** — the CI reconcile test uses a fake agent; booting a real VM end-to-end through controller→agent needs a live multi-host KVM setup (manual Step-2 gate). The agent's boot path itself is the CI-green `mm_host::launch`.
+2. **OIDC discovery / JWKS** — currently an HS256 config key; add issuer discovery + JWKS verification for production identity providers (FR-29 full).
+3. **API p95 metrics + per-tenant rate limiting** — the tower middleware for NFR-P4 tracking + quota enforcement.
+4. **Fleet REST endpoints** (`api/fleets.rs`) — machines already carry a `fleet` field and the `fleets` table exists; dedicated fleet CRUD was not built.
+5. **Destroy-on-delete agent teardown** — REST `DELETE` removes the row + (in cluster mode) the CLI stops first; wiring the controller to drive agent-side TAP/overlay teardown via the assignment stream on delete is follow-on.
+6. **HA leader election** — M4 (M2 ships a single control-plane instance whose state survives restart).
