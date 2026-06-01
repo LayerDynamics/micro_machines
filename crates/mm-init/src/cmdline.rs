@@ -11,6 +11,14 @@ pub struct InitConfig {
     /// Passed hex-encoded on the cmdline (`mm.authorized_key=`) because the kernel
     /// command line is whitespace-separated and SSH keys contain spaces.
     pub authorized_key: Option<String>,
+    /// Real entropy from the host (hex-encoded on the cmdline as `mm.random_seed=`)
+    /// used to seed the guest CRNG via `RNDADDENTROPY`. A fresh microVM has no
+    /// entropy source — and this fixture kernel has no virtio-rng driver — so
+    /// `getrandom(2)` blocks until the CRNG is initialized, which stalls anything
+    /// that needs randomness at boot (notably dropbear generating its host key:
+    /// "Connection timed out during banner exchange"). Crediting host entropy here
+    /// unblocks it. The seed is generated per-VM by `mm run`.
+    pub random_seed: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -61,6 +69,9 @@ impl InitConfig {
                 Some(("mm.authorized_key", v)) => {
                     cfg.authorized_key =
                         decode_hex(v).and_then(|bytes| String::from_utf8(bytes).ok());
+                }
+                Some(("mm.random_seed", v)) => {
+                    cfg.random_seed = decode_hex(v).filter(|b| !b.is_empty());
                 }
                 _ => {}
             }
@@ -139,6 +150,14 @@ mod tests {
             InitConfig::parse("mm.authorized_key=abc").authorized_key,
             None
         );
+    }
+    #[test]
+    fn decodes_hex_encoded_random_seed() {
+        let c = InitConfig::parse("mm.random_seed=00ff10ab");
+        assert_eq!(c.random_seed, Some(vec![0x00, 0xff, 0x10, 0xab]));
+        // Malformed or empty hex yields no seed (init simply skips CRNG crediting).
+        assert_eq!(InitConfig::parse("mm.random_seed=xyz").random_seed, None);
+        assert_eq!(InitConfig::parse("mm.random_seed=").random_seed, None);
     }
     #[test]
     fn decode_hex_roundtrips() {

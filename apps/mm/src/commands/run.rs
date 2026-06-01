@@ -50,6 +50,7 @@ pub fn build_vm_config(
     mac: String,
     workload_argv_hex: Option<&str>,
     authorized_key_hex: Option<&str>,
+    random_seed_hex: Option<&str>,
 ) -> VmConfig {
     let ip_param = mm_net::ip_cmdline(ip, gateway, mask, hostname, "eth0");
     // Some(hex) → run the image's command (argv hex-encoded as mm.workload_argv);
@@ -69,6 +70,11 @@ pub fn build_vm_config(
     if let Some(hex) = authorized_key_hex {
         // Hex-encoded (no spaces) so it survives the whitespace-split cmdline.
         kernel_cmdline.push_str(&format!(" mm.authorized_key={hex}"));
+    }
+    if let Some(hex) = random_seed_hex {
+        // Real host entropy for the guest CRNG — mm-init credits it via RNDADDENTROPY
+        // so getrandom(2) doesn't block (this kernel has no virtio-rng). Hex-encoded.
+        kernel_cmdline.push_str(&format!(" mm.random_seed={hex}"));
     }
     VmConfig {
         vcpus,
@@ -237,6 +243,10 @@ mod linux {
         // 6. Worker VM config with chroot-relative paths; serialized for the child.
         // Inject the managed SSH public key so `mm ssh` works with no in-guest setup.
         let authorized_key_hex = ensure_ssh_key(&root)?;
+        // Per-VM CRNG seed drawn from the host's (initialized) entropy pool — the
+        // guest has none at boot and no virtio-rng, so mm-init credits this so
+        // getrandom(2) doesn't block (notably dropbear's host-key generation).
+        let random_seed_hex = host_random_seed_hex();
         // Workload: `--ssh` boots the sandbox shell; otherwise run the image's own
         // command (Entrypoint+Cmd), hex-encoded so args with spaces survive the
         // kernel cmdline.
@@ -261,6 +271,7 @@ mod linux {
             mac_from_ip(ip),
             workload_argv_hex.as_deref(),
             authorized_key_hex.as_deref(),
+            random_seed_hex.as_deref(),
         );
         worker_cfg.validate().context("validating VM config")?;
         let cfg_path = jail.join("config.json");
@@ -453,6 +464,24 @@ mod linux {
         s
     }
 
+    /// Draw a 32-byte CRNG seed from the host's `/dev/urandom` and hex-encode it for
+    /// the guest cmdline (`mm.random_seed=`). The host pool is already initialized, so
+    /// this is real entropy the guest can credit to unblock `getrandom(2)`. Returns
+    /// `None` if the host RNG is somehow unreadable (the guest then self-seeds slowly).
+    fn host_random_seed_hex() -> Option<String> {
+        let mut seed = [0u8; 32];
+        match std::fs::File::open("/dev/urandom").and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut seed)
+        }) {
+            Ok(()) => Some(hex_encode(&seed)),
+            Err(e) => {
+                eprintln!("mm: reading host entropy for guest seed failed: {e}");
+                None
+            }
+        }
+    }
+
     /// Make the jail directories world-traversable (0755) and the kernel + rootfs
     /// world-readable (0644), then verify the dropped uid can actually read them
     /// and reach the chroot — failing loudly otherwise.
@@ -562,6 +591,7 @@ mod tests {
             "02:00:00:0a:00:02".to_string(),
             Some("2f62696e2f7368"), // hex("/bin/sh")
             None,
+            None,
         );
         assert_eq!(cfg.vcpus, 2);
         assert!(cfg
@@ -595,6 +625,7 @@ mod tests {
             "02:00:00:0a:00:05".to_string(),
             None, // no workload argv → sandbox mode
             None,
+            None,
         );
         assert!(cfg.kernel_cmdline.contains("mm.mode=sandbox"));
         assert!(!cfg.kernel_cmdline.contains("mm.workload"));
@@ -615,8 +646,10 @@ mod tests {
             "02:00:00:0a:00:07".to_string(),
             Some("2f62696e2f7368"), // hex("/bin/sh")
             Some("deadbeef"),
+            Some("00ff10ab"),
         );
         assert!(cfg.kernel_cmdline.contains("mm.authorized_key=deadbeef"));
+        assert!(cfg.kernel_cmdline.contains("mm.random_seed=00ff10ab"));
     }
 
     #[test]

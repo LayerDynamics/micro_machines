@@ -44,6 +44,13 @@ pub fn run_pid1() -> ExitCode {
         }
     }
 
+    // Credit host entropy to the CRNG *before* starting sshd, so dropbear's host-key
+    // generation (which calls getrandom(2)) doesn't block on a fresh, entropy-starved
+    // microVM. Best-effort: with no seed on the cmdline this is a no-op.
+    if let Some(seed) = &cfg.random_seed {
+        seed_crng(seed);
+    }
+
     // Start the in-guest sshd (if injected) so the machine is reachable over SSH in
     // either mode — `mm ssh` works while a workload runs, and is the access path for
     // sandbox mode. Best-effort: a missing/failed sshd never blocks the boot.
@@ -84,6 +91,50 @@ fn start_sshd() {
             let _ = child.wait();
         }
         Err(e) => eprintln!("mm-init: starting sshd failed: {e}"),
+    }
+}
+
+/// Credit host-provided entropy to the guest CRNG via the `RNDADDENTROPY` ioctl on
+/// `/dev/urandom`, which both mixes the seed in *and* marks the pool initialized so
+/// `getrandom(2)` stops blocking. A just-booted microVM has gathered no entropy, and
+/// this kernel has no virtio-rng driver to supply any, so the first consumer of
+/// randomness (dropbear generating its host key) would otherwise stall until the
+/// kernel slowly self-seeds from interrupts — surfacing as
+/// "Connection timed out during banner exchange". Best-effort and non-fatal.
+fn seed_crng(seed: &[u8]) {
+    if seed.is_empty() {
+        return;
+    }
+    // The kernel's `struct rand_pool_info { int entropy_count; int buf_size; u8 buf[]; }`,
+    // serialized in native byte order. `entropy_count` is in BITS; credit the whole
+    // seed so the CRNG counts as fully seeded.
+    const RNDADDENTROPY: libc::c_ulong = 0x4008_5203;
+    let entropy_bits = (seed.len() as i32).saturating_mul(8);
+    let mut pool = Vec::with_capacity(8 + seed.len());
+    pool.extend_from_slice(&entropy_bits.to_ne_bytes());
+    pool.extend_from_slice(&(seed.len() as i32).to_ne_bytes());
+    pool.extend_from_slice(seed);
+
+    // SAFETY: open/ioctl/close with checked returns; `pool` is laid out exactly as
+    // `rand_pool_info` and outlives the ioctl. The ioctl request width differs between
+    // gnu (c_ulong) and musl (c_int) `libc::Ioctl` — the guest targets musl, so the
+    // cast is load-bearing (mirrors the SIOCSIFFLAGS casts above).
+    unsafe {
+        let fd = libc::open(c"/dev/urandom".as_ptr(), libc::O_WRONLY);
+        if fd < 0 {
+            eprintln!(
+                "mm-init: seeding CRNG: open /dev/urandom failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        if libc::ioctl(fd, RNDADDENTROPY as libc::Ioctl, pool.as_ptr()) < 0 {
+            eprintln!(
+                "mm-init: seeding CRNG: RNDADDENTROPY failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        libc::close(fd);
     }
 }
 
