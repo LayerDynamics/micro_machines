@@ -346,8 +346,10 @@ impl Machine {
 
         // Configured devices: net (attach to its TAP). The boot vsock above already
         // covers M1's single vsock use; balloon is a tracked M1 TODO, so a config
-        // that asks for it fails loudly rather than being silently dropped.
-        for device in &self.config.devices {
+        // that asks for it fails loudly rather than being silently dropped. Clone the
+        // list so the loop body can take `&mut self` (e.g. install_device_pause).
+        let config_devices = self.config.devices.clone();
+        for device in &config_devices {
             match device {
                 ConfigDevice::Net {
                     tap_name,
@@ -361,12 +363,14 @@ impl Machine {
                         None => open_tap(tap_name)?,
                     };
                     let net = Net::new(tap, parse_mac(mac)?, rate_limit.clone());
+                    let mut net: Box<dyn VirtioDevice> = Box::new(net);
+                    self.install_device_pause(&mut net)?;
                     self.attach_virtio(
                         &mut bus,
                         &mut mmio_cmdline,
                         &mut next_mmio,
                         &mut next_gsi,
-                        Box::new(net),
+                        net,
                     )?;
                 }
                 ConfigDevice::Vsock { .. } => {

@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use event_manager::{EventManager, EventOps, EventSet, Events, MutEventSubscriber, SubscriberOps};
@@ -18,7 +19,7 @@ use virtio_queue::{Queue, QueueT};
 use vm_memory::{Bytes, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
-use super::{Interrupt, VirtioDevice, QUEUE_SIZE, TYPE_NET, VIRTIO_F_VERSION_1};
+use super::{DevicePause, Interrupt, VirtioDevice, QUEUE_SIZE, TYPE_NET, VIRTIO_F_VERSION_1};
 use crate::machine::{Result, VmmError};
 
 /// Length of the `virtio_net_hdr_v1` the guest prepends to every frame.
@@ -40,6 +41,8 @@ pub struct Net {
     mac: [u8; 6],
     queue_max_sizes: [u16; 2],
     rate_limit: Option<crate::config::RateLimit>,
+    /// Snapshot pause handle (SPEC-1 FR-14); the worker captures its rx/tx cursors.
+    pause: Option<DevicePause>,
 }
 
 impl Net {
@@ -51,6 +54,7 @@ impl Net {
             mac,
             queue_max_sizes: [QUEUE_SIZE, QUEUE_SIZE],
             rate_limit,
+            pause: None,
         }
     }
 }
@@ -74,6 +78,10 @@ impl VirtioDevice for Net {
             let idx = offset as usize + i;
             *byte = self.mac.get(idx).copied().unwrap_or(0);
         }
+    }
+
+    fn set_pause_handle(&mut self, pause: DevicePause) {
+        self.pause = Some(pause);
     }
 
     fn activate(
@@ -100,6 +108,9 @@ impl VirtioDevice for Net {
             .ok_or_else(|| VmmError::Device("net: already activated".to_string()))?;
         set_nonblocking(&tap)?;
 
+        // Shared flag the subscriber sets after capturing its cursors, so the detached
+        // epoll loop knows to stop (a snapshot froze the guest, SPEC-1 FR-14).
+        let pause_done = Arc::new(AtomicBool::new(false));
         let worker = NetWorker {
             rx_queue,
             tx_queue,
@@ -112,17 +123,20 @@ impl VirtioDevice for Net {
             limiter: crate::ratelimit::DeviceRateLimiter::from_config(
                 self.rate_limit.take().as_ref(),
             ),
+            pause: self.pause.take(),
+            pause_done: pause_done.clone(),
         };
 
         let mut manager = EventManager::<NetWorker>::new()
             .map_err(|e| VmmError::Device(format!("net epoll: {e:?}")))?;
         manager.add_subscriber(worker);
 
-        // Detached epoll loop; exits when the eventfds/tap are closed at teardown.
+        // Detached epoll loop; exits when the eventfds/tap are closed at teardown, or
+        // when the worker has captured its cursors for a snapshot.
         std::thread::Builder::new()
             .name("mm-net".to_string())
             .spawn(move || loop {
-                if manager.run().is_err() {
+                if manager.run().is_err() || pause_done.load(Ordering::Acquire) {
                     break;
                 }
             })
@@ -146,6 +160,10 @@ struct NetWorker {
     rx_backlog: VecDeque<Vec<u8>>,
     /// Optional tx throughput limiter (SPEC-1 FR-28).
     limiter: Option<crate::ratelimit::DeviceRateLimiter>,
+    /// Snapshot pause handle; on its eventfd the worker captures rx/tx cursors.
+    pause: Option<DevicePause>,
+    /// Set after capturing, so the detached epoll loop stops.
+    pause_done: Arc<AtomicBool>,
 }
 
 impl NetWorker {
@@ -282,6 +300,9 @@ impl MutEventSubscriber for NetWorker {
         let _ = ops.add(Events::new(&self.tap, EventSet::IN));
         let _ = ops.add(Events::new(&self.tx_evt, EventSet::IN));
         let _ = ops.add(Events::new(&self.rx_evt, EventSet::IN));
+        if let Some(p) = self.pause.as_ref() {
+            let _ = ops.add(Events::new(&p.evt, EventSet::IN));
+        }
     }
 
     fn process(&mut self, events: Events, _ops: &mut EventOps) {
@@ -301,6 +322,22 @@ impl MutEventSubscriber for NetWorker {
             if let Err(e) = self.process_rx() {
                 tracing::error!("net: rx (notify) failed: {e}");
             }
+        } else if self.pause.as_ref().is_some_and(|p| fd == p.evt.as_raw_fd()) {
+            // Snapshot pause: drain once, capture rx/tx cursors, signal the loop to
+            // stop (the guest is already frozen, SPEC-1 FR-14). Split the borrows so
+            // the mutable drains don't overlap the immutable `pause` borrow.
+            if let Some(p) = self.pause.as_ref() {
+                let _ = p.evt.read();
+            }
+            let _ = self.process_tx();
+            let _ = self.process_rx();
+            let cursors = vec![self.rx_queue.state().into(), self.tx_queue.state().into()];
+            if let Some(p) = self.pause.as_ref() {
+                if let Ok(mut slot) = p.slot.lock() {
+                    *slot = Some(cursors);
+                }
+            }
+            self.pause_done.store(true, Ordering::Release);
         }
     }
 }
@@ -361,6 +398,8 @@ mod tests {
             interrupt,
             rx_backlog: VecDeque::new(),
             limiter: None,
+            pause: None,
+            pause_done: Arc::new(AtomicBool::new(false)),
         }
     }
 
