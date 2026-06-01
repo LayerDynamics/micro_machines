@@ -7,6 +7,7 @@
 //! status byte, and raises the used-ring interrupt.
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -41,6 +42,9 @@ pub struct Block {
     file: Option<File>,
     queue_max_sizes: [u16; 1],
     rate_limit: Option<crate::config::RateLimit>,
+    /// Snapshot pause handle (set by the Machine before activation); the worker
+    /// captures its queue cursor here when signalled (SPEC-1 FR-14).
+    pause: Option<super::DevicePause>,
 }
 
 impl Block {
@@ -64,6 +68,7 @@ impl Block {
             file: Some(file),
             queue_max_sizes: [QUEUE_SIZE],
             rate_limit,
+            pause: None,
         })
     }
 }
@@ -94,6 +99,10 @@ impl VirtioDevice for Block {
         }
     }
 
+    fn set_pause_handle(&mut self, pause: super::DevicePause) {
+        self.pause = Some(pause);
+    }
+
     fn activate(
         &mut self,
         mem: Arc<GuestMemoryMmap>,
@@ -113,18 +122,24 @@ impl VirtioDevice for Block {
             .ok_or_else(|| VmmError::Device("block: already activated".to_string()))?;
         let read_only = self.read_only;
         let rate_limit = self.rate_limit.take();
+        let pause = self.pause.take();
 
         // The worker is detached: it lives as long as its notify eventfd (owned by
         // the transport) stays open, and exits cleanly when the VM tears down.
         std::thread::Builder::new()
             .name("mm-blk".to_string())
-            .spawn(move || block_worker(queue, evt, mem, interrupt, file, read_only, rate_limit))
+            .spawn(move || {
+                block_worker(queue, evt, mem, interrupt, file, read_only, rate_limit, pause)
+            })
             .map_err(VmmError::Io)?;
         Ok(())
     }
 }
 
-/// Block worker loop: wait for a queue notify, then drain all pending requests.
+/// Block worker loop: wait for a queue notify (or a snapshot pause request), then
+/// drain all pending requests. Polls both the notify eventfd and — when snapshotting
+/// is wired — the pause eventfd, so a snapshot can quiesce the device and capture its
+/// queue cursor (SPEC-1 FR-14).
 #[allow(clippy::too_many_arguments)]
 fn block_worker(
     mut queue: Queue,
@@ -134,22 +149,57 @@ fn block_worker(
     mut file: File,
     read_only: bool,
     rate_limit: Option<crate::config::RateLimit>,
+    pause: Option<super::DevicePause>,
 ) {
     let mut limiter = crate::ratelimit::DeviceRateLimiter::from_config(rate_limit.as_ref());
+    let mut drain = |queue: &mut Queue, file: &mut File| {
+        if let Err(e) = process_queue(queue, &mem, &interrupt, file, read_only, &mut limiter) {
+            tracing::error!("block: queue processing failed: {e}");
+        }
+    };
+
     loop {
-        // Blocking read; an error means the eventfd was closed -> shut down.
-        if evt.read().is_err() {
+        let mut fds = [
+            libc::pollfd {
+                fd: evt.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pause.as_ref().map_or(-1, |p| p.evt.as_raw_fd()),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: `fds` is a valid, initialized pollfd slice for the call's duration;
+        // a fd of -1 is ignored by poll.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if rc < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             break;
         }
-        if let Err(e) = process_queue(
-            &mut queue,
-            &mem,
-            &interrupt,
-            &mut file,
-            read_only,
-            &mut limiter,
-        ) {
-            tracing::error!("block: queue processing failed: {e}");
+
+        if fds[0].revents & libc::POLLIN != 0 {
+            // A read error means the notify eventfd was closed -> shut down.
+            if evt.read().is_err() {
+                break;
+            }
+            drain(&mut queue, &mut file);
+        }
+
+        if fds[1].revents & libc::POLLIN != 0 {
+            if let Some(p) = pause.as_ref() {
+                let _ = p.evt.read();
+                // Final drain so next_avail reaches avail.idx, then capture the cursor
+                // and exit (the VM is frozen for the snapshot).
+                drain(&mut queue, &mut file);
+                if let Ok(mut slot) = p.slot.lock() {
+                    *slot = Some(vec![queue.state().into()]);
+                }
+            }
+            break;
         }
     }
 }
@@ -393,5 +443,35 @@ mod tests {
         let mem = guest_mem();
         let vq = MockSplitQueue::new(mem.as_ref(), 16);
         let _queue: Queue = vq.create_queue().unwrap();
+    }
+
+    #[test]
+    fn worker_captures_queue_cursor_on_pause() {
+        // On a snapshot pause signal, the worker captures its queue cursor into the
+        // slot and exits — the device half of the FR-14 pause/capture mechanism.
+        let mem = guest_mem();
+        let queue = MockSplitQueue::create(mem.as_ref(), GuestAddress(0), 16)
+            .create_queue::<Queue>()
+            .unwrap();
+        let notify = EventFd::new(0).unwrap();
+        let interrupt = Arc::new(Interrupt::new(EventFd::new(0).unwrap()));
+        let file = File::open("/dev/null").unwrap();
+        let pause_evt = EventFd::new(0).unwrap();
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let pause = crate::devices::DevicePause {
+            evt: pause_evt.try_clone().unwrap(),
+            slot: slot.clone(),
+        };
+
+        let worker = std::thread::spawn(move || {
+            block_worker(queue, notify, mem, interrupt, file, true, None, Some(pause));
+        });
+        // Ask the worker to pause + capture; it captures its cursor and returns.
+        pause_evt.write(1).unwrap();
+        worker.join().unwrap();
+
+        let cursors = slot.lock().unwrap().take().expect("cursor was captured");
+        assert_eq!(cursors.len(), 1, "block has one request queue");
+        assert_eq!(cursors[0].next_avail, 0, "a fresh queue's cursor is at 0");
     }
 }

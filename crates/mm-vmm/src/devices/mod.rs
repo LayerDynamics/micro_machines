@@ -87,6 +87,16 @@ const VIRTIO_MMIO_INT_VRING: u32 = 0x01;
 /// Default per-device virtqueue size.
 pub const QUEUE_SIZE: u16 = 256;
 
+/// A snapshot pause handle handed to a snapshottable virtio device (SPEC-1 FR-14).
+/// The Machine writes `evt` to ask the device's worker to quiesce; the worker drains
+/// to a consistent point, writes each virtqueue's [`QueueCursor`] into `slot` (in
+/// queue-index order), and exits. Capture happens while the guest's vCPUs are already
+/// paused, so the queues are stable.
+pub struct DevicePause {
+    pub evt: EventFd,
+    pub slot: Arc<Mutex<Option<Vec<crate::snapshot::state::QueueCursor>>>>,
+}
+
 /// The guest-visible interrupt line for a virtio device: an eventfd registered
 /// with KVM as an irqfd, plus the virtio interrupt-status register the guest
 /// reads/acks. Cloned (via `Arc`) into each device's worker so it can raise an
@@ -137,6 +147,11 @@ pub trait VirtioDevice: Send {
     fn read_config(&self, offset: u64, data: &mut [u8]);
     /// Write device-specific configuration space (default: read-only config).
     fn write_config(&mut self, _offset: u64, _data: &[u8]) {}
+    /// Install a snapshot pause handle (default: not snapshottable — a no-op). A
+    /// device that owns virtqueues overrides this to store the handle and wire it
+    /// into its worker at [`activate`](VirtioDevice::activate), so a snapshot can
+    /// quiesce it and capture its queue cursors.
+    fn set_pause_handle(&mut self, _pause: DevicePause) {}
     /// Take ownership of the configured queues + resources and start processing.
     fn activate(
         &mut self,

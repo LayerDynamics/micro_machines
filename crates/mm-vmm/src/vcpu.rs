@@ -8,7 +8,7 @@
 //! does none of this for us — the VMM is the firmware. The constants and segment
 //! layout below follow the standard PC/Linux boot conventions.
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{
     kvm_cpuid_entry2, kvm_fpu, kvm_msr_entry, kvm_regs, kvm_segment, kvm_sregs, CpuId, Msrs,
@@ -60,6 +60,9 @@ pub enum VcpuRunExit {
     Halted,
     /// KVM reported a triple fault / shutdown.
     Shutdown,
+    /// The vCPU was paused for a snapshot; its state was captured into the pause
+    /// slot before the thread returned.
+    Paused,
 }
 
 /// A single virtual CPU: its KVM fd plus its index (used as the local APIC id).
@@ -142,17 +145,25 @@ impl Vcpu {
         &mut self,
         dispatch: &Arc<dyn IoDispatch>,
         stop: &AtomicBool,
+        pause: &AtomicBool,
+        pause_out: &Mutex<Option<VcpuState>>,
     ) -> Result<VcpuRunExit> {
         loop {
             if stop.load(Ordering::Acquire) {
                 return Ok(VcpuRunExit::Halted);
             }
+            if pause.load(Ordering::Acquire) {
+                return self.do_pause(pause_out);
+            }
             let exit = match self.fd.run() {
                 Ok(exit) => exit,
-                // A stop signal interrupts KVM_RUN with EINTR; re-check `stop`.
+                // A stop/pause signal interrupts KVM_RUN with EINTR; re-check both.
                 Err(e) if e.errno() == libc::EINTR => {
                     if stop.load(Ordering::Acquire) {
                         return Ok(VcpuRunExit::Halted);
+                    }
+                    if pause.load(Ordering::Acquire) {
+                        return self.do_pause(pause_out);
                     }
                     continue;
                 }
@@ -203,6 +214,18 @@ impl Vcpu {
                 )));
             }
         }
+    }
+
+    /// Capture this vCPU's state into `pause_out` and report a paused exit. Called
+    /// once the pause flag is observed — always *outside* `KVM_RUN` (the run loop
+    /// checks the flag at the top and right after an `EINTR`), so the state-read
+    /// ioctls are safe.
+    fn do_pause(&self, pause_out: &Mutex<Option<VcpuState>>) -> Result<VcpuRunExit> {
+        let state = self.capture_state()?;
+        if let Ok(mut slot) = pause_out.lock() {
+            *slot = Some(state);
+        }
+        Ok(VcpuRunExit::Paused)
     }
 
     /// Capture this vCPU's full execution context for a snapshot (SPEC-1 FR-14).

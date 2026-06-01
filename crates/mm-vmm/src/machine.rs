@@ -11,7 +11,7 @@ use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kvm_bindings::{kvm_pit_config, kvm_userspace_memory_region, KVM_PIT_SPEAKER_DUMMY};
 use kvm_ioctls::{Kvm, VmFd};
@@ -20,9 +20,10 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::config::{ConfigError, VirtioDevice as ConfigDevice, VmConfig};
 use crate::devices::{
-    Balloon, Block, Bus, Interrupt, MmioTransport, Net, SerialDevice, VirtioDevice, Vsock,
-    VsockReady, COM1_IRQ,
+    Balloon, Block, Bus, DevicePause, Interrupt, MmioTransport, Net, SerialDevice, VirtioDevice,
+    Vsock, VsockReady, COM1_IRQ,
 };
+use crate::snapshot::state::{DeviceState, QueueCursor, VcpuState};
 use crate::vcpu::{Vcpu, VcpuRunExit};
 
 /// Start of the 32-bit MMIO hole on x86: guest RAM is split around it so device
@@ -121,9 +122,27 @@ pub struct Machine {
     vsock_listener: Option<UnixListener>,
     /// Set by `shutdown` to ask the vCPU threads to stop.
     vcpu_stop: Arc<AtomicBool>,
+    /// Set by `pause_and_capture_vcpus` to ask the vCPU threads to capture their
+    /// state and freeze (snapshot, SPEC-1 FR-14), distinct from the teardown stop.
+    vcpu_pause: Arc<AtomicBool>,
+    /// Per-vCPU capture slots, filled when the threads observe `vcpu_pause`, then
+    /// drained by `pause_and_capture_vcpus`. One per vCPU, in index order.
+    vcpu_states: Vec<Arc<Mutex<Option<VcpuState>>>>,
+    /// Snapshot capture handles for the snapshottable devices, in device-attach
+    /// order. Each lets `pause_devices` signal the device's worker and read back its
+    /// queue cursors (SPEC-1 FR-14).
+    device_captures: Vec<DeviceCapture>,
     /// pthread ids of the running vCPU threads, so `shutdown` can signal them out
     /// of a halted KVM_RUN.
     vcpu_tids: Arc<Mutex<Vec<libc::pthread_t>>>,
+}
+
+/// The Machine's half of a device snapshot handle: signal `evt` to ask the device's
+/// worker to quiesce and fill `slot` with its queue cursors.
+struct DeviceCapture {
+    device_type: u32,
+    evt: EventFd,
+    slot: Arc<Mutex<Option<Vec<QueueCursor>>>>,
 }
 
 /// The signal used to kick a vCPU thread out of `KVM_RUN` at teardown. A no-op
@@ -208,6 +227,9 @@ impl Machine {
             tap_fds,
             vsock_listener: None,
             vcpu_stop: Arc::new(AtomicBool::new(false)),
+            vcpu_pause: Arc::new(AtomicBool::new(false)),
+            vcpu_states: Vec::new(),
+            device_captures: Vec::new(),
             vcpu_tids: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -283,18 +305,21 @@ impl Machine {
         )));
         bus.set_serial(serial);
 
-        // Rootfs block device (always present).
+        // Rootfs block device (always present). Snapshottable: install a pause handle
+        // so its queue cursor can be captured (SPEC-1 FR-14).
         let block = Block::new(
             &self.config.rootfs.path,
             self.config.rootfs.read_only,
             self.config.rootfs.rate_limit.clone(),
         )?;
+        let mut block: Box<dyn VirtioDevice> = Box::new(block);
+        self.install_device_pause(&mut block)?;
         self.attach_virtio(
             &mut bus,
             &mut mmio_cmdline,
             &mut next_mmio,
             &mut next_gsi,
-            Box::new(block),
+            block,
         )?;
 
         // Boot vsock channel (always present): carries the guest "ready" signal, and
@@ -389,12 +414,16 @@ impl Machine {
             let dispatch = dispatch.clone();
             let hook = self.vcpu_hook.clone();
             let stop = self.vcpu_stop.clone();
+            let pause = self.vcpu_pause.clone();
             let tids = self.vcpu_tids.clone();
+            // Per-vCPU slot the thread fills if it is paused for a snapshot.
+            let pause_out = Arc::new(Mutex::new(None));
+            self.vcpu_states.push(pause_out.clone());
             let handle = std::thread::Builder::new()
                 .name(format!("mm-vcpu-{}", vcpu.index()))
                 .spawn(move || {
-                    // Register this thread so `shutdown` can signal it out of KVM_RUN.
-                    // SAFETY: `pthread_self` is always safe and returns this thread.
+                    // Register this thread so `shutdown`/`pause` can signal it out of
+                    // KVM_RUN. SAFETY: `pthread_self` is always safe.
                     let tid = unsafe { libc::pthread_self() };
                     if let Ok(mut guard) = tids.lock() {
                         guard.push(tid);
@@ -404,7 +433,7 @@ impl Machine {
                     if let Some(hook) = &hook {
                         hook(vcpu.index())?;
                     }
-                    vcpu.run(&dispatch, &stop)
+                    vcpu.run(&dispatch, &stop, &pause, &pause_out)
                 })
                 .map_err(VmmError::Io)?;
             self.vcpu_threads.push(handle);
@@ -525,6 +554,129 @@ impl Machine {
         kicker_done.store(true, Ordering::Release);
         let _ = kicker.join();
         Ok(())
+    }
+
+    /// Pause the vCPUs at a quiescent point and capture each one's state for a
+    /// snapshot (SPEC-1 FR-14). Sets the pause flag, kicks the threads out of any
+    /// blocking `KVM_RUN` (reusing the teardown signal), joins them, and returns the
+    /// captured [`VcpuState`]s in vCPU-index order. The VM is **frozen** afterwards
+    /// (the vCPU threads have exited); restore rebuilds a fresh `Machine`.
+    pub fn pause_and_capture_vcpus(&mut self) -> Result<Vec<VcpuState>> {
+        self.vcpu_pause.store(true, Ordering::Release);
+
+        let tids: Vec<libc::pthread_t> = self
+            .vcpu_tids
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+
+        // Same repeating kicker as `shutdown`: a no-op-handler signal interrupts a
+        // blocking KVM_RUN so the thread observes `vcpu_pause` and captures state.
+        let kicker_done = Arc::new(AtomicBool::new(false));
+        let kicker = {
+            let done = kicker_done.clone();
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Acquire) {
+                    for &tid in &tids {
+                        // SAFETY: VCPU_STOP_SIGNAL has a no-op handler; this only
+                        // interrupts a blocking KVM_RUN.
+                        unsafe {
+                            libc::pthread_kill(tid, VCPU_STOP_SIGNAL);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+        };
+
+        // A capture error (or panic) is fatal for a snapshot — surface it rather than
+        // silently producing a partial state file.
+        let mut join_err = None;
+        for handle in self.vcpu_threads.drain(..) {
+            match handle.join() {
+                Ok(Ok(_exit)) => {}
+                Ok(Err(e)) => join_err = Some(e),
+                Err(_) => {
+                    join_err = Some(VmmError::Vcpu("vcpu thread panicked during pause".into()))
+                }
+            }
+        }
+
+        kicker_done.store(true, Ordering::Release);
+        let _ = kicker.join();
+
+        if let Some(e) = join_err {
+            return Err(e);
+        }
+
+        // Drain the per-vCPU slots in index order.
+        let mut states = Vec::with_capacity(self.vcpu_states.len());
+        for (index, slot) in self.vcpu_states.iter().enumerate() {
+            let captured = slot
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take())
+                .ok_or_else(|| {
+                    VmmError::Vcpu(format!("vcpu {index} state was not captured during pause"))
+                })?;
+            states.push(captured);
+        }
+        Ok(states)
+    }
+
+    /// Create a snapshot pause handle, give one end to `device`, and record the other
+    /// for [`pause_devices`](Self::pause_devices). Call once per snapshottable device
+    /// before it is activated.
+    fn install_device_pause(&mut self, device: &mut Box<dyn VirtioDevice>) -> Result<()> {
+        let evt = EventFd::new(libc::EFD_NONBLOCK).map_err(VmmError::Io)?;
+        let slot = Arc::new(Mutex::new(None));
+        device.set_pause_handle(DevicePause {
+            evt: evt.try_clone().map_err(VmmError::Io)?,
+            slot: slot.clone(),
+        });
+        self.device_captures.push(DeviceCapture {
+            device_type: device.device_type(),
+            evt,
+            slot,
+        });
+        Ok(())
+    }
+
+    /// Quiesce the snapshottable devices and capture each one's queue cursors for a
+    /// snapshot (SPEC-1 FR-14), in device-attach order. Call **after**
+    /// [`pause_and_capture_vcpus`](Self::pause_and_capture_vcpus) — the guest is then
+    /// frozen, so each device's worker drains to a stable point before capturing.
+    pub fn pause_devices(&self) -> Result<Vec<DeviceState>> {
+        let mut out = Vec::with_capacity(self.device_captures.len());
+        for cap in &self.device_captures {
+            cap.evt.write(1).map_err(VmmError::Io)?;
+            let cursors = Self::wait_for_capture(&cap.slot, Duration::from_secs(2))?;
+            out.push(DeviceState {
+                device_type: cap.device_type,
+                queues: cursors,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Poll a device's capture slot until its worker fills it, or time out.
+    fn wait_for_capture(
+        slot: &Mutex<Option<Vec<QueueCursor>>>,
+        timeout: Duration,
+    ) -> Result<Vec<QueueCursor>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(cursors) = slot.lock().ok().and_then(|mut g| g.take()) {
+                return Ok(cursors);
+            }
+            if Instant::now() >= deadline {
+                return Err(VmmError::Device(
+                    "a device did not capture its queue cursors within the pause timeout"
+                        .to_string(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Build the guest physical memory map, splitting RAM around the 32-bit MMIO
