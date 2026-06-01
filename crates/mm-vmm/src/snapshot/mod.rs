@@ -9,3 +9,11 @@ pub mod manifest;
 
 pub use fork::{plan_fork, ForkError, ForkPlan};
 pub use manifest::{SnapshotKind, SnapshotManifest};
+
+/// Serializable vCPU + device state (the snapshot `state_file`). Linux-only: it
+/// embeds `kvm_bindings`. The (de)serialization is pure and unit-tested on any Linux
+/// host without KVM.
+#[cfg(target_os = "linux")]
+pub mod state;
+#[cfg(target_os = "linux")]
+pub use state::{DeviceState, MsrEntry, QueueCursor, StateError, VcpuState, VmState};
