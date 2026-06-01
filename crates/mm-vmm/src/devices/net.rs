@@ -39,16 +39,18 @@ pub struct Net {
     tap: Option<File>,
     mac: [u8; 6],
     queue_max_sizes: [u16; 2],
+    rate_limit: Option<crate::config::RateLimit>,
 }
 
 impl Net {
     /// Create a net device backed by the already-opened TAP `tap`, advertising
-    /// `mac` to the guest.
-    pub fn new(tap: File, mac: [u8; 6]) -> Self {
+    /// `mac` to the guest. `rate_limit` optionally caps tx throughput (SPEC-1 FR-28).
+    pub fn new(tap: File, mac: [u8; 6], rate_limit: Option<crate::config::RateLimit>) -> Self {
         Self {
             tap: Some(tap),
             mac,
             queue_max_sizes: [QUEUE_SIZE, QUEUE_SIZE],
+            rate_limit,
         }
     }
 }
@@ -107,6 +109,9 @@ impl VirtioDevice for Net {
             mem,
             interrupt,
             rx_backlog: VecDeque::new(),
+            limiter: crate::ratelimit::DeviceRateLimiter::from_config(
+                self.rate_limit.take().as_ref(),
+            ),
         };
 
         let mut manager = EventManager::<NetWorker>::new()
@@ -139,6 +144,8 @@ struct NetWorker {
     /// TAP while the guest had no RX buffers posted; drained FIFO when buffers
     /// become available.
     rx_backlog: VecDeque<Vec<u8>>,
+    /// Optional tx throughput limiter (SPEC-1 FR-28).
+    limiter: Option<crate::ratelimit::DeviceRateLimiter>,
 }
 
 impl NetWorker {
@@ -157,6 +164,13 @@ impl NetWorker {
                 frame.extend_from_slice(&buf);
             }
             if frame.len() > VIRTIO_NET_HDR_LEN {
+                // Rate limit (FR-28): one op + the Ethernet payload bytes. Throttling
+                // briefly blocks this worker; the tx descriptors are kept (never
+                // dropped) so no frames are lost.
+                if let Some(l) = self.limiter.as_mut() {
+                    let payload = (frame.len() - VIRTIO_NET_HDR_LEN) as u64;
+                    l.wait_admit(1, payload, std::time::Duration::from_millis(200));
+                }
                 // Best-effort send; a full TAP drops the frame (Ethernet semantics).
                 let _ = self.tap.write(&frame[VIRTIO_NET_HDR_LEN..]);
             }
@@ -320,7 +334,7 @@ mod tests {
         // directly on a constructed device using /dev/null as a stand-in fd.
         let f = File::open("/dev/null").unwrap();
         let mac = [0x02, 0x00, 0x00, 0x12, 0x34, 0x56];
-        let net = Net::new(f, mac);
+        let net = Net::new(f, mac, None);
         let mut cfg = [0u8; 6];
         net.read_config(0, &mut cfg);
         assert_eq!(cfg, mac);
@@ -346,6 +360,7 @@ mod tests {
             mem,
             interrupt,
             rx_backlog: VecDeque::new(),
+            limiter: None,
         }
     }
 

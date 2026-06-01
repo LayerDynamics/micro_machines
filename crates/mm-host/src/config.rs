@@ -58,8 +58,13 @@ pub fn build_vm_config(
         rootfs: BlockDevice {
             path: rootfs,
             read_only: true,
+            rate_limit: None,
         },
-        devices: vec![VirtioDevice::Net { tap_name, mac }],
+        devices: vec![VirtioDevice::Net {
+            tap_name,
+            mac,
+            rate_limit: None,
+        }],
     }
 }
 
@@ -116,7 +121,8 @@ mod tests {
             cfg.devices,
             vec![VirtioDevice::Net {
                 tap_name: "mm-web-1".to_string(),
-                mac: "02:00:00:0a:00:02".to_string()
+                mac: "02:00:00:0a:00:02".to_string(),
+                rate_limit: None,
             }]
         );
     }

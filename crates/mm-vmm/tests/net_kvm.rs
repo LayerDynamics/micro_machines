@@ -99,10 +99,12 @@ fn net_config() -> VmConfig {
         rootfs: BlockDevice {
             path: "tests/fixtures/rootfs.ext4".into(),
             read_only: true,
+            rate_limit: None,
         },
         devices: vec![VirtioDevice::Net {
             tap_name: TAP.into(),
             mac: GUEST_MAC.into(),
+            rate_limit: None,
         }],
     }
 }

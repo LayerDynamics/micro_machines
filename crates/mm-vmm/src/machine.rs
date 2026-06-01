@@ -266,7 +266,11 @@ impl Machine {
         bus.set_serial(serial);
 
         // Rootfs block device (always present).
-        let block = Block::new(&self.config.rootfs.path, self.config.rootfs.read_only)?;
+        let block = Block::new(
+            &self.config.rootfs.path,
+            self.config.rootfs.read_only,
+            self.config.rootfs.rate_limit.clone(),
+        )?;
         self.attach_virtio(
             &mut bus,
             &mut mmio_cmdline,
@@ -295,14 +299,18 @@ impl Machine {
         // that asks for it fails loudly rather than being silently dropped.
         for device in &self.config.devices {
             match device {
-                ConfigDevice::Net { tap_name, mac } => {
+                ConfigDevice::Net {
+                    tap_name,
+                    mac,
+                    rate_limit,
+                } => {
                     let tap = match tap_fds.next() {
                         // SAFETY: the parent passed us this open TAP fd via fd
                         // inheritance; we take exclusive ownership of it here.
                         Some(fd) => unsafe { std::fs::File::from_raw_fd(fd) },
                         None => open_tap(tap_name)?,
                     };
-                    let net = Net::new(tap, parse_mac(mac)?);
+                    let net = Net::new(tap, parse_mac(mac)?, rate_limit.clone());
                     self.attach_virtio(
                         &mut bus,
                         &mut mmio_cmdline,

@@ -40,12 +40,18 @@ pub struct Block {
     read_only: bool,
     file: Option<File>,
     queue_max_sizes: [u16; 1],
+    rate_limit: Option<crate::config::RateLimit>,
 }
 
 impl Block {
     /// Open `path` as the backing image. `read_only` opens it read-only and
     /// advertises `VIRTIO_BLK_F_RO` so the guest mounts it accordingly.
-    pub fn new(path: &Path, read_only: bool) -> Result<Self> {
+    /// `rate_limit` optionally caps throughput (SPEC-1 FR-28).
+    pub fn new(
+        path: &Path,
+        read_only: bool,
+        rate_limit: Option<crate::config::RateLimit>,
+    ) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(!read_only)
@@ -57,6 +63,7 @@ impl Block {
             read_only,
             file: Some(file),
             queue_max_sizes: [QUEUE_SIZE],
+            rate_limit,
         })
     }
 }
@@ -105,18 +112,20 @@ impl VirtioDevice for Block {
             .take()
             .ok_or_else(|| VmmError::Device("block: already activated".to_string()))?;
         let read_only = self.read_only;
+        let rate_limit = self.rate_limit.take();
 
         // The worker is detached: it lives as long as its notify eventfd (owned by
         // the transport) stays open, and exits cleanly when the VM tears down.
         std::thread::Builder::new()
             .name("mm-blk".to_string())
-            .spawn(move || block_worker(queue, evt, mem, interrupt, file, read_only))
+            .spawn(move || block_worker(queue, evt, mem, interrupt, file, read_only, rate_limit))
             .map_err(VmmError::Io)?;
         Ok(())
     }
 }
 
 /// Block worker loop: wait for a queue notify, then drain all pending requests.
+#[allow(clippy::too_many_arguments)]
 fn block_worker(
     mut queue: Queue,
     evt: EventFd,
@@ -124,13 +133,22 @@ fn block_worker(
     interrupt: Arc<Interrupt>,
     mut file: File,
     read_only: bool,
+    rate_limit: Option<crate::config::RateLimit>,
 ) {
+    let mut limiter = crate::ratelimit::DeviceRateLimiter::from_config(rate_limit.as_ref());
     loop {
         // Blocking read; an error means the eventfd was closed -> shut down.
         if evt.read().is_err() {
             break;
         }
-        if let Err(e) = process_queue(&mut queue, &mem, &interrupt, &mut file, read_only) {
+        if let Err(e) = process_queue(
+            &mut queue,
+            &mem,
+            &interrupt,
+            &mut file,
+            read_only,
+            &mut limiter,
+        ) {
             tracing::error!("block: queue processing failed: {e}");
         }
     }
@@ -143,6 +161,7 @@ fn process_queue(
     interrupt: &Interrupt,
     file: &mut File,
     read_only: bool,
+    limiter: &mut Option<crate::ratelimit::DeviceRateLimiter>,
 ) -> Result<()> {
     let mut signalled = false;
     while let Some(chain) = queue.pop_descriptor_chain(mem.clone()) {
@@ -150,6 +169,17 @@ fn process_queue(
         let descs: Vec<(GuestAddress, u32, bool)> = chain
             .map(|d| (d.addr(), d.len(), d.is_write_only()))
             .collect();
+        // Rate limit (FR-28): one op + the data-descriptor bytes (the header +
+        // status descriptors are control, not data). Blocks briefly when throttled.
+        if let Some(l) = limiter.as_mut() {
+            let data_bytes: u64 = descs
+                .get(1..descs.len().saturating_sub(1))
+                .unwrap_or(&[])
+                .iter()
+                .map(|(_, len, _)| u64::from(*len))
+                .sum();
+            l.wait_admit(1, data_bytes, std::time::Duration::from_millis(200));
+        }
         let used_len = service_request(mem, file, read_only, &descs)?;
         queue
             .add_used(mem.as_ref(), head, used_len)
@@ -277,7 +307,7 @@ mod tests {
             let mut f = File::create(&tmp).unwrap();
             f.write_all(&vec![0u8; 4096]).unwrap(); // 8 sectors
         }
-        let blk = Block::new(&tmp, true).unwrap();
+        let blk = Block::new(&tmp, true, None).unwrap();
         assert_eq!(blk.capacity_sectors, 8);
         let mut cfg = [0u8; 8];
         blk.read_config(0, &mut cfg);

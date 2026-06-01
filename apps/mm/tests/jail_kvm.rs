@@ -116,6 +116,7 @@ fn run_jailed_boot(tag: &str, user_namespace: bool) {
         rootfs: BlockDevice {
             path: "/rootfs.ext4".into(),
             read_only: true,
+            rate_limit: None,
         },
         devices: vec![],
     };

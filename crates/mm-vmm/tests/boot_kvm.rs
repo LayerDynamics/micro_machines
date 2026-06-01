@@ -28,6 +28,7 @@ fn fixture_config() -> VmConfig {
         rootfs: BlockDevice {
             path: "tests/fixtures/rootfs.ext4".into(),
             read_only: true,
+            rate_limit: None,
         },
         devices: vec![],
     }

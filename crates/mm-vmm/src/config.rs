@@ -38,6 +38,21 @@ pub struct VmConfig {
 pub struct BlockDevice {
     pub path: PathBuf,
     pub read_only: bool,
+    /// Optional token-bucket throughput limit (SPEC-1 FR-28); `None` = unlimited.
+    #[serde(default)]
+    pub rate_limit: Option<RateLimit>,
+}
+
+/// Token-bucket throughput limits for a virtio device (SPEC-1 FR-28): a bucket for
+/// operations (one per request) and a bucket for bytes. A device is throttled when
+/// either bucket is dry, until time refills it. Zero capacity in a bucket disables
+/// that dimension's limit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimit {
+    pub ops_capacity: u64,
+    pub ops_refill_per_ms: u64,
+    pub bytes_capacity: u64,
+    pub bytes_refill_per_ms: u64,
 }
 
 /// The virtio device set M1 supports (SPEC-1 FR-3). Serialized with an internal
@@ -46,7 +61,13 @@ pub struct BlockDevice {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VirtioDevice {
     /// Networking via a host TAP device (FR-3, FR-10).
-    Net { tap_name: String, mac: String },
+    Net {
+        tap_name: String,
+        mac: String,
+        /// Optional token-bucket throughput limit (FR-28); `None` = unlimited.
+        #[serde(default)]
+        rate_limit: Option<RateLimit>,
+    },
     /// Host<->guest control/exec channel (FR-3; used by Sandbox Mode in M3).
     Vsock { cid: u32 },
     /// Memory reclamation (FR-3).
@@ -87,6 +108,7 @@ mod tests {
             rootfs: BlockDevice {
                 path: "/r/root.img".into(),
                 read_only: true,
+                rate_limit: None,
             },
             devices: vec![],
         }
