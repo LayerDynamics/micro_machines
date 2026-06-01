@@ -63,7 +63,7 @@ pub fn build_vm_config(
     // a microVM never needs (NFR-P1). The rootfs is read-only; mm-init turns it into
     // a writable overlay root at boot.
     let mut kernel_cmdline = format!(
-        "console=ttyS0 root=/dev/vda ro init=/init reboot=k panic=1 {} {ip_param} {mode}",
+        "console=ttyS0 root=/dev/vda ro init=/init reboot=t panic=1 {} {ip_param} {mode}",
         mm_vmm::FAST_BOOT_ARGS,
     );
     if let Some(hex) = authorized_key_hex {

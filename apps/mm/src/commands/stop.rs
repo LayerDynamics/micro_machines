@@ -19,9 +19,9 @@ pub fn run(args: StopArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Signal the owning `mm run` foreground process to power the guest off; the
-    // guest's panic=1/reboot=k then halts the vCPUs and that process records the
-    // stopped state. If the process is gone, fall through to marking it stopped.
+    // SIGTERM the owning `mm __vmm-worker`; the worker is serving the guest
+    // (wait_for_vcpus) so killing it tears the VM down and releases its TAP. If the
+    // process is gone, fall through to marking it stopped.
     if let Some(pid) = record.pid {
         signal_terminate(pid);
     }

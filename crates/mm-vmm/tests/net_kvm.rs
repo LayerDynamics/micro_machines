@@ -92,7 +92,7 @@ fn net_config() -> VmConfig {
         // net.ifnames=0 forces the legacy `eth0` name the `ip=` param targets,
         // rather than a predictable name (enp0s…) that would leave eth0 unconfigured.
         kernel_cmdline: format!(
-            "{GUEST_CONSOLE} root=/dev/vda ro init=/init reboot=k panic=1 \
+            "{GUEST_CONSOLE} root=/dev/vda ro init=/init reboot=t panic=1 \
              {} net.ifnames=0 {ip_param} mm.workload=/sbin/ready",
             mm_vmm::FAST_BOOT_ARGS,
         ),

@@ -435,8 +435,8 @@ impl Machine {
     }
 
     /// Serve the guest until it powers itself off: join the vCPU threads, each of
-    /// which exits its run loop when KVM reports a shutdown (the guest's
-    /// `reboot`/`poweroff` with `reboot=k`). Unlike [`shutdown`], this does **not**
+    /// which exits its run loop when KVM reports a shutdown (the guest resets via a
+    /// triple fault — `reboot=t`). Unlike [`shutdown`], this does **not**
     /// force the vCPUs to stop — it is how a long-running guest (a real workload or
     /// an SSH-reachable sandbox) is run for its full lifetime. The VM is torn down
     /// abruptly only if the worker process is killed (e.g. `mm stop`).

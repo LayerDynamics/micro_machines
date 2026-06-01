@@ -161,16 +161,19 @@ fn install_panic_hook() {
     }));
 }
 
-/// Flush filesystem buffers and power the machine off. Diverges: on the rare
-/// chance `reboot(2)` returns, we spin rather than fall through to undefined
-/// PID-1 behavior.
+/// Flush filesystem buffers and terminate the machine. We `reboot` rather than
+/// power off: with `reboot=t` on the cmdline the kernel resets via a triple fault,
+/// which KVM reports to the VMM as a shutdown exit so the worker stops serving the
+/// guest. A plain power-off instead halts the CPU, and the in-kernel irqchip makes
+/// that block inside `KVM_RUN` forever (the VMM never learns the guest is done).
+/// Diverges: on the rare chance `reboot(2)` returns, we spin.
 fn poweroff() -> ! {
     // SAFETY: `sync(2)` takes no arguments and cannot fail; it only schedules a
-    // best-effort writeback of the ephemeral overlay before we cut power.
+    // best-effort writeback of the ephemeral overlay before we reset.
     unsafe {
         libc::sync();
     }
-    let _ = reboot(RebootMode::RB_POWER_OFF);
+    let _ = reboot(RebootMode::RB_AUTOBOOT);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }

@@ -142,7 +142,10 @@ fn main() {
             libc::close(fd);
         }
         libc::sync();
-        libc::reboot(libc::RB_POWER_OFF);
+        // Reboot (not power off): with reboot=t the kernel resets via a triple
+        // fault, which KVM reports to the VMM as a shutdown exit so the worker's
+        // vCPU thread returns. A power-off would halt the CPU and block KVM_RUN.
+        libc::reboot(libc::RB_AUTOBOOT);
     }
 }
 EOF
