@@ -186,6 +186,23 @@ impl Store {
         Ok(res.rows_affected())
     }
 
+    /// Increment a machine's retry counter (used when the reconciler re-issues a
+    /// boot after a failure, so the retry budget is finite). Returns rows changed.
+    pub async fn increment_retry_count(&self, uid: Uuid) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE machines
+             SET status = jsonb_set(
+                     status, '{retry_count}',
+                     to_jsonb(COALESCE((status->>'retry_count')::int, 0) + 1)),
+                 updated_at = now()
+             WHERE uid = $1",
+        )
+        .bind(uid)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Set both the observed state and the guest IP (the agent learns the IP when it
     /// boots the machine, so it reports both together). Returns rows changed.
     pub async fn set_observed(&self, uid: Uuid, state: &str, ip: &str) -> Result<u64, sqlx::Error> {

@@ -46,7 +46,13 @@ pub async fn reconcile_once(store: &Store, registry: &AgentRegistry) -> Result<(
             host_assigned: m.host_id.is_some(),
             retry_count: m.status.retry_count,
         };
-        match reconcile::decide(m.spec.running, false, &obs, MAX_RETRIES) {
+        let action = reconcile::decide(m.spec.running, false, &obs, MAX_RETRIES);
+        // A retry counts against the budget, so a persistently-failing machine
+        // eventually rests (decide → None) instead of being re-assigned forever.
+        if action == Action::Retry {
+            store.increment_retry_count(m.uid).await?;
+        }
+        match action {
             Action::AssignAndStart | Action::Retry => {
                 // Keep an existing placement; otherwise schedule onto a host with room.
                 let host = match &m.host_id {
