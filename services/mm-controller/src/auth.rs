@@ -12,8 +12,9 @@
 //! At least one source must be configured. The verifier is pure (no IO); discovery
 //! happens once at startup, so verification stays fast and deterministic.
 use anyhow::Context;
+use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::jwk::JwkSet;
-use jsonwebtoken::{decode, decode_header, errors::ErrorKind, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 
 use crate::authz::Claims;
 
@@ -140,8 +141,9 @@ pub async fn fetch_oidc_jwks(issuer: &str) -> anyhow::Result<JwkSet> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use jsonwebtoken::{encode, EncodingKey, Header};
+
+    use super::*;
 
     const ISSUER: &str = "https://issuer.test";
 

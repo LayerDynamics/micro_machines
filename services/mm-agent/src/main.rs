@@ -16,14 +16,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use tonic::transport::Channel;
-
 use mm_agent::actuator::{self, BootRequest, HostConfig};
 use mm_agent::capacity::{self, HostResources, Reservation};
 use mm_agent::local_store::LocalStore;
 use mm_proto::host_service_client::HostServiceClient;
 use mm_proto::machine_service_client::MachineServiceClient;
 use mm_proto::{Assignment, Capacity, HostRef, MachineEvent, State};
+use tonic::transport::Channel;
 
 #[derive(Parser)]
 #[command(name = "mm-agent", about = "MicroMachines host agent")]

@@ -330,12 +330,14 @@ impl Machine {
             None => Vsock::new(DEFAULT_GUEST_CID)?,
         };
         self.ready = Some(vsock.ready_signal());
+        let mut vsock: Box<dyn VirtioDevice> = Box::new(vsock);
+        self.install_device_pause(&mut vsock)?;
         self.attach_virtio(
             &mut bus,
             &mut mmio_cmdline,
             &mut next_mmio,
             &mut next_gsi,
-            Box::new(vsock),
+            vsock,
         )?;
 
         // Pre-opened TAP fds (jailed boot) are consumed in net-device order; an
@@ -612,13 +614,9 @@ impl Machine {
         // Drain the per-vCPU slots in index order.
         let mut states = Vec::with_capacity(self.vcpu_states.len());
         for (index, slot) in self.vcpu_states.iter().enumerate() {
-            let captured = slot
-                .lock()
-                .ok()
-                .and_then(|mut g| g.take())
-                .ok_or_else(|| {
-                    VmmError::Vcpu(format!("vcpu {index} state was not captured during pause"))
-                })?;
+            let captured = slot.lock().ok().and_then(|mut g| g.take()).ok_or_else(|| {
+                VmmError::Vcpu(format!("vcpu {index} state was not captured during pause"))
+            })?;
             states.push(captured);
         }
         Ok(states)

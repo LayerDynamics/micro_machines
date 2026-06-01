@@ -12,9 +12,8 @@
 //!
 //! Both are IO-free, so the policy is exhaustively unit-testable and lives in one
 //! place rather than smeared across handlers.
-use serde::{Deserialize, Serialize};
-
 use mm_api_types::Error;
+use serde::{Deserialize, Serialize};
 
 /// A role a subject can hold in a namespace, ordered by privilege so a simple
 /// `>=` comparison answers "is this role at least as powerful as required".

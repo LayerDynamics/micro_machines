@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
+use axum::http::header::AUTHORIZATION;
+use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};

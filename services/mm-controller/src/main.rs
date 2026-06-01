@@ -12,9 +12,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use sqlx::postgres::PgPoolOptions;
-use tonic::transport::Server;
-
 use mm_controller::api::{self, AppState};
 use mm_controller::auth::JwtVerifier;
 use mm_controller::grpc::{AgentRegistry, HostSvc, MachineSvc};
@@ -22,6 +19,8 @@ use mm_controller::store::Store;
 use mm_controller::tls;
 use mm_proto::host_service_server::HostServiceServer;
 use mm_proto::machine_service_server::MachineServiceServer;
+use sqlx::postgres::PgPoolOptions;
+use tonic::transport::Server;
 
 #[derive(Debug, Parser)]
 #[command(name = "mm-controller", about = "MicroMachines control plane")]

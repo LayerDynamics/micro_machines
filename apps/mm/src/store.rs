@@ -94,8 +94,9 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use time::OffsetDateTime;
+
+    use super::*;
 
     fn temp_db_path() -> std::path::PathBuf {
         let mut p = std::env::temp_dir();

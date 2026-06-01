@@ -135,8 +135,9 @@ pub fn run_exec<S: Read + Write>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Cursor;
+
+    use super::*;
 
     /// A mock guest agent: it captures what the host writes, and on read serves a
     /// canned sequence of response frames (as if the guest ran the command).

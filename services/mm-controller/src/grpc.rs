@@ -11,14 +11,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use mm_proto::host_service_server::HostService;
+use mm_proto::machine_service_server::MachineService;
+use mm_proto::{Ack, Assignment, Capacity, HostRef, Machine, MachineEvent, MachineRef};
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
-
-use mm_proto::host_service_server::HostService;
-use mm_proto::machine_service_server::MachineService;
-use mm_proto::{Ack, Assignment, Capacity, HostRef, Machine, MachineEvent, MachineRef};
 
 use crate::convert::{machine_to_proto, proto_state_name};
 use crate::store::Store;

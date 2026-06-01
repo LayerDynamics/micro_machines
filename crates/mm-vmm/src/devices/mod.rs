@@ -22,18 +22,17 @@ mod net;
 mod serial;
 mod vsock;
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+
 pub use balloon::Balloon;
 pub use block::Block;
 pub use net::Net;
 pub use serial::{EventFdTrigger, SerialDevice, COM1_BASE_PORT, COM1_IRQ};
-pub use vsock::{Vsock, VsockReady};
-
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-
 use virtio_queue::{Queue, QueueT};
 use vm_memory::GuestMemoryMmap;
 use vmm_sys_util::eventfd::EventFd;
+pub use vsock::{Vsock, VsockReady};
 
 use crate::machine::{IoDispatch, Result, VmmError};
 

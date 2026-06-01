@@ -16,14 +16,13 @@ use axum::http::{header, Method, Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use serde_json::{json, Value};
-use sqlx::postgres::PgPoolOptions;
-use tower::ServiceExt;
-
 use mm_controller::api::{router, AppState};
 use mm_controller::auth::JwtVerifier;
 use mm_controller::authz::Claims;
 use mm_controller::store::Store;
+use serde_json::{json, Value};
+use sqlx::postgres::PgPoolOptions;
+use tower::ServiceExt;
 
 const SECRET: &[u8] = b"integration-test-secret";
 

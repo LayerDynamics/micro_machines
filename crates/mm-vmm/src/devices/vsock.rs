@@ -28,7 +28,7 @@ use virtio_queue::{Queue, QueueT};
 use vm_memory::{Bytes, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
-use super::{Interrupt, VirtioDevice, QUEUE_SIZE, TYPE_VSOCK, VIRTIO_F_VERSION_1};
+use super::{DevicePause, Interrupt, VirtioDevice, QUEUE_SIZE, TYPE_VSOCK, VIRTIO_F_VERSION_1};
 use crate::machine::{Result, VmmError};
 use crate::vsock_proto::{
     CreditTracker, VsockHeader, HOST_CID, OP_CREDIT_REQUEST, OP_CREDIT_UPDATE, OP_REQUEST,
@@ -95,6 +95,9 @@ pub struct Vsock {
     ready: Arc<VsockReady>,
     listener: Option<UnixListener>,
     queue_max_sizes: [u16; 3],
+    /// Snapshot pause handle (SPEC-1 FR-14); the worker captures its rx/tx queue
+    /// cursors here when signalled.
+    pause: Option<DevicePause>,
 }
 
 impl Vsock {
@@ -106,6 +109,7 @@ impl Vsock {
             listener: None,
             // rx, tx, event queues.
             queue_max_sizes: [QUEUE_SIZE, QUEUE_SIZE, QUEUE_SIZE],
+            pause: None,
         })
     }
 
@@ -147,6 +151,10 @@ impl VirtioDevice for Vsock {
         }
     }
 
+    fn set_pause_handle(&mut self, pause: DevicePause) {
+        self.pause = Some(pause);
+    }
+
     fn activate(
         &mut self,
         mem: Arc<GuestMemoryMmap>,
@@ -182,6 +190,7 @@ impl VirtioDevice for Vsock {
             interrupt,
             ready: self.ready.clone(),
             listener: self.listener.take(),
+            pause: self.pause.take(),
             pending: Vec::new(),
             conns: HashMap::new(),
             next_port: FIRST_HOST_PORT,
@@ -283,6 +292,8 @@ enum Source {
     Listener,
     Pending(usize),
     Conn(u32),
+    /// Snapshot pause requested: capture rx/tx cursors and exit.
+    PauseEvt,
 }
 
 /// The single-threaded reactor owning the vsock device's queues and connections.
@@ -296,6 +307,8 @@ struct VsockWorker {
     interrupt: Arc<Interrupt>,
     ready: Arc<VsockReady>,
     listener: Option<UnixListener>,
+    /// Snapshot pause handle; on signal the reactor captures rx/tx cursors + exits.
+    pause: Option<DevicePause>,
     pending: Vec<Pending>,
     conns: HashMap<u32, Conn>,
     next_port: u32,
@@ -323,6 +336,9 @@ impl VsockWorker {
             push(self.tx_evt.as_raw_fd(), libc::POLLIN, Source::TxEvt);
             if let Some(l) = self.listener.as_ref() {
                 push(l.as_raw_fd(), libc::POLLIN, Source::Listener);
+            }
+            if let Some(p) = self.pause.as_ref() {
+                push(p.evt.as_raw_fd(), libc::POLLIN, Source::PauseEvt);
             }
             for (i, p) in self.pending.iter().enumerate() {
                 push(p.uds.as_raw_fd(), libc::POLLIN, Source::Pending(i));
@@ -414,6 +430,20 @@ impl VsockWorker {
                                 dirty = true;
                             }
                         }
+                    }
+                    Source::PauseEvt => {
+                        // Snapshot: capture the rx/tx queue cursors and exit (the VM
+                        // is already frozen, so the queues are stable).
+                        if let Some(p) = self.pause.as_ref() {
+                            let _ = p.evt.read();
+                            let cursors =
+                                vec![self.rx_queue.state().into(), self.tx_queue.state().into()];
+                            if let Ok(mut slot) = p.slot.lock() {
+                                *slot = Some(cursors);
+                            }
+                        }
+                        stop = true;
+                        break;
                     }
                 }
             }
@@ -846,7 +876,8 @@ impl VsockWorker {
 
 #[cfg(test)]
 mod tests {
-    use virtio_queue::desc::{split::Descriptor as SplitDescriptor, RawDescriptor};
+    use virtio_queue::desc::split::Descriptor as SplitDescriptor;
+    use virtio_queue::desc::RawDescriptor;
     use virtio_queue::mock::MockSplitQueue;
     use vm_memory::GuestAddress;
 
@@ -928,6 +959,7 @@ mod tests {
             interrupt,
             ready: Arc::new(VsockReady::new().unwrap()),
             listener: None,
+            pause: None,
             pending: Vec::new(),
             conns: HashMap::new(),
             next_port: FIRST_HOST_PORT,

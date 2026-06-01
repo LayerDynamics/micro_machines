@@ -129,7 +129,9 @@ impl VirtioDevice for Block {
         std::thread::Builder::new()
             .name("mm-blk".to_string())
             .spawn(move || {
-                block_worker(queue, evt, mem, interrupt, file, read_only, rate_limit, pause)
+                block_worker(
+                    queue, evt, mem, interrupt, file, read_only, rate_limit, pause,
+                )
             })
             .map_err(VmmError::Io)?;
         Ok(())
@@ -340,10 +342,12 @@ fn write_request(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
     use virtio_queue::mock::MockSplitQueue;
     use vm_memory::GuestAddress;
+
+    use super::*;
 
     fn guest_mem() -> Arc<GuestMemoryMmap> {
         Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x100_0000)]).unwrap())

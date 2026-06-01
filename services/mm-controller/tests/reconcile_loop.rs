@@ -13,10 +13,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::postgres::PgPoolOptions;
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::{Channel, Server};
-
 use mm_agent::tls::client_config;
 use mm_api_types::State;
 use mm_controller::grpc::{AgentRegistry, HostSvc, MachineSvc};
@@ -28,6 +24,9 @@ use mm_proto::host_service_server::HostServiceServer;
 use mm_proto::machine_service_client::MachineServiceClient;
 use mm_proto::machine_service_server::MachineServiceServer;
 use mm_proto::{Capacity, HostRef, MachineEvent};
+use sqlx::postgres::PgPoolOptions;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::{Channel, Server};
 
 #[tokio::test]
 async fn reconcile_schedules_boots_and_survives_restart() {
