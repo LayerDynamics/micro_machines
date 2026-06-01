@@ -3,9 +3,16 @@ on:
   push: { branches: [main] }
   pull_request: {}
 
+# Cancel an in-flight run for the same ref when a new commit lands, so superseded
+# (and any stuck) runs don't keep occupying runners.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -17,6 +24,7 @@ jobs:
 
   node:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -35,6 +43,7 @@ jobs:
   # job below applies that fix and runs the real boot test.
   kvm-preflight:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
       - name: Probe KVM capability
@@ -69,6 +78,7 @@ jobs:
   # no self-hosted runner required.
   kvm-integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -101,6 +111,7 @@ jobs:
   # the TAP via TUNSETIFF), so the test binary runs under sudo.
   net-integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 18
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -135,6 +146,7 @@ jobs:
   # setup, so the test binary runs under sudo.
   jail-integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 18
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -178,6 +190,7 @@ jobs:
   # signals readiness. This is the product's headline path, exercised whole.
   mm-run-integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -222,6 +235,7 @@ jobs:
   # ssh` CLI (managed-key auth, reachable over the bridge, zero per-image setup).
   ssh-integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -262,6 +276,7 @@ jobs:
   # builds and is statically linked, so it runs in any guest userland.
   ssh-build-probe:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Install musl toolchain
@@ -281,6 +296,7 @@ jobs:
   # diagnostic — never fails the build.
   net-jail-preflight:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
       - name: Probe sudo + bridge/TAP + namespaces
         run: |
