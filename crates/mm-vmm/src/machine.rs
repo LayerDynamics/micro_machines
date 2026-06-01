@@ -918,6 +918,10 @@ impl Machine {
         for (gpa, size) in ranges {
             let fo = FileOffset::new(file.try_clone().map_err(VmmError::Io)?, file_offset);
             let region = MmapRegionBuilder::new(size)
+                // PROT_READ|PROT_WRITE is required: the builder defaults to PROT_NONE,
+                // and KVM (and the host) must be able to read/write guest RAM — without
+                // it KVM_RUN faults with EFAULT and host accesses SIGSEGV.
+                .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
                 .with_mmap_flags(libc::MAP_NORESERVE | libc::MAP_PRIVATE)
                 .with_file_offset(fo)
                 .build()
