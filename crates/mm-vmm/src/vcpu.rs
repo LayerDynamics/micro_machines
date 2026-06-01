@@ -18,6 +18,7 @@ use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
 use crate::machine::{IoDispatch, Result, VmmError};
+use crate::snapshot::state::{MsrEntry, VcpuState};
 
 // --- Guest-physical layout for boot structures (low memory, below the kernel). ---
 const BOOT_GDT_OFFSET: u64 = 0x500;
@@ -203,6 +204,141 @@ impl Vcpu {
             }
         }
     }
+
+    /// Capture this vCPU's full execution context for a snapshot (SPEC-1 FR-14).
+    /// Must be called with the vCPU quiesced (not inside `KVM_RUN`). CPUID is not
+    /// captured — it is rebuilt deterministically from the host + index at restore.
+    pub fn capture_state(&self) -> Result<VcpuState> {
+        let regs = self.fd.get_regs().map_err(VmmError::Kvm)?;
+        let sregs = self.fd.get_sregs().map_err(VmmError::Kvm)?;
+        let fpu = fpu_to_bytes(&self.fd.get_fpu().map_err(VmmError::Kvm)?);
+        let lapic = self.fd.get_lapic().map_err(VmmError::Kvm)?;
+        let mp_state = self.fd.get_mp_state().map_err(VmmError::Kvm)?;
+
+        // Query the curated MSR set: build a `Msrs` holding the indices, let KVM fill
+        // in the data, then read it back as plain pairs.
+        let entries: Vec<kvm_msr_entry> = SNAPSHOT_MSRS
+            .iter()
+            .map(|&index| kvm_msr_entry {
+                index,
+                ..Default::default()
+            })
+            .collect();
+        let mut msrs = Msrs::from_entries(&entries)
+            .map_err(|e| VmmError::Vcpu(format!("building snapshot MSRs: {e:?}")))?;
+        let read = self.fd.get_msrs(&mut msrs).map_err(VmmError::Kvm)?;
+        let msrs = msrs.as_slice()[..read]
+            .iter()
+            .map(|e| MsrEntry {
+                index: e.index,
+                data: e.data,
+            })
+            .collect();
+
+        Ok(VcpuState {
+            regs,
+            sregs,
+            fpu,
+            lapic,
+            mp_state,
+            msrs,
+        })
+    }
+
+    /// Restore a captured [`VcpuState`] onto this (freshly created, not yet run)
+    /// vCPU, the inverse of [`capture_state`](Self::capture_state).
+    pub fn restore_state(&self, state: &VcpuState) -> Result<()> {
+        self.fd.set_sregs(&state.sregs).map_err(VmmError::Kvm)?;
+        self.fd
+            .set_fpu(&fpu_from_bytes(&state.fpu)?)
+            .map_err(VmmError::Kvm)?;
+        self.fd.set_lapic(&state.lapic).map_err(VmmError::Kvm)?;
+        self.fd
+            .set_mp_state(state.mp_state)
+            .map_err(VmmError::Kvm)?;
+
+        let entries: Vec<kvm_msr_entry> = state
+            .msrs
+            .iter()
+            .map(|m| kvm_msr_entry {
+                index: m.index,
+                data: m.data,
+                ..Default::default()
+            })
+            .collect();
+        let msrs = Msrs::from_entries(&entries)
+            .map_err(|e| VmmError::Vcpu(format!("building restore MSRs: {e:?}")))?;
+        let written = self.fd.set_msrs(&msrs).map_err(VmmError::Kvm)?;
+        if written != entries.len() {
+            return Err(VmmError::Vcpu(format!(
+                "set_msrs wrote {written}/{} entries on restore",
+                entries.len()
+            )));
+        }
+
+        // Set general-purpose registers last so RIP/RSP are not perturbed by the
+        // other ioctls.
+        self.fd.set_regs(&state.regs).map_err(VmmError::Kvm)?;
+        Ok(())
+    }
+}
+
+/// MSRs captured/restored across a snapshot: the SYSENTER/SYSCALL targets, the TSC,
+/// MISC_ENABLE, and the kvm-clock paravirt-clock MSRs the guest relies on (the guest
+/// is configured to use kvm-clock in `build_cpuid`). EFER and the FS/GS bases live in
+/// `sregs`, so they are not duplicated here.
+const SNAPSHOT_MSRS: &[u32] = &[
+    MSR_IA32_SYSENTER_CS,
+    MSR_IA32_SYSENTER_ESP,
+    MSR_IA32_SYSENTER_EIP,
+    MSR_STAR,
+    MSR_LSTAR,
+    MSR_CSTAR,
+    MSR_SYSCALL_MASK,
+    MSR_KERNEL_GS_BASE,
+    MSR_IA32_TSC,
+    MSR_IA32_MISC_ENABLE,
+    MSR_KVM_WALL_CLOCK_NEW,
+    MSR_KVM_SYSTEM_TIME_NEW,
+];
+
+/// kvm-clock paravirt-clock MSRs (the guest programs these to find its clock pages).
+const MSR_KVM_WALL_CLOCK_NEW: u32 = 0x4b56_4d00;
+const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
+
+/// Serialize a `kvm_fpu` to its raw bytes for the snapshot state file.
+fn fpu_to_bytes(fpu: &kvm_fpu) -> Vec<u8> {
+    // SAFETY: `kvm_fpu` is a fixed-size `repr(C)` POD; reading `size_of` bytes of it
+    // is sound and yields an exact, restorable copy.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (fpu as *const kvm_fpu).cast::<u8>(),
+            std::mem::size_of::<kvm_fpu>(),
+        )
+    };
+    bytes.to_vec()
+}
+
+/// Rebuild a `kvm_fpu` from snapshot bytes, validating the length.
+fn fpu_from_bytes(bytes: &[u8]) -> Result<kvm_fpu> {
+    let want = std::mem::size_of::<kvm_fpu>();
+    if bytes.len() != want {
+        return Err(VmmError::Vcpu(format!(
+            "snapshot FPU state is {} bytes, expected {want}",
+            bytes.len()
+        )));
+    }
+    let mut fpu = kvm_fpu::default();
+    // SAFETY: `kvm_fpu` is POD; we copy exactly `size_of::<kvm_fpu>()` bytes into a
+    // zeroed instance, and the length was checked above.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            (&mut fpu as *mut kvm_fpu).cast::<u8>(),
+            want,
+        );
+    }
+    Ok(fpu)
 }
 
 /// Build the boot MSR set: SYSENTER/SYSCALL targets and TSC zeroed, fast-string
