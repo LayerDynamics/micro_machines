@@ -105,10 +105,7 @@ fn mm_run_boots_an_oci_image() {
     // Wait up to 120s for the guest to signal readiness (image pull + boot).
     let booted = rx.recv_timeout(Duration::from_secs(120)).is_ok();
 
-    // While the machine is up, `mm ps` must list it and report its allocated IP —
-    // the lifecycle/status surface (FR-8/FR-9), exercised end to end (not just the
-    // store round-trip unit test). Captured now; asserted after teardown so a failed
-    // assertion never leaks host resources.
+    // A helper to drive `mm` subcommands against this run's isolated MM_ROOT.
     let mm = |sub: &[&str]| -> (bool, String) {
         let out = Command::new(mm_bin)
             .args(sub)
@@ -120,8 +117,6 @@ fn mm_run_boots_an_oci_image() {
             String::from_utf8_lossy(&out.stdout).into_owned(),
         )
     };
-    let (ps_ok, ps_running) = mm(&["ps"]);
-    let (ipq_ok, ip_only) = mm(&["ps", "--ip-only", "oci-test"]);
 
     // Tear down: kill `mm run` and SIGTERM the jailed worker via `mm stop`. The
     // worker's PR_SET_PDEATHSIG cascade tears the whole VMM tree (and its TAP) down.
@@ -134,8 +129,15 @@ fn mm_run_boots_an_oci_image() {
         .stderr(Stdio::null())
         .status();
 
-    // `mm rm` after stop must succeed (the machine is terminal) and clean up the
-    // record + host resources; `mm ps` must then no longer list it.
+    // The lifecycle/status surface (FR-8/FR-9), exercised end to end — not just the
+    // store round-trip unit test. We drive these *after* the foreground `mm run` is
+    // gone: the registry is `redb`, which holds an exclusive lock while a process has
+    // it open, so a concurrent `mm ps` during a foreground run can't read it (in
+    // normal use you'd `mm run -d`, which returns and releases the lock). The record
+    // persists — with its allocated IP — until `mm rm` deletes it, so `mm ps` /
+    // `mm ps --ip-only` see it here, and the final `mm ps` must not.
+    let (ps_ok, ps_listed) = mm(&["ps"]);
+    let (ipq_ok, ip_only) = mm(&["ps", "--ip-only", "oci-test"]);
     let (rm_ok, rm_out) = mm(&["rm", "oci-test"]);
     let (_, ps_after) = mm(&["ps"]);
 
@@ -143,7 +145,7 @@ fn mm_run_boots_an_oci_image() {
     std::thread::sleep(Duration::from_millis(500));
     let log = output.lock().map(|s| s.clone()).unwrap_or_default();
     eprintln!("--- `mm run {IMAGE}` output ---\n{log}\n--- end ---");
-    eprintln!("--- `mm ps` (running) ---\n{ps_running}--- ip-only: {ip_only:?} ---");
+    eprintln!("--- `mm ps` ---\n{ps_listed}--- ip-only: {ip_only:?} ---");
     eprintln!("--- `mm rm` -> {rm_out:?}; `mm ps` (after) ---\n{ps_after}--- end ---");
     let _ = std::fs::remove_dir_all(&state);
 
@@ -159,12 +161,12 @@ fn mm_run_boots_an_oci_image() {
         "guest did not get a writable overlay root\noutput:\n{log}"
     );
 
-    // Lifecycle (FR-8/FR-9): `mm ps` lists the running machine with its IP, and
+    // Lifecycle (FR-8/FR-9): `mm ps` lists the machine with its allocated IP, and
     // `mm rm` removes it so it no longer appears.
     assert!(ps_ok, "`mm ps` failed");
     assert!(
-        ps_running.contains("oci-test"),
-        "`mm ps` did not list the running machine:\n{ps_running}"
+        ps_listed.contains("oci-test"),
+        "`mm ps` did not list the machine:\n{ps_listed}"
     );
     assert!(
         ipq_ok && ip_only.trim().starts_with("10.0.0."),
