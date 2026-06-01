@@ -849,6 +849,15 @@ impl Machine {
         Ok(machine)
     }
 
+    /// Restore a snapshot in-process (opens `/dev/kvm` itself), the restore
+    /// counterpart to [`boot`](Self::boot). For the non-jailed path (tests, local
+    /// single-host restore without inherited fds).
+    pub fn restore(config: &VmConfig, state: VmState, mem_path: &Path) -> Result<Self> {
+        let mut machine = Self::with_resources(config, Kvm::new()?, Vec::new())?;
+        machine.restore_start(state, mem_path)?;
+        Ok(machine)
+    }
+
     /// Wire the device model + vCPUs from a snapshot and resume — the restore
     /// counterpart to [`start`](Self::start). Loads RAM, attaches each device and
     /// re-activates it from its saved cursors (bypassing the guest's `DRIVER_OK`

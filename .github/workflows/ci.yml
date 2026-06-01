@@ -199,6 +199,34 @@ jobs:
         # and runs in the dedicated `net-integration` job instead.
         run: cargo test -p mm-vmm --features kvm-integration --test boot_kvm -- --ignored --nocapture
 
+  # Real snapshot/restore integration test (FR-14). Boots a sandbox guest in-process,
+  # snapshots it, restores into a fresh Machine, and re-snapshots — proving the
+  # vCPU/clock/device capture+restore, RAM dump/load, and restore-activate seam round
+  # trip. Runs as the unprivileged runner user (no jail/TAP), like the boot test.
+  snapshot-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: x86_64-unknown-linux-musl }
+      - name: Enable /dev/kvm access for the runner user
+        run: |
+          set -euo pipefail
+          sudo modprobe kvm || true
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+      - name: Install fixture build tools (musl linker + mke2fs)
+        run: sudo apt-get update && sudo apt-get install -y musl-tools e2fsprogs
+      - name: Fetch test fixtures (kernel + rootfs)
+        run: ./scripts/fetch-test-fixtures.sh
+      - name: Run KVM snapshot/restore integration test
+        run: cargo test -p mm-vmm --features kvm-integration --test snapshot_kvm -- --ignored --nocapture
+
   # Real virtio-net integration test (FR-10/11). Boots a microVM with a net
   # device on a host bridge and asserts a guest-originated UDP datagram reaches a
   # host socket — proving virtio-net TX, the kernel's static `ip=` config, and
