@@ -28,7 +28,7 @@ use crate::devices::{
     Balloon, Block, Bus, DevicePause, Interrupt, MmioTransport, Net, SerialDevice, VirtioDevice,
     Vsock, VsockReady, COM1_IRQ,
 };
-use crate::snapshot::state::{DeviceState, QueueCursor, VcpuState};
+use crate::snapshot::state::{DeviceState, QueueCursor, VcpuState, VmState};
 use crate::vcpu::{Vcpu, VcpuRunExit};
 
 /// Start of the 32-bit MMIO hole on x86: guest RAM is split around it so device
@@ -462,7 +462,7 @@ impl Machine {
         next_mmio: &mut u64,
         next_gsi: &mut u32,
         device: Box<dyn VirtioDevice>,
-    ) -> Result<()> {
+    ) -> Result<Arc<Mutex<MmioTransport>>> {
         let base = *next_mmio;
         let gsi = *next_gsi;
 
@@ -470,15 +470,19 @@ impl Machine {
         self.vm.register_irqfd(&irq, gsi)?;
         let interrupt = Arc::new(Interrupt::new(irq));
 
-        let transport = MmioTransport::new(device, self.guest_memory.clone(), interrupt)?;
-        bus.add_mmio_device(base, MMIO_DEVICE_SIZE, Arc::new(Mutex::new(transport)));
+        let transport = Arc::new(Mutex::new(MmioTransport::new(
+            device,
+            self.guest_memory.clone(),
+            interrupt,
+        )?));
+        bus.add_mmio_device(base, MMIO_DEVICE_SIZE, transport.clone());
 
         // e.g. " virtio_mmio.device=4K@0xd0000000:5"
         let _ = write!(cmdline, " virtio_mmio.device=4K@0x{base:x}:{gsi}");
 
         *next_mmio += MMIO_DEVICE_SIZE;
         *next_gsi += 1;
-        Ok(())
+        Ok(transport)
     }
 
     /// Wait up to `timeout` for the guest to signal readiness over the boot vsock.
@@ -813,6 +817,166 @@ impl Machine {
         }
         Ok(())
     }
+
+    /// Restore a snapshot into a fresh, running microVM (SPEC-1 FR-14). Like
+    /// [`boot_jailed`](Self::boot_jailed) it takes the inherited KVM/TAP/vsock fds,
+    /// but instead of loading a kernel and configuring the boot protocol it loads the
+    /// guest RAM from `mem_path`, rebuilds the devices from their saved queue cursors,
+    /// restores each vCPU's state + the VM clock, and resumes execution mid-flight.
+    ///
+    /// # Safety
+    /// `kvm_fd`, `tap_fds`, and `vsock_listener_fd` must be valid open fds whose
+    /// ownership transfers to this call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_jailed(
+        config: &VmConfig,
+        kvm_fd: RawFd,
+        tap_fds: Vec<RawFd>,
+        vsock_listener_fd: Option<RawFd>,
+        vcpu_hook: Option<VcpuHook>,
+        state: VmState,
+        mem_path: &Path,
+    ) -> Result<Self> {
+        // SAFETY: the caller guarantees `kvm_fd` is an open /dev/kvm fd we now own.
+        let kvm = unsafe { Kvm::from_raw_fd(kvm_fd) };
+        let mut machine = Self::with_resources(config, kvm, tap_fds)?;
+        if let Some(fd) = vsock_listener_fd {
+            // SAFETY: caller transfers an open, bound, listening UDS fd.
+            machine.vsock_listener = Some(unsafe { UnixListener::from_raw_fd(fd) });
+        }
+        machine.vcpu_hook = vcpu_hook;
+        machine.restore_start(state, mem_path)?;
+        Ok(machine)
+    }
+
+    /// Wire the device model + vCPUs from a snapshot and resume — the restore
+    /// counterpart to [`start`](Self::start). Loads RAM, attaches each device and
+    /// re-activates it from its saved cursors (bypassing the guest's `DRIVER_OK`
+    /// handshake, since the guest is mid-execution), restores vCPU + clock state, and
+    /// spawns the (already-running) vCPU threads. No kernel load, no `configure_boot`.
+    fn restore_start(&mut self, state: VmState, mem_path: &Path) -> Result<()> {
+        // 1. Guest RAM (kernel, page tables, and the virtqueue rings all live here).
+        self.load_guest_memory(mem_path)?;
+
+        let mut bus = Bus::new();
+        // The cmdline is discarded on restore — the guest already booted and its
+        // drivers are bound to the (deterministic) MMIO addresses recreated below.
+        let mut cmdline = String::new();
+        let mut next_mmio = MMIO_DEVICE_BASE;
+        let mut next_gsi = FIRST_VIRTIO_GSI;
+
+        let serial_irq = EventFd::new(libc::EFD_NONBLOCK).map_err(VmmError::Io)?;
+        self.vm.register_irqfd(&serial_irq, COM1_IRQ)?;
+        let serial = Arc::new(Mutex::new(SerialDevice::new(
+            serial_irq,
+            Box::new(AutoFlush(std::io::stdout())),
+        )));
+        bus.set_serial(serial);
+
+        // Device cursors, consumed in the same attach order they were captured.
+        let mut device_states = state.devices.into_iter();
+
+        // 2. Devices, in the same order as `start`: block, vsock, then nets. Each is
+        //    re-activated from its saved cursors instead of waiting for DRIVER_OK.
+        let block = Block::new(
+            &self.config.rootfs.path,
+            self.config.rootfs.read_only,
+            self.config.rootfs.rate_limit.clone(),
+        )?;
+        let mut block: Box<dyn VirtioDevice> = Box::new(block);
+        self.install_device_pause(&mut block)?;
+        let block_t =
+            self.attach_virtio(&mut bus, &mut cmdline, &mut next_mmio, &mut next_gsi, block)?;
+        restore_activate_next(&block_t, device_states.next())?;
+
+        let vsock = match self.vsock_listener.take() {
+            Some(listener) => Vsock::with_host_bridge(DEFAULT_GUEST_CID, listener)?,
+            None => Vsock::new(DEFAULT_GUEST_CID)?,
+        };
+        self.ready = Some(vsock.ready_signal());
+        let mut vsock: Box<dyn VirtioDevice> = Box::new(vsock);
+        self.install_device_pause(&mut vsock)?;
+        let vsock_t =
+            self.attach_virtio(&mut bus, &mut cmdline, &mut next_mmio, &mut next_gsi, vsock)?;
+        restore_activate_next(&vsock_t, device_states.next())?;
+
+        let config_devices = self.config.devices.clone();
+        let mut tap_fds = std::mem::take(&mut self.tap_fds).into_iter();
+        for device in &config_devices {
+            if let ConfigDevice::Net {
+                tap_name,
+                mac,
+                rate_limit,
+            } = device
+            {
+                let tap = match tap_fds.next() {
+                    // SAFETY: inherited open TAP fd; we take ownership.
+                    Some(fd) => unsafe { File::from_raw_fd(fd) },
+                    None => open_tap(tap_name)?,
+                };
+                let net = Net::new(tap, parse_mac(mac)?, rate_limit.clone());
+                let mut net: Box<dyn VirtioDevice> = Box::new(net);
+                self.install_device_pause(&mut net)?;
+                let net_t =
+                    self.attach_virtio(&mut bus, &mut cmdline, &mut next_mmio, &mut next_gsi, net)?;
+                restore_activate_next(&net_t, device_states.next())?;
+            }
+        }
+
+        // 3. Restore the VM-wide clock before any vCPU runs, so the guest's paravirt
+        //    clock does not jump.
+        self.restore_clock(&state.clock)?;
+
+        // 4. Hand the bus to the vCPU threads, restore each vCPU's state, and resume.
+        let bus = Arc::new(bus);
+        self.bus = Some(bus.clone());
+        let dispatch: Arc<dyn IoDispatch> = bus;
+        let mut vcpu_states = state.vcpus.into_iter();
+        for mut vcpu in std::mem::take(&mut self.vcpus) {
+            let vstate = vcpu_states.next().ok_or_else(|| {
+                VmmError::Vcpu(format!("restore: no saved state for vcpu {}", vcpu.index()))
+            })?;
+            vcpu.restore_state(&vstate)?;
+
+            let dispatch = dispatch.clone();
+            let hook = self.vcpu_hook.clone();
+            let stop = self.vcpu_stop.clone();
+            let pause = self.vcpu_pause.clone();
+            let tids = self.vcpu_tids.clone();
+            let pause_out = Arc::new(Mutex::new(None));
+            self.vcpu_states.push(pause_out.clone());
+            let handle = std::thread::Builder::new()
+                .name(format!("mm-vcpu-{}", vcpu.index()))
+                .spawn(move || {
+                    // SAFETY: `pthread_self` is always safe.
+                    let tid = unsafe { libc::pthread_self() };
+                    if let Ok(mut guard) = tids.lock() {
+                        guard.push(tid);
+                    }
+                    if let Some(hook) = &hook {
+                        hook(vcpu.index())?;
+                    }
+                    vcpu.run(&dispatch, &stop, &pause, &pause_out)
+                })
+                .map_err(VmmError::Io)?;
+            self.vcpu_threads.push(handle);
+        }
+        Ok(())
+    }
+}
+
+/// Re-activate a restored device's transport from its captured `DeviceState`. A free
+/// function so it does not borrow `&mut self` while the restore loop holds the config.
+fn restore_activate_next(
+    transport: &Arc<Mutex<MmioTransport>>,
+    state: Option<DeviceState>,
+) -> Result<()> {
+    let state =
+        state.ok_or_else(|| VmmError::Device("restore: missing device state".to_string()))?;
+    transport
+        .lock()
+        .expect("transport mutex")
+        .restore_activate(&state.queues)
 }
 
 /// A `Write` adapter that flushes the inner writer after every write, so guest

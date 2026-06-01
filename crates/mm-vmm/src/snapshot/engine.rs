@@ -9,9 +9,11 @@
 //!
 //! Snapshot is freeze-only: it pauses the vCPUs (which then exit) and quiesces the
 //! devices, so the VM is frozen afterwards; restore rebuilds a fresh [`Machine`].
+use std::os::unix::io::RawFd;
 use std::path::Path;
 
-use crate::machine::{Machine, Result, VmmError};
+use crate::config::VmConfig;
+use crate::machine::{Machine, Result, VcpuHook, VmmError};
 use crate::snapshot::manifest::{SnapshotKind, SnapshotManifest};
 use crate::snapshot::state::VmState;
 
@@ -68,6 +70,33 @@ fn write_snapshot_metadata(
         .map_err(|e| VmmError::Device(format!("serializing manifest: {e}")))?;
     std::fs::write(out_dir.join(MANIFEST_FILE), manifest_bytes).map_err(VmmError::Io)?;
     Ok(())
+}
+
+/// Restore a snapshot directory into a fresh, running microVM (SPEC-1 FR-14). Takes
+/// the same inherited fds as a jailed boot plus the snapshot `dir`; `config` must
+/// match the snapshot's device set (same rootfs/net/vsock), and is used to rebuild
+/// the VM before its saved state is loaded back in.
+#[allow(clippy::too_many_arguments)]
+pub fn restore(
+    config: &VmConfig,
+    kvm_fd: RawFd,
+    tap_fds: Vec<RawFd>,
+    vsock_listener_fd: Option<RawFd>,
+    vcpu_hook: Option<VcpuHook>,
+    dir: &Path,
+) -> Result<Machine> {
+    let manifest = load_manifest(dir)?;
+    let state = load_state(dir, &manifest)?;
+    let mem_path = dir.join(&manifest.memory_file);
+    Machine::restore_jailed(
+        config,
+        kvm_fd,
+        tap_fds,
+        vsock_listener_fd,
+        vcpu_hook,
+        state,
+        &mem_path,
+    )
 }
 
 /// Load a snapshot's manifest from `dir`.

@@ -23,4 +23,4 @@ pub use state::{DeviceState, MsrEntry, QueueCursor, StateError, VcpuState, VmSta
 #[cfg(target_os = "linux")]
 pub mod engine;
 #[cfg(target_os = "linux")]
-pub use engine::{load_manifest, load_state, snapshot};
+pub use engine::{load_manifest, load_state, restore, snapshot};

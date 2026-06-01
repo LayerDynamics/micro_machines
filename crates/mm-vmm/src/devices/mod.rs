@@ -372,6 +372,44 @@ impl MmioTransport {
             self.interrupt.clone(),
         )
     }
+
+    /// Activate a device from a restored snapshot (SPEC-1 FR-14): rebuild each
+    /// virtqueue from its saved cursor — the addresses the guest programmed plus the
+    /// `next_avail`/`next_used` indices — instead of waiting for the guest to
+    /// re-program them via `DRIVER_OK` (on restore the guest is mid-execution and
+    /// will not). Then start the worker and mark the device live. `cursors` may be
+    /// shorter than the device's queue count when a trailing queue was unused and
+    /// uncaptured (e.g. vsock's event queue); those get fresh queues.
+    pub fn restore_activate(
+        &mut self,
+        cursors: &[crate::snapshot::state::QueueCursor],
+    ) -> Result<()> {
+        if self.activated {
+            return Ok(());
+        }
+        if cursors.len() > self.queue_max_sizes.len() {
+            return Err(VmmError::Device(format!(
+                "restore: {} queue cursors for a device with {} queues",
+                cursors.len(),
+                self.queue_max_sizes.len()
+            )));
+        }
+        let mut queues = Vec::with_capacity(self.queue_max_sizes.len());
+        for (i, &max) in self.queue_max_sizes.iter().enumerate() {
+            let queue = match cursors.get(i) {
+                Some(cursor) => Queue::try_from(virtio_queue::QueueState::from(*cursor))
+                    .map_err(|e| VmmError::Device(format!("restore queue {i}: {e:?}")))?,
+                None => Queue::new(max)
+                    .map_err(|e| VmmError::Device(format!("restore queue {i}: {e}")))?,
+            };
+            queues.push(queue);
+        }
+        self.queues = queues;
+        self.activate()?;
+        self.activated = true;
+        self.status |= STATUS_DRIVER_OK;
+        Ok(())
+    }
 }
 
 /// One device's MMIO window on the guest physical bus.
