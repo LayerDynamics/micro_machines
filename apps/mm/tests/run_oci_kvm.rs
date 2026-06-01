@@ -94,13 +94,19 @@ fn mm_run_boots_an_oci_image() {
 
     let output = Arc::new(Mutex::new(String::new()));
     let (tx, rx) = mpsc::channel();
-    let h_out = watch(child.stdout.take().unwrap(), output.clone(), tx.clone());
-    let h_err = watch(child.stderr.take().unwrap(), output.clone(), tx);
+    // Detached readers: we never join them. The jailed worker (and its forked VMM
+    // tree) inherit `mm run`'s stdout in foreground mode, so they keep the pipe open
+    // until torn down — joining could block. The boot markers we assert on are
+    // captured early (before readiness), so reading the buffer after teardown is
+    // enough.
+    watch(child.stdout.take().unwrap(), output.clone(), tx.clone());
+    watch(child.stderr.take().unwrap(), output.clone(), tx);
 
     // Wait up to 120s for the guest to signal readiness (image pull + boot).
     let booted = rx.recv_timeout(Duration::from_secs(120)).is_ok();
 
-    // Tear down: kill `mm run` and SIGTERM the jailed worker via `mm stop`.
+    // Tear down: kill `mm run` and SIGTERM the jailed worker via `mm stop`. The
+    // worker's PR_SET_PDEATHSIG cascade tears the whole VMM tree (and its TAP) down.
     let _ = child.kill();
     let _ = child.wait();
     let _ = Command::new(mm_bin)
@@ -110,9 +116,8 @@ fn mm_run_boots_an_oci_image() {
         .stderr(Stdio::null())
         .status();
 
-    // Join the readers (the pipes are now closed) so all output is captured.
-    let _ = h_out.join();
-    let _ = h_err.join();
+    // Let the readers flush what they captured (no join — see above).
+    std::thread::sleep(Duration::from_millis(500));
     let log = output.lock().map(|s| s.clone()).unwrap_or_default();
     eprintln!("--- `mm run {IMAGE}` output ---\n{log}\n--- end ---");
     let _ = std::fs::remove_dir_all(&state);

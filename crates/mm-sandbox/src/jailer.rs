@@ -138,6 +138,7 @@ fn setup_user_namespace_via_parent(uid: u32, gid: u32) -> Result<(), JailerError
     // async-signal-safe work before blocking on the pipe.
     match unsafe { fork() }.map_err(JailerError::Fork)? {
         ForkResult::Child => {
+            set_parent_death_signal();
             // Keep the child's ends; dropping the others closes our copies.
             drop(c2p_r);
             drop(p2c_w);
@@ -187,6 +188,24 @@ fn setup_user_namespace_via_parent(uid: u32, gid: u32) -> Result<(), JailerError
 /// failures are surfaced as `JailerError::UserNamespace`).
 fn io_from_errno(e: nix::Error) -> std::io::Error {
     std::io::Error::from_raw_os_error(e as i32)
+}
+
+/// Ask the kernel to SIGKILL this process when its parent dies. Set in every forked
+/// child of the confinement tree (the userns child and the PID-1 grandchild) so that
+/// killing the top worker — e.g. `mm stop` SIGTERMing the recorded pid — cascades
+/// all the way down and tears the actual VMM (and its TAP) down, instead of leaving
+/// the inner process orphaned and the guest running.
+fn set_parent_death_signal() {
+    // SAFETY: prctl(PR_SET_PDEATHSIG, sig) is always safe; failure is non-fatal.
+    unsafe {
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        );
+    }
 }
 
 /// Create the per-VM cgroup, write its limits, and move this process into it.
@@ -274,7 +293,10 @@ fn fork_into_pid_namespace() -> Result<(), JailerError> {
     // SAFETY: single-threaded process (see above); each branch only does
     // async-signal-safe work before the child returns / the parent exits.
     match unsafe { fork() }.map_err(JailerError::Fork)? {
-        ForkResult::Child => Ok(()),
+        ForkResult::Child => {
+            set_parent_death_signal();
+            Ok(())
+        }
         ForkResult::Parent { child } => {
             let code = match waitpid(child, None) {
                 Ok(WaitStatus::Exited(_, code)) => code,
