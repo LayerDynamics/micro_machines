@@ -150,6 +150,42 @@ impl Store {
         rows.into_iter().map(MachineRow::into_machine).collect()
     }
 
+    /// Every machine across all namespaces — the input the reconcile loop iterates.
+    pub async fn list_all_machines(&self) -> Result<Vec<Machine>, sqlx::Error> {
+        let rows: Vec<MachineRow> = sqlx::query_as(
+            "SELECT uid, namespace, fleet, name, spec, status, host_id FROM machines",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(MachineRow::into_machine).collect()
+    }
+
+    /// Fetch a machine by its stable uid (the gRPC key).
+    pub async fn get_machine_by_uid(&self, uid: Uuid) -> Result<Option<Machine>, sqlx::Error> {
+        let row: Option<MachineRow> = sqlx::query_as(
+            "SELECT uid, namespace, fleet, name, spec, status, host_id FROM machines WHERE uid = $1",
+        )
+        .bind(uid)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(MachineRow::into_machine).transpose()
+    }
+
+    /// Set a machine's observed lifecycle state (from an agent `ReportEvent`),
+    /// merging into the existing status JSON. Returns rows changed.
+    pub async fn set_observed_state(&self, uid: Uuid, state: &str) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE machines
+             SET status = jsonb_set(status, '{state}', to_jsonb($2::text)), updated_at = now()
+             WHERE uid = $1",
+        )
+        .bind(uid)
+        .bind(state)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Set `spec.running` (the `start`/`stop` verbs) and bump `updated_at`. Returns
     /// the number of rows changed (0 if the machine does not exist).
     pub async fn set_running(
@@ -221,6 +257,33 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Refresh a host's heartbeat timestamp (keeps it marked healthy/live).
+    pub async fn touch_heartbeat(&self, host_id: &str) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE hosts SET last_heartbeat = now(), healthy = true WHERE host_id = $1",
+        )
+        .bind(host_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Healthy hosts and their advertised capacity JSON, for the scheduler. A host
+    /// is considered live if it heartbeat within `stale_after` seconds.
+    pub async fn live_host_capacities(
+        &self,
+        stale_after_secs: i64,
+    ) -> Result<Vec<(String, Value)>, sqlx::Error> {
+        let rows: Vec<(String, Value)> = sqlx::query_as(
+            "SELECT host_id, capacity FROM hosts
+             WHERE healthy = true AND last_heartbeat > now() - make_interval(secs => $1::double precision)",
+        )
+        .bind(stale_after_secs as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     // --- rbac + audit -----------------------------------------------------

@@ -13,9 +13,13 @@ path = "src/main.rs"
 
 [dependencies]
 mm-api-types = { path = "../../crates/mm-api-types" }
+mm-proto = { path = "../../crates/mm-proto" } # controller<->agent gRPC contract
 
 tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["net"] }
 sqlx = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -29,8 +33,13 @@ axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 jsonwebtoken = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 # Integration tests drive the router in-process (tower oneshot) and mint their own
 # HS256 tokens; they run against a real Postgres in CI (no network server needed).
 http-body-util = "0.1"
+# The reconcile-loop test generates a dev CA + server/client certs with
+# scripts/dev-certs.sh (openssl) into a temp dir to exercise the real mTLS
+# controller<->agent path; openssl is present locally and in the CI controller job.
+mm-agent = { path = "../mm-agent" }

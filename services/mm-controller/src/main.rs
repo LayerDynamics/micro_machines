@@ -1,19 +1,27 @@
 //! MicroMachines control plane (M2): a REST API + scheduler + reconciler over a
 //! PostgreSQL store, talking mTLS gRPC to per-host agents.
 //!
-//! This entrypoint owns configuration, the database, and serving the REST API. It
-//! connects the pool, applies the embedded migrations on startup, builds the router
-//! over the store + a JWT verifier, and serves until interrupted. The gRPC servers
-//! and the reconcile loop (Task 8) are layered on next.
+//! This entrypoint owns configuration and the database, then runs three things
+//! concurrently: the public REST API (axum), the controller↔agent gRPC servers
+//! (tonic, mutual-TLS), and the reconcile loop that drives observed state toward
+//! desired state by pushing assignments to connected agents.
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use sqlx::postgres::PgPoolOptions;
+use tonic::transport::Server;
 
 use mm_controller::api::{self, AppState};
 use mm_controller::auth::JwtVerifier;
+use mm_controller::grpc::{AgentRegistry, HostSvc, MachineSvc};
 use mm_controller::store::Store;
+use mm_controller::tls;
+use mm_proto::host_service_server::HostServiceServer;
+use mm_proto::machine_service_server::MachineServiceServer;
 
 #[derive(Debug, Parser)]
 #[command(name = "mm-controller", about = "MicroMachines control plane")]
@@ -27,16 +35,22 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:8080")]
     listen: String,
 
-    /// HS256 secret used to verify bearer tokens. Supplied by configuration rather
-    /// than fetched from an OIDC provider, so token verification is offline and the
-    /// signing authority is operator-controlled.
+    /// Listen address for the controller↔agent gRPC server.
+    #[arg(long, default_value = "0.0.0.0:50051")]
+    grpc_listen: String,
+
+    /// HS256 secret used to verify bearer tokens (configured, not from OIDC).
     #[arg(long, env = "JWT_HS256_SECRET")]
     jwt_hs256_secret: String,
 
-    /// Directory holding the mTLS CA + controller cert/key for the gRPC servers
-    /// (wired in a later task).
+    /// Directory holding the mTLS CA + controller cert/key (`ca.pem`, `server.pem`,
+    /// `server.key`). When `ca.pem` is present the gRPC server requires client certs.
     #[arg(long, default_value = "./certs")]
-    tls_dir: String,
+    tls_dir: PathBuf,
+
+    /// Reconcile loop tick interval, in seconds (convergence target < 30s, NFR-R4).
+    #[arg(long, default_value_t = 5)]
+    reconcile_interval_secs: u64,
 }
 
 #[tokio::main]
@@ -49,30 +63,66 @@ async fn main() -> Result<()> {
         .connect(&args.database_url)
         .await
         .context("connecting to Postgres")?;
-
     let store = Store::new(pool);
     store
         .migrate()
         .await
         .context("applying database migrations")?;
 
+    let registry = AgentRegistry::default();
+
+    // REST API over the store.
     let state = AppState {
-        store,
+        store: store.clone(),
         verifier: Arc::new(JwtVerifier::hs256(args.jwt_hs256_secret.as_bytes())),
     };
-    let app = api::router(state);
-
-    let listener = tokio::net::TcpListener::bind(&args.listen)
+    let rest_listener = tokio::net::TcpListener::bind(&args.listen)
         .await
-        .with_context(|| format!("binding {}", args.listen))?;
-    tracing::info!(listen = %args.listen, tls_dir = %args.tls_dir, "control plane serving REST API");
+        .with_context(|| format!("binding REST {}", args.listen))?;
+    let rest = axum::serve(rest_listener, api::router(state));
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
-        .context("serving REST API")?;
-    tracing::info!("shutting down");
+    // gRPC servers (mTLS when a CA is configured).
+    let grpc_addr: SocketAddr = args.grpc_listen.parse().context("parsing --grpc-listen")?;
+    let mut grpc_builder = Server::builder();
+    if args.tls_dir.join("ca.pem").exists() {
+        grpc_builder = grpc_builder
+            .tls_config(tls::server_config(&args.tls_dir)?)
+            .context("configuring server mTLS")?;
+    } else {
+        tracing::warn!(
+            "no CA in {} — gRPC server running without mTLS",
+            args.tls_dir.display()
+        );
+    }
+    let grpc = grpc_builder
+        .add_service(MachineServiceServer::new(MachineSvc {
+            store: store.clone(),
+            registry: registry.clone(),
+        }))
+        .add_service(HostServiceServer::new(HostSvc {
+            store: store.clone(),
+        }))
+        .serve(grpc_addr);
+
+    // Reconcile loop.
+    let reconcile = mm_controller::r#loop::run(
+        store,
+        registry,
+        Duration::from_secs(args.reconcile_interval_secs),
+    );
+
+    tracing::info!(
+        rest = %args.listen,
+        grpc = %args.grpc_listen,
+        "control plane serving"
+    );
+
+    // Run all three until one exits (an error) or the process is signalled.
+    tokio::select! {
+        r = rest => r.context("REST server")?,
+        r = grpc => r.context("gRPC server")?,
+        _ = reconcile => {}
+        _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
+    }
     Ok(())
 }

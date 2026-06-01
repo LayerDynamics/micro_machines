@@ -11,11 +11,18 @@
 //! - [`store`] — PostgreSQL persistence (runtime sqlx queries).
 //! - [`api`] — the axum router + handlers.
 //!
-//! Later M2 tasks add the gRPC servers and the reconcile loop alongside these.
+//! - [`grpc`] — the controller's MachineService + HostService gRPC servers.
+//! - [`r#loop`] — the reconciliation loop driving observed toward desired state.
+//! - [`tls`] — mutual-TLS config for the gRPC server.
 pub mod api;
 pub mod auth;
 pub mod authz;
+pub mod convert;
+pub mod grpc;
+#[path = "loop.rs"]
+pub mod r#loop;
 pub mod model;
 pub mod reconcile;
 pub mod scheduler;
 pub mod store;
+pub mod tls;

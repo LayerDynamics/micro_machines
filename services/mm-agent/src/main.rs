@@ -123,8 +123,17 @@ async fn serve_once(
     host_res: HostResources,
     args: &AgentArgs,
 ) -> Result<()> {
-    let channel = Channel::from_shared(args.controller.clone())
-        .context("invalid controller endpoint")?
+    let mut endpoint =
+        Channel::from_shared(args.controller.clone()).context("invalid controller endpoint")?;
+    // Use mTLS when a CA is present in the cert dir (production); fall back to plain
+    // gRPC for local/dev where no certs are provisioned.
+    if args.tls_dir.join("ca.pem").exists() {
+        let domain = controller_domain(&args.controller);
+        endpoint = endpoint
+            .tls_config(mm_agent::tls::client_config(&args.tls_dir, &domain)?)
+            .context("configuring client mTLS")?;
+    }
+    let channel = endpoint
         .connect()
         .await
         .context("connecting to controller")?;
@@ -284,6 +293,14 @@ fn reserved_ips(store: &LocalStore) -> Result<Vec<Ipv4Addr>> {
         .into_iter()
         .filter_map(|m| m.ip.and_then(|s| s.parse().ok()))
         .collect())
+}
+
+/// Extract the host portion of a controller endpoint URL, used as the TLS server
+/// name (which must match the controller certificate's SAN).
+fn controller_domain(url: &str) -> String {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let host = after_scheme.split('/').next().unwrap_or(after_scheme);
+    host.split(':').next().unwrap_or(host).to_string()
 }
 
 /// A short, stable host-local name derived from a machine uid. The TAP device name
