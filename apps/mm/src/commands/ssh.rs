@@ -35,6 +35,13 @@ pub fn run(args: SshArgs) -> Result<()> {
         "UserKnownHostsFile=/dev/null",
         "-o",
         "LogLevel=ERROR",
+        // Fail fast instead of blocking on the kernel TCP timeout when the guest is
+        // unreachable, and never fall back to an interactive password prompt (auth
+        // is key-only). Keeps `mm ssh` responsive and scriptable.
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "BatchMode=yes",
     ]);
     let identity = crate::commands::state_root().join("ssh").join("id_ed25519");
     if identity.exists() {
