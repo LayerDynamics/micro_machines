@@ -434,6 +434,23 @@ impl Machine {
         Ok(rc > 0 && (poll_fd.revents & libc::POLLIN) != 0)
     }
 
+    /// Serve the guest until it powers itself off: join the vCPU threads, each of
+    /// which exits its run loop when KVM reports a shutdown (the guest's
+    /// `reboot`/`poweroff` with `reboot=k`). Unlike [`shutdown`], this does **not**
+    /// force the vCPUs to stop — it is how a long-running guest (a real workload or
+    /// an SSH-reachable sandbox) is run for its full lifetime. The VM is torn down
+    /// abruptly only if the worker process is killed (e.g. `mm stop`).
+    pub fn wait_for_vcpus(&mut self) -> Result<()> {
+        for handle in self.vcpu_threads.drain(..) {
+            match handle.join() {
+                Ok(Ok(_exit)) => {}
+                Ok(Err(e)) => tracing::error!("vcpu thread exited with error: {e}"),
+                Err(_) => tracing::error!("vcpu thread panicked"),
+            }
+        }
+        Ok(())
+    }
+
     /// Stop the VM: ask the vCPU threads to stop and signal them out of any halted
     /// `KVM_RUN` (the in-kernel irqchip handles guest `HLT` internally, so KVM_RUN
     /// blocks rather than returning), then join them.

@@ -116,8 +116,11 @@ mod linux {
             tracing::warn!("guest did not signal readiness within 10s");
         }
 
-        // Serve the guest until it powers off.
-        machine.shutdown().context("running microVM")?;
+        // Serve the guest for its full lifetime — until it powers itself off (a
+        // workload that exits, or `mm stop` killing this process). We must NOT call
+        // shutdown() here: that would force the vCPUs to stop right after readiness,
+        // tearing down a long-running guest (and releasing its TAP) immediately.
+        machine.wait_for_vcpus().context("running microVM")?;
         Ok(())
     }
 }
