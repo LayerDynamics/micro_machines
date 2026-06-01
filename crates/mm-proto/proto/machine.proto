@@ -11,11 +11,15 @@ service MachineService {
   rpc Delete(MachineRef) returns (Ack);
   rpc Get(MachineRef) returns (Machine);
   rpc WatchAssignments(HostRef) returns (stream Assignment); // controller -> agent
-  // Run a command in a sandbox guest over vsock, streaming stdout/stderr back and
-  // ending with the exit code (SPEC-1 FR-13). controller -> agent -> guest.
-  rpc Exec(ExecRequest) returns (stream ExecChunk);
+  // NOTE: cluster exec (controller -> agent -> guest, SPEC-1 FR-13) is Task 55. It
+  // needs a reverse path to the client-only agent (which dials in for assignments
+  // and has no inbound address), so the rpc is added together with that forwarding
+  // design rather than ahead of it. The message contract below is kept ready. The
+  // single-host path (`mm exec`) reaches the guest directly via the host vsock
+  // bridge UDS and needs no control-plane rpc.
 }
 
+// Exec wire contract (used by Task 55's cluster exec once the forwarding path lands).
 message ExecRequest { MachineRef ref = 1; repeated string cmd = 2; uint64 timeout_ms = 3; }
 // A streamed exec result: an output chunk (stdout/stderr), or — when `done` — the
 // terminal frame carrying `exit_code`.
