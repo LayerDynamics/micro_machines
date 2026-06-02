@@ -179,6 +179,11 @@ mod linux {
             std::thread::sleep(Duration::from_millis(5));
         };
 
+        // Diagnostic (fork exec-independence bring-up): the command finished and its
+        // output readers joined; the only thing left is writing the Exit frame back to
+        // the host. If "sending Exit" prints but "finished Exec" does not, the
+        // guest->host vsock write is what blocks after a snapshot/fork resume.
+        eprintln!("mm-init: exec agent: command done (timed_out={timed_out}); sending Exit");
         let _ = out.join();
         let _ = err.join();
 
@@ -190,6 +195,7 @@ mod linux {
         let mut w = writer.lock().expect("writer mutex");
         let _ = w.write_all(&encode(&Frame::Exit { id, code }));
         let _ = w.flush();
+        eprintln!("mm-init: exec agent: Exit frame written code={code}");
     }
 
     /// Spawn a thread that reads `source` to EOF, forwarding each chunk as an
