@@ -1,8 +1,31 @@
 # FR-16: branch a running sandbox via userfaultfd write-protect (UFFD_WP)
 
 **Date:** 2026-06-02
-**Status:** Design (build pending — gated on a KVM de-risking experiment, see Phase 0)
+**Status:** Phase 0 PASSED — feasibility confirmed on the CI kernel; Phase 1 (engine) unblocked.
 **Tracks:** M3 follow-up #5 (FR-16 running BRANCH) / #7 (UFFD_WP), now in scope by request.
+
+## Phase 0 result (2026-06-02) — FEASIBLE
+
+The feasibility probe (`uffd_wp_on_live_guest_is_supported` in
+`crates/mm-vmm/tests/fork_kvm.rs`, fork-integration CI job) passed:
+
+```
+FR-16 UFFD_WP probe: observed 1 write-protect fault(s) from the live guest
+test uffd_wp_on_live_guest_is_supported ... ok
+```
+
+A **full** (`user_mode_only(false)`) userfaultfd registered over the running guest's
+RAM in write-protect mode **does** receive `WriteProtected` faults for the guest's own
+writes (faulted out via EPT through KVM in kernel context). So the hard open question is
+answered yes on this kernel, and the rest of this plan (Phase 1+) is unblocked.
+
+Two harness requirements the probe surfaced, load-bearing for the engine too:
+- The uffd must be **non-user-mode-only** — a `UFFD_USER_MODE_ONLY` uffd never sees the
+  guest's kernel-context faults (it would falsely observe zero).
+- It needs an **accessible `/dev/userfaultfd`** (or `CAP_SYS_PTRACE` / the
+  `vm.unprivileged_userfaultfd=1` sysctl). The userfaultfd crate does not fall back to
+  the `userfaultfd(2)` syscall once the device node exists, so a root-only device node
+  yields `OpenDevUserfaultfd(EACCES)`. CI grants the runner user access to it.
 
 ## Goal
 
