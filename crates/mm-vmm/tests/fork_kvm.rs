@@ -20,8 +20,7 @@ use mm_sandbox::exec::{run_exec_over_uds_ready, ExecResult, EXEC_PORT};
 use mm_vmm::snapshot::{fork_children, load_state, snapshot, ForkPlan};
 use mm_vmm::{BlockDevice, Machine, VmConfig};
 use userfaultfd::{Event, FaultKind, FeatureFlags, RegisterMode, UffdBuilder};
-use vm_memory::GuestMemoryRegion;
-use vm_memory::{Bytes, GuestAddress};
+use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryRegion};
 
 #[cfg(target_arch = "aarch64")]
 const GUEST_CONSOLE: &str = "console=ttyAMA0";
