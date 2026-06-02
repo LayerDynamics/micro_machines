@@ -527,18 +527,18 @@ mm --server $S snapshot m3 && mm --server $S fork m3 --count 100                
 ```
 → Expected: snapshot/restore preserves state; 100-child fork p50 < 150 ms (NFR-P2, recorded); exec returns correct results; children independent.
 
-**Exit criteria (M3 complete when ALL true):**
-- [ ] Snapshot of a paused microVM captures memory + vCPU + device state and restores to an identical, resumable VM (FR-14).
-- [ ] CoW fork spawns N=100 children from a warmed parent; per-child time-to-ready p50 < 150 ms (FR-15, NFR-P2) — number recorded; children are CoW-isolated.
-- [ ] `exec` runs a command in a sandbox guest over vsock and returns correct stdout/stderr/exit code (FR-13), routed through controller→agent→guest.
-- [ ] virtio blk/net enforce token-bucket rate limits (FR-28).
-- [ ] All pure-logic units have passing tests; KVM integration tests pass on the kvm runner; clippy + fmt clean; every task committed.
-- [ ] Running-sandbox BRANCH (FR-16) is recorded as a TODO, NOT implemented (out of M3 scope).
+**Exit criteria (M3 complete when ALL true):** ✅ ALL MET — gate signed off 2026-06-02.
+- [x] Snapshot of a paused microVM captures memory + vCPU + device state and restores to an identical, resumable VM (FR-14). — `snapshot-integration` CI job green.
+- [x] CoW fork spawns N=100 children from a warmed parent; per-child time-to-ready p50 < 150 ms (FR-15, NFR-P2) — number recorded; children are CoW-isolated. — `fork-integration` green; N=100 measured p50 <1 ms, p90 1 ms, max 4 ms (CI run 26814151459).
+- [x] `exec` runs a command in a sandbox guest over vsock and returns correct stdout/stderr/exit code (FR-13), routed through controller→agent→guest. — `cluster-integration` green; `cluster-e2e.sh` asserts real guest stdout + non-zero exit + reverse-channel survival across a controller restart (CI run 26817967954).
+- [x] virtio blk/net enforce token-bucket rate limits (FR-28). — ratelimit units + device wiring green.
+- [x] All pure-logic units have passing tests; KVM integration tests pass on the kvm runner; clippy + fmt clean; every task committed. — full CI run 26817967954 green (15/15 jobs).
+- [x] Running-sandbox BRANCH (FR-16) is recorded as a TODO, NOT implemented (out of M3 scope). — see below.
 
 **TODOs discovered during M3** (note, do NOT fix now):
 - **FR-16 running-sandbox BRANCH** (SHOULD, out of M3 scope) — branch a *running* (not paused) sandbox via diff snapshots + `UFFD_WP` live page copy, so the parent keeps running while children fork. M3 forks a paused parent only.
-- **Full N=100 fork fan-out sweep** — `fork_kvm.rs` proves the CoW mechanism + isolation at N=4 (~2 ms/child, far under NFR-P2's 150 ms p50); the explicit N=100-concurrent p50 number on a bare-metal host is a benchmark-coverage follow-up (100 live microVMs is heavy for the shared nested-KVM CI runner).
+- ~~**Full N=100 fork fan-out sweep**~~ — DONE (`fork_kvm.rs::fork_fanout_p50_tracks_nfr_p2`, `fork-integration` job): forks 100 children one-at-a-time from a warmed parent snapshot and reports the p50 (measured <1 ms, far under NFR-P2's 150 ms). The N=4 concurrent-isolation test remains as the CoW-independence proof.
 - **In-guest fork independence via exec** — `fork_kvm.rs` proves CoW isolation by writing/reading each child's guest RAM directly; a richer check would `mm exec` a distinct command in 3 random children and assert independent results.
-- **Cluster exec forwarding (Task 8/55)** — controller→agent→guest `exec` over the control plane needs a reverse channel to the client-only agent; `MachineService.Exec` was deferred with its message contract kept (see machine.proto). Single-host `mm exec` is done + green.
+- ~~**Cluster exec forwarding (Task 8/55)**~~ — DONE: controller→agent→guest `exec` over the control plane lands via a `WatchExec`/`ReportExecResult` reverse channel into the client-only agent (commit 93794ac, `cluster-integration` green). Output streams end-to-end; `mm --server … exec` is the cluster entry point.
 - **Snapshot GC/retention + cross-host restore** — snapshots accrete files under the state dir; restore currently assumes the same host (TSC/CPUID).
 - **userfaultfd UFFD_WP fork optimization** — M3's fork uses kernel `MAP_PRIVATE` CoW (proven, fast). The plan's `UFFD_WP` lazy-copy is an optional optimization to shrink the source-pause window further; not required for the proven core.
