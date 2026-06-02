@@ -135,8 +135,12 @@ mod linux {
             );
             return;
         };
+        eprintln!("mm-init: exec agent: spawning {cmd:?}");
         let mut child = match command.spawn() {
-            Ok(c) => c,
+            Ok(c) => {
+                eprintln!("mm-init: exec agent: spawned {cmd:?}");
+                c
+            }
             Err(e) => {
                 eprintln!("mm-init: exec agent: spawn failed: {e}");
                 send(
