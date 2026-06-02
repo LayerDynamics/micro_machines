@@ -52,8 +52,11 @@ fn fixture_config() -> VmConfig {
     }
 }
 
-fn scratch_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("mm-fork-{}", std::process::id()));
+/// A per-test scratch directory. The `tag` must be unique per test: cargo runs the
+/// tests in this file concurrently, and each cleans up its own dir, so a shared path
+/// would race (one test's cleanup deleting another's snapshot mid-run).
+fn scratch_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("mm-fork-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");
     dir
 }
@@ -72,7 +75,7 @@ fn fork_fans_out_independent_cow_children() {
             .expect("readiness poll"),
         "parent reached userspace"
     );
-    let dir = scratch_dir();
+    let dir = scratch_dir("isolation");
     let manifest = snapshot(&mut parent, &dir).expect("snapshot the warm parent");
 
     // Fan out CHILDREN children over CoW memory, timing the fan-out (NFR-P2).
@@ -131,7 +134,7 @@ fn fork_fanout_p50_tracks_nfr_p2() {
             .expect("readiness poll"),
         "parent reached userspace"
     );
-    let dir = scratch_dir();
+    let dir = scratch_dir("fanout-p50");
     let manifest = snapshot(&mut parent, &dir).expect("snapshot the warm parent");
     drop(parent); // frozen parent is no longer needed
 
