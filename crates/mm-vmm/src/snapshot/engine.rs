@@ -32,6 +32,7 @@ pub fn snapshot(machine: &mut Machine, out_dir: &Path) -> Result<SnapshotManifes
     let vcpus = machine.pause_and_capture_vcpus()?;
     let devices = machine.pause_devices()?;
     let clock = machine.capture_clock()?;
+    let irqchip = machine.capture_irqchip()?;
 
     machine.dump_guest_memory(&out_dir.join(MEMORY_FILE))?;
 
@@ -39,6 +40,7 @@ pub fn snapshot(machine: &mut Machine, out_dir: &Path) -> Result<SnapshotManifes
         vcpus,
         devices,
         clock,
+        irqchip,
     };
     let manifest = SnapshotManifest {
         version: SnapshotManifest::CURRENT_VERSION,
@@ -144,6 +146,7 @@ mod tests {
                     ..Default::default()
                 }],
             }],
+            irqchip: Default::default(),
         }
     }
 

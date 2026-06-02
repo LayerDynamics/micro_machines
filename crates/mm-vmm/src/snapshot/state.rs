@@ -116,6 +116,29 @@ pub struct DeviceState {
     pub queues: Vec<QueueCursor>,
 }
 
+/// In-kernel interrupt-controller + timer state captured at snapshot
+/// (`KVM_GET_IRQCHIP` for the two PICs and the IOAPIC, `KVM_GET_PIT2`), stored as the
+/// raw bytes of the corresponding `kvm_irqchip` / `kvm_pit_state2` structs (POD,
+/// `repr(C)` — `kvm_irqchip` carries a union so it has no serde derive, hence bytes).
+///
+/// Restored before any vCPU runs. A fresh VM is created with a *default* irqchip, but
+/// the (CoW-)restored guest RAM still expects the IOAPIC redirection entries it
+/// programmed (e.g. the COM1 serial IRQ). Without re-applying this state the resumed
+/// guest's interrupt routing is inconsistent and it oopses in the interrupt path on
+/// the first interrupt-driven device access (observed: a forked child crashing in the
+/// tty write path on its first console write).
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct IrqChipState {
+    /// `kvm_irqchip` bytes for `KVM_IRQCHIP_PIC_MASTER`.
+    pub pic_master: Vec<u8>,
+    /// `kvm_irqchip` bytes for `KVM_IRQCHIP_PIC_SLAVE`.
+    pub pic_slave: Vec<u8>,
+    /// `kvm_irqchip` bytes for `KVM_IRQCHIP_IOAPIC`.
+    pub ioapic: Vec<u8>,
+    /// `kvm_pit_state2` bytes (`KVM_GET_PIT2`).
+    pub pit: Vec<u8>,
+}
+
 /// The full non-RAM state of a paused microVM — the serialized `state_file`.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct VmState {
@@ -127,6 +150,10 @@ pub struct VmState {
     /// paravirt clock does not jump forward by the snapshot's wall-clock age — the
     /// classic restore hang (RCU stalls) if omitted.
     pub clock: kvm_clock_data,
+    /// In-kernel irqchip (PIC + IOAPIC) and PIT state. Restored before the vCPUs run
+    /// so interrupt routing survives snapshot/restore + fork (see [`IrqChipState`]).
+    #[serde(default)]
+    pub irqchip: IrqChipState,
 }
 
 impl VmState {
@@ -195,6 +222,12 @@ mod tests {
                     event_idx_enabled: false,
                 }],
             }],
+            irqchip: IrqChipState {
+                pic_master: vec![0x11; 8],
+                pic_slave: vec![0x22; 8],
+                ioapic: vec![0x33; 8],
+                pit: vec![0x44; 8],
+            },
         };
 
         let bytes = vm.to_bytes().expect("serialize");
@@ -212,6 +245,9 @@ mod tests {
         assert_eq!(back.devices[0].device_type, 2);
         assert_eq!(back.devices[0].queues[0].next_avail, 5);
         assert!(back.devices[0].queues[0].ready);
+        assert_eq!(back.irqchip.pic_master, vec![0x11; 8]);
+        assert_eq!(back.irqchip.ioapic, vec![0x33; 8]);
+        assert_eq!(back.irqchip.pit, vec![0x44; 8]);
     }
 
     #[test]

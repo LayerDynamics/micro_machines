@@ -17,7 +17,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use kvm_bindings::{
-    kvm_clock_data, kvm_pit_config, kvm_userspace_memory_region, KVM_PIT_SPEAKER_DUMMY,
+    kvm_clock_data, kvm_irqchip, kvm_pit_config, kvm_pit_state2, kvm_userspace_memory_region,
+    KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_PIT_SPEAKER_DUMMY,
 };
 use kvm_ioctls::{Kvm, VmFd};
 use vm_memory::{
@@ -30,7 +31,7 @@ use crate::devices::{
     Balloon, Block, Bus, DevicePause, Interrupt, MmioTransport, Net, SerialDevice, VirtioDevice,
     Vsock, VsockReady, COM1_IRQ,
 };
-use crate::snapshot::state::{DeviceState, QueueCursor, VcpuState, VmState};
+use crate::snapshot::state::{DeviceState, IrqChipState, QueueCursor, VcpuState, VmState};
 use crate::vcpu::{Vcpu, VcpuRunExit};
 
 /// Start of the 32-bit MMIO hole on x86: guest RAM is split around it so device
@@ -782,6 +783,50 @@ impl Machine {
         self.vm.set_clock(clock).map_err(VmmError::Kvm)
     }
 
+    /// Capture the in-kernel interrupt-controller (PIC master/slave + IOAPIC) and PIT
+    /// state for a snapshot (SPEC-1 FR-14). Restored by [`restore_irqchip`] before any
+    /// vCPU runs; without it a resumed/forked guest's interrupt routing (e.g. the COM1
+    /// serial IRQ) is reset to defaults while the guest still expects what it
+    /// programmed, and it oopses in the interrupt path on the first device interrupt.
+    pub fn capture_irqchip(&self) -> Result<IrqChipState> {
+        Ok(IrqChipState {
+            pic_master: self.get_irqchip_bytes(KVM_IRQCHIP_PIC_MASTER)?,
+            pic_slave: self.get_irqchip_bytes(KVM_IRQCHIP_PIC_SLAVE)?,
+            ioapic: self.get_irqchip_bytes(KVM_IRQCHIP_IOAPIC)?,
+            pit: pit_to_bytes(&self.vm.get_pit2().map_err(VmmError::Kvm)?),
+        })
+    }
+
+    /// Restore the in-kernel irqchip + PIT state captured by [`capture_irqchip`]. Must
+    /// run before the vCPU threads start so interrupt routing is in place when guest
+    /// code first touches an interrupt-driven device.
+    pub fn restore_irqchip(&self, state: &IrqChipState) -> Result<()> {
+        self.set_irqchip_bytes(KVM_IRQCHIP_PIC_MASTER, &state.pic_master)?;
+        self.set_irqchip_bytes(KVM_IRQCHIP_PIC_SLAVE, &state.pic_slave)?;
+        self.set_irqchip_bytes(KVM_IRQCHIP_IOAPIC, &state.ioapic)?;
+        self.vm
+            .set_pit2(&pit_from_bytes(&state.pit)?)
+            .map_err(VmmError::Kvm)
+    }
+
+    /// `KVM_GET_IRQCHIP` for one chip, returned as the raw bytes of the whole
+    /// `kvm_irqchip` (chip id + union), which [`set_irqchip_bytes`] feeds back verbatim.
+    fn get_irqchip_bytes(&self, chip_id: u32) -> Result<Vec<u8>> {
+        let mut chip = kvm_irqchip {
+            chip_id,
+            ..Default::default()
+        };
+        self.vm.get_irqchip(&mut chip).map_err(VmmError::Kvm)?;
+        Ok(irqchip_to_bytes(&chip))
+    }
+
+    /// `KVM_SET_IRQCHIP` from bytes produced by [`get_irqchip_bytes`] (the embedded
+    /// `chip_id` selects the chip).
+    fn set_irqchip_bytes(&self, chip_id: u32, bytes: &[u8]) -> Result<()> {
+        let chip = irqchip_from_bytes(chip_id, bytes)?;
+        self.vm.set_irqchip(&chip).map_err(VmmError::Kvm)
+    }
+
     /// Dump all guest RAM regions, in ascending address order, to `path` — the
     /// snapshot `memory_file`. Streamed in 1 MiB chunks so large guests don't need a
     /// full-size host buffer.
@@ -1040,6 +1085,16 @@ impl Machine {
         //    clock does not jump.
         self.restore_clock(&state.clock)?;
 
+        // 3b. Restore the in-kernel irqchip (PIC + IOAPIC) and PIT before any vCPU
+        //     runs, so interrupt routing matches what the (restored) guest programmed.
+        //     The fresh VM's irqchip is otherwise at defaults and the guest oopses in
+        //     the interrupt path on its first interrupt-driven device access. Older
+        //     snapshots without this state carry empty byte vectors — skip those so a
+        //     pre-existing snapshot still restores (just without irqchip fidelity).
+        if !state.irqchip.ioapic.is_empty() {
+            self.restore_irqchip(&state.irqchip)?;
+        }
+
         // 4. Hand the bus to the vCPU threads, restore each vCPU's state, and resume.
         let bus = Arc::new(bus);
         self.bus = Some(bus.clone());
@@ -1076,6 +1131,77 @@ impl Machine {
         }
         Ok(())
     }
+}
+
+/// Serialize a `kvm_irqchip` to its raw bytes for the snapshot state file.
+fn irqchip_to_bytes(chip: &kvm_irqchip) -> Vec<u8> {
+    // SAFETY: `kvm_irqchip` is a fixed-size `repr(C)` POD (a chip id plus a union of
+    // PIC/IOAPIC state); reading `size_of` bytes of it is sound and restorable.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (chip as *const kvm_irqchip).cast::<u8>(),
+            std::mem::size_of::<kvm_irqchip>(),
+        )
+    };
+    bytes.to_vec()
+}
+
+/// Rebuild a `kvm_irqchip` from snapshot bytes, forcing `chip_id` (which selects the
+/// chip for `KVM_SET_IRQCHIP`) and validating the length.
+fn irqchip_from_bytes(chip_id: u32, bytes: &[u8]) -> Result<kvm_irqchip> {
+    let want = std::mem::size_of::<kvm_irqchip>();
+    if bytes.len() != want {
+        return Err(VmmError::Device(format!(
+            "snapshot irqchip state is {} bytes, expected {want}",
+            bytes.len()
+        )));
+    }
+    let mut chip = kvm_irqchip::default();
+    // SAFETY: `kvm_irqchip` is POD; copy exactly `size_of` bytes into a zeroed instance
+    // (length checked above).
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            (&mut chip as *mut kvm_irqchip).cast::<u8>(),
+            want,
+        );
+    }
+    chip.chip_id = chip_id;
+    Ok(chip)
+}
+
+/// Serialize a `kvm_pit_state2` to its raw bytes for the snapshot state file.
+fn pit_to_bytes(pit: &kvm_pit_state2) -> Vec<u8> {
+    // SAFETY: `kvm_pit_state2` is a fixed-size `repr(C)` POD.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (pit as *const kvm_pit_state2).cast::<u8>(),
+            std::mem::size_of::<kvm_pit_state2>(),
+        )
+    };
+    bytes.to_vec()
+}
+
+/// Rebuild a `kvm_pit_state2` from snapshot bytes, validating the length.
+fn pit_from_bytes(bytes: &[u8]) -> Result<kvm_pit_state2> {
+    let want = std::mem::size_of::<kvm_pit_state2>();
+    if bytes.len() != want {
+        return Err(VmmError::Device(format!(
+            "snapshot PIT state is {} bytes, expected {want}",
+            bytes.len()
+        )));
+    }
+    let mut pit = kvm_pit_state2::default();
+    // SAFETY: `kvm_pit_state2` is POD; copy exactly `size_of` bytes into a zeroed
+    // instance (length checked above).
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            (&mut pit as *mut kvm_pit_state2).cast::<u8>(),
+            want,
+        );
+    }
+    Ok(pit)
 }
 
 /// Re-activate a restored device's transport from its captured `DeviceState`. A free
