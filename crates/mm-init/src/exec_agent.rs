@@ -85,9 +85,6 @@ mod linux {
             if conn < 0 {
                 continue;
             }
-            // Diagnostic (fork exec-independence bring-up): confirm the guest agent
-            // accepted a host connection after a snapshot/fork resume.
-            eprintln!("mm-init: exec agent: accepted connection");
             // One thread per connection so concurrent execs don't block each other.
             std::thread::spawn(move || handle_connection(conn));
         }
@@ -109,11 +106,7 @@ mod linux {
                     timeout_ms,
                 } = frame
                 {
-                    // Diagnostic (fork exec-independence bring-up): confirm the Exec
-                    // frame reached the guest agent over the restored vsock.
-                    eprintln!("mm-init: exec agent: received Exec cmd={cmd:?}");
                     handle_exec(&mut stream, id, &cmd, timeout_ms);
-                    eprintln!("mm-init: exec agent: finished Exec cmd={cmd:?}");
                 }
             }
             match stream.read(&mut chunk) {
@@ -135,12 +128,8 @@ mod linux {
             );
             return;
         };
-        eprintln!("mm-init: exec agent: spawning {cmd:?}");
         let mut child = match command.spawn() {
-            Ok(c) => {
-                eprintln!("mm-init: exec agent: spawned {cmd:?}");
-                c
-            }
+            Ok(c) => c,
             Err(e) => {
                 eprintln!("mm-init: exec agent: spawn failed: {e}");
                 send(
@@ -183,11 +172,6 @@ mod linux {
             std::thread::sleep(Duration::from_millis(5));
         };
 
-        // Diagnostic (fork exec-independence bring-up): the command finished and its
-        // output readers joined; the only thing left is writing the Exit frame back to
-        // the host. If "sending Exit" prints but "finished Exec" does not, the
-        // guest->host vsock write is what blocks after a snapshot/fork resume.
-        eprintln!("mm-init: exec agent: command done (timed_out={timed_out}); sending Exit");
         let _ = out.join();
         let _ = err.join();
 
@@ -199,7 +183,6 @@ mod linux {
         let mut w = writer.lock().expect("writer mutex");
         let _ = w.write_all(&encode(&Frame::Exit { id, code }));
         let _ = w.flush();
-        eprintln!("mm-init: exec agent: Exit frame written code={code}");
     }
 
     /// Spawn a thread that reads `source` to EOF, forwarding each chunk as an

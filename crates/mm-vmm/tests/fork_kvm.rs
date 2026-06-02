@@ -256,3 +256,68 @@ fn forked_child_is_execable_over_its_vsock_bridge() {
     child.shutdown().expect("stop forked child");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// In-guest fork exec-independence (SPEC-1 FR-15): fork several children, write a
+/// distinct marker into each child's guest filesystem *via `exec`*, then read every
+/// child back — each must see only its own value. The write-all-then-read-all order is
+/// what makes a cross-child bleed (shared guest RAM/fs from a broken CoW fork) show up:
+/// a leak would surface a sibling's marker on read-back. This is the end-to-end
+/// counterpart of the host-level CoW-isolation check above, exercised through a real
+/// command run inside each live child.
+#[test]
+#[ignore = "requires /dev/kvm and fixtures"]
+fn forked_children_have_independent_guest_state() {
+    let cfg = fixture_config();
+    cfg.validate().unwrap();
+
+    let mut parent = Machine::boot(&cfg).expect("parent boots");
+    assert!(
+        parent
+            .wait_for_ready(Duration::from_secs(10))
+            .expect("readiness poll"),
+        "parent reached userspace"
+    );
+    let dir = scratch_dir("exec-independence");
+    let manifest = snapshot(&mut parent, &dir).expect("snapshot the warm parent");
+    drop(parent);
+
+    let state = load_state(&dir, &manifest).expect("load snapshot state");
+    let mem_path = dir.join(&manifest.memory_file);
+
+    const N: usize = 3;
+    // Fork N children, each with its own host vsock bridge, all resident at once.
+    let mut children: Vec<(Machine, PathBuf)> = Vec::with_capacity(N);
+    for i in 0..N {
+        let uds = dir.join(format!("child-{i}.sock"));
+        let child = fork_bridged_child(&cfg, &state, &mem_path, &uds);
+        children.push((child, uds));
+    }
+
+    // Phase 1: write a distinct marker into each child's guest filesystem.
+    for (i, (_, uds)) in children.iter().enumerate() {
+        let value = format!("CHILD-{i}");
+        let w = exec_marker(uds, &["write", value.as_str()]);
+        assert_eq!(
+            w.exit_code,
+            0,
+            "child {i} marker write failed (stderr: {})",
+            String::from_utf8_lossy(&w.stderr)
+        );
+    }
+
+    // Phase 2: read every child back — each must see ONLY its own value.
+    for (i, (_, uds)) in children.iter().enumerate() {
+        let r = exec_marker(uds, &["read"]);
+        assert_eq!(r.exit_code, 0, "child {i} marker read failed");
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout),
+            format!("CHILD-{i}"),
+            "child {i} must read back its own marker — no cross-child bleed"
+        );
+    }
+
+    for (mut child, _) in children {
+        child.shutdown().expect("stop forked child");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
