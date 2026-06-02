@@ -43,18 +43,65 @@ below is verified by its own integration job in CI.
 
 This is pre-1.0 (`0.0.0`); interfaces may change.
 
-## Platform requirements
+## Requirements
 
 The VMM core runs on **Linux with KVM** (`/dev/kvm`); microVMs cannot boot on other
 platforms. The cross-platform crates (configuration, API types, the CLI's remote mode,
 pure logic) build and test on macOS too, but anything that boots a guest must run on a
 Linux/KVM host.
 
-- Rust (pinned via `rust-toolchain.toml`)
-- A Linux/KVM host for booting microVMs
-- For the cluster control plane: PostgreSQL
-- For local KVM integration tests: a guest kernel + minimal rootfs
-  (`scripts/fetch-test-fixtures.sh` provisions them)
+### Toolchain
+
+- **Rust** — stable, with `rustfmt` and `clippy`. `rust-toolchain.toml` pins the channel
+  and components, so `rustup` installs the right toolchain automatically on first build.
+  It also declares the `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl` targets
+  used to build the static guest binaries.
+- **Node ≥ 20** and **pnpm ≥ 9** — only for the JS/TS workspace (`package.json` `engines`).
+- A protobuf compiler is **not** required: `mm-proto` builds the gRPC contract with a
+  vendored `protoc`.
+
+### Runtime (booting microVMs, on Linux)
+
+- Access to `/dev/kvm`, and root (or `CAP_NET_ADMIN` + `CAP_SYS_ADMIN`) to create the
+  host bridge/TAP and jail the VMM worker.
+- A guest kernel (point `MM_KERNEL` at it, or place a `vmlinux` under the state root).
+- **PostgreSQL** — for the cluster control plane (`mm-controller`); CI runs against
+  PostgreSQL 16. Building the controller does not need a database; running it does.
+
+### Building guest fixtures / the OCI flow (Debian/Ubuntu package names)
+
+- `musl-tools` (provides `musl-gcc`) — static guest binaries (`mm-init`, dropbear).
+- `e2fsprogs` (provides `mke2fs`) — build the guest `ext4` rootfs.
+- `skopeo` — pull OCI images; **umoci** — unpack them (released static binary, not in apt).
+- `openssl` — dev mTLS certs (`scripts/dev-certs.sh`); `curl`, `tar`, `make`, `file` — fetch/build helpers.
+
+## Install (build from source)
+
+There are no published binaries yet; build from source. On a Debian/Ubuntu Linux host:
+
+```bash
+# 1. System dependencies for the guest-image / OCI build path.
+sudo apt-get update
+sudo apt-get install -y musl-tools e2fsprogs skopeo openssl curl tar make file
+# umoci is not packaged in apt — install the released static binary:
+sudo curl -fsSL -o /usr/local/bin/umoci \
+  https://github.com/opencontainers/umoci/releases/download/v0.4.7/umoci.amd64
+sudo chmod 0755 /usr/local/bin/umoci
+
+# 2. Rust toolchain — rustup reads rust-toolchain.toml and installs the pinned
+#    stable channel, components, and musl targets on the first cargo invocation.
+#    (Install rustup from https://rustup.rs if you don't have it.)
+
+# 3. Clone and build the workspace.
+git clone https://github.com/layerdynamics/micro_machines.git
+cd micro_machines
+cargo build --workspace --release
+```
+
+The binaries land in `target/release/`: `mm` (CLI), `mm-controller`, `mm-agent`.
+
+On macOS you can build and test the cross-platform crates (`cargo build -p mm`,
+`cargo test --workspace`), but booting a microVM requires a Linux/KVM host.
 
 ## Quickstart (single host)
 
