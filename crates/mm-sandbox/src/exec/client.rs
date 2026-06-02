@@ -126,13 +126,30 @@ pub fn run_exec_over_uds_ready(
     ready_timeout: Duration,
 ) -> std::io::Result<ExecResult> {
     let mut stream = connect_exec_ready(uds_path, port, ready_timeout)?;
+    // Bound the command phase: if the guest stalls after the handshake (produces no
+    // output and never sends its terminal Exit frame), the host must not block forever.
+    stream.set_read_timeout(Some(command_read_timeout(timeout_ms)))?;
     run_exec(&mut stream, id, cmd, timeout_ms)
 }
 
+/// Grace added to a command's own timeout to bound how long the host will wait for
+/// guest data (output or the terminal Exit frame) before giving up.
+const COMMAND_READ_GRACE: Duration = Duration::from_secs(5);
+
+/// How long a single read in the command phase may block waiting for guest data. The
+/// command's own `timeout_ms` (which the guest agent enforces) plus a grace for the
+/// terminal Exit frame. Used as the stream read timeout so a guest that stalls
+/// mid-command fails the exec instead of hanging the host (the bug that left the
+/// forked-child exec test stuck after a successful handshake).
+pub fn command_read_timeout(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms).saturating_add(COMMAND_READ_GRACE)
+}
+
 /// Connect to the host vsock bridge at `uds_path` and complete the guest handshake to
-/// `port`, retrying connect+handshake until `ready_timeout` elapses. Returns a stream
-/// ready for [`run_exec`]/[`run_exec_streaming`] (with no read timeout — the command
-/// phase blocks, since the guest agent enforces the command's own `timeout_ms`).
+/// `port`, retrying connect+handshake until `ready_timeout` elapses. Returns a
+/// connected, handshaken stream with no read timeout set — the caller should apply a
+/// command-phase read timeout (see [`command_read_timeout`]) before
+/// [`run_exec`]/[`run_exec_streaming`] so a stalled guest cannot block the host.
 ///
 /// `ready_timeout` of [`Duration::ZERO`] makes exactly one attempt (still bounded by
 /// the per-attempt handshake timeout, so it cannot hang).

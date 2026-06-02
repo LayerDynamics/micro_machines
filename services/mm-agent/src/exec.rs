@@ -12,7 +12,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use mm_proto::machine_service_client::MachineServiceClient;
 use mm_proto::{ExecChunk, ExecTask};
-use mm_sandbox::exec::{connect_exec_ready, run_exec_streaming, ExecEvent, EXEC_PORT};
+use mm_sandbox::exec::{
+    command_read_timeout, connect_exec_ready, run_exec_streaming, ExecEvent, EXEC_PORT,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
@@ -141,6 +143,15 @@ fn produce_chunks(target: Target, request_id: &str, tx: mpsc::Sender<ExecChunk>)
             return;
         }
     };
+    // Bound the command phase so a guest that stalls after the handshake cannot block
+    // this worker forever (the connect retry only bounds the handshake).
+    if let Err(e) = stream.set_read_timeout(Some(command_read_timeout(timeout_ms))) {
+        let _ = tx.blocking_send(terminal_error(
+            request_id,
+            &format!("setting exec read timeout: {e}"),
+        ));
+        return;
+    }
 
     let mut sent_terminal = false;
     let run = run_exec_streaming(&mut stream, GUEST_EXEC_ID, &cmd, timeout_ms, |event| {
