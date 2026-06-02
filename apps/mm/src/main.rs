@@ -76,9 +76,7 @@ fn main() -> anyhow::Result<()> {
             Command::Ssh(_) => {
                 anyhow::bail!("`mm ssh` is not available in cluster mode; ssh to the host or use the guest IP from `mm --server ... ps`")
             }
-            Command::Exec(_) => {
-                anyhow::bail!("`mm exec` is not available in cluster mode yet (Task 55); run it on the host that owns the machine")
-            }
+            Command::Exec(args) => commands::remote::exec(&client, args),
             Command::Worker(_) => unreachable!("handled above"),
         };
     }

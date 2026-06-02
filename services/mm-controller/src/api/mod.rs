@@ -32,6 +32,9 @@ pub struct AppState {
     pub store: Store,
     pub verifier: Arc<JwtVerifier>,
     pub metrics: Arc<Metrics>,
+    /// Routes cluster exec (FR-13) to the agent owning the target machine's host. The
+    /// same [`ExecDispatcher`] instance is shared with the gRPC `MachineService`.
+    pub exec: crate::grpc::ExecDispatcher,
 }
 
 /// API error → HTTP status. Unauthenticated requests get 401, RBAC denials 403,
@@ -43,6 +46,9 @@ pub enum ApiError {
     NotFound,
     Conflict(String),
     BadRequest(String),
+    /// A transient inability to serve the request (e.g. cluster exec when no agent is
+    /// currently connected for the machine's host) — the caller may retry.
+    ServiceUnavailable(String),
     Internal(String),
 }
 
@@ -54,6 +60,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            ApiError::ServiceUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
         };
         (status, Json(json!({ "error": msg }))).into_response()
@@ -93,6 +100,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1alpha1/namespaces/:ns/machines/:name/stop",
             post(machines::stop),
+        )
+        .route(
+            "/v1alpha1/namespaces/:ns/machines/:name/exec",
+            post(machines::exec),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

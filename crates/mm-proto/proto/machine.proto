@@ -11,19 +11,37 @@ service MachineService {
   rpc Delete(MachineRef) returns (Ack);
   rpc Get(MachineRef) returns (Machine);
   rpc WatchAssignments(HostRef) returns (stream Assignment); // controller -> agent
-  // NOTE: cluster exec (controller -> agent -> guest, SPEC-1 FR-13) is Task 55. It
-  // needs a reverse path to the client-only agent (which dials in for assignments
-  // and has no inbound address), so the rpc is added together with that forwarding
-  // design rather than ahead of it. The message contract below is kept ready. The
-  // single-host path (`mm exec`) reaches the guest directly via the host vsock
-  // bridge UDS and needs no control-plane rpc.
+
+  // Cluster exec (controller -> agent -> guest, SPEC-1 FR-13). The agent is
+  // client-only (it dials in and has no inbound address), so exec uses the same
+  // reverse-channel shape as assignments: the agent opens WatchExec and the
+  // controller pushes an ExecTask down it; the agent runs the command against the
+  // local guest's vsock bridge and streams the output back up via ReportExecResult.
+  // A request_id correlates the pushed task with its streamed result, so the
+  // controller can route output back to the waiting REST caller. The single-host
+  // path (`mm exec`) still reaches the guest directly via the host vsock bridge UDS
+  // and needs no control-plane rpc.
+  rpc WatchExec(HostRef) returns (stream ExecTask);        // controller -> agent
+  rpc ReportExecResult(stream ExecChunk) returns (Ack);    // agent -> controller
 }
 
-// Exec wire contract (used by Task 55's cluster exec once the forwarding path lands).
+// An exec command the controller pushes to a host's agent, tagged with a request_id
+// the agent echoes on every ExecChunk so the controller can correlate the streamed
+// result with the REST caller that is blocked awaiting it.
+message ExecTask { string request_id = 1; ExecRequest request = 2; }
+
+// Exec wire contract. `cmd` is argv (cmd[0] is the program); `timeout_ms` bounds the
+// command's run time in the guest.
 message ExecRequest { MachineRef ref = 1; repeated string cmd = 2; uint64 timeout_ms = 3; }
 // A streamed exec result: an output chunk (stdout/stderr), or — when `done` — the
-// terminal frame carrying `exit_code`.
-message ExecChunk { string stream = 1; bytes data = 2; int32 exit_code = 3; bool done = 4; }
+// terminal frame carrying `exit_code`. `request_id` echoes the originating ExecTask
+// so the controller routes the chunk to the right waiting caller. `error`, when
+// non-empty on the terminal frame, marks a transport/exec failure (couldn't reach
+// the guest) as distinct from a command that simply exited non-zero.
+message ExecChunk {
+  string stream = 1; bytes data = 2; int32 exit_code = 3; bool done = 4;
+  string request_id = 5; string error = 6;
+}
 
 // HostService: the agent reports capacity/health and machine state transitions.
 service HostService {

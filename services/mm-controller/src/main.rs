@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use mm_controller::api::{self, AppState};
 use mm_controller::auth::JwtVerifier;
-use mm_controller::grpc::{AgentRegistry, HostSvc, MachineSvc};
+use mm_controller::grpc::{AgentRegistry, ExecDispatcher, HostSvc, MachineSvc};
 use mm_controller::store::Store;
 use mm_controller::tls;
 use mm_proto::host_service_server::HostServiceServer;
@@ -75,6 +75,9 @@ async fn main() -> Result<()> {
         .context("applying database migrations")?;
 
     let registry = AgentRegistry::default();
+    // Shared by the REST exec handler (caller side) and the gRPC MachineService
+    // (agent side) so a `mm exec` REST call can be routed to the owning host's agent.
+    let exec = ExecDispatcher::default();
 
     // Build the token verifier: an HS256 secret and/or an OIDC issuer's JWKS
     // (fetched once via the issuer's discovery document). At least one is required.
@@ -101,6 +104,7 @@ async fn main() -> Result<()> {
         store: store.clone(),
         verifier: Arc::new(verifier),
         metrics: Arc::new(mm_controller::metrics::Metrics::new()),
+        exec: exec.clone(),
     };
     let rest_listener = tokio::net::TcpListener::bind(&args.listen)
         .await
@@ -124,6 +128,7 @@ async fn main() -> Result<()> {
         .add_service(MachineServiceServer::new(MachineSvc {
             store: store.clone(),
             registry: registry.clone(),
+            exec: exec.clone(),
         }))
         .add_service(HostServiceServer::new(HostSvc {
             store: store.clone(),

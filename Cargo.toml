@@ -27,6 +27,9 @@ rust-version = "1.74"
 # with `serde = { workspace = true }`. Versions are managed in this single place.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Binary-safe encoding for cluster exec output streamed as NDJSON over HTTP (FR-13):
+# guest stdout/stderr may not be UTF-8, so each chunk's bytes are base64-encoded.
+base64 = "0.22"
 # Compact binary serde for the snapshot state file (vCPU + device state). kvm-bindings'
 # serde support targets binary formats; JSON can choke on its FAM/big-array fields.
 bincode = "1.3"

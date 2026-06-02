@@ -1323,6 +1323,7 @@ name = "mm"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "libc",
  "mm-api-types",
@@ -1353,11 +1354,13 @@ dependencies = [
  "mm-image",
  "mm-net",
  "mm-proto",
+ "mm-sandbox",
  "prost",
  "redb",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",
@@ -1380,6 +1383,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "clap",
  "futures",
  "hdrhistogram",

@@ -20,12 +20,14 @@ mm-host = { path = "../../crates/mm-host" }   # shared launch + jailed-worker bo
 mm-proto = { path = "../../crates/mm-proto" } # controller<->agent gRPC contract
 mm-net = { path = "../../crates/mm-net" }     # TAP teardown on destroy
 mm-image = { path = "../../crates/mm-image" } # overlay teardown on destroy
+mm-sandbox = { path = "../../crates/mm-sandbox" } # streaming exec client over the vsock bridge
 
 serde = { workspace = true }
 serde_json = { workspace = true }
 redb = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["net"] } # ReceiverStream for the exec report stream
 tonic = { workspace = true }
 prost = { workspace = true }
 clap = { workspace = true, features = ["env"] }

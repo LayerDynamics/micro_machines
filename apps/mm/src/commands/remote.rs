@@ -153,6 +153,68 @@ pub fn rm(client: &RemoteClient, args: RmArgs) -> Result<()> {
     Ok(())
 }
 
+/// `mm exec` in cluster mode (SPEC-1 FR-13): POST the command to the controller and
+/// stream its newline-delimited JSON response, mirroring the guest's stdout/stderr to
+/// ours and exiting with the guest command's exit code — the cluster counterpart of
+/// the single-host [`crate::commands::exec::run`].
+pub fn exec(client: &RemoteClient, args: crate::commands::exec::ExecArgs) -> Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+
+    use base64::Engine;
+
+    let path = format!("{}/exec", machine_path(&client.namespace, &args.name));
+    let body = json!({ "command": args.command, "timeout_ms": args.timeout_ms });
+    let req = client.build(Method::POST, &path, Some(&body))?;
+    let resp = client.http.execute(req).context("contacting controller")?;
+    let status = resp.status().as_u16();
+    if status >= 300 {
+        let v: Value = resp.json().unwrap_or(Value::Null);
+        bail!("controller returned {status}: {v}");
+    }
+
+    // The body is one JSON object per line: output chunks, then a terminal frame.
+    let reader = BufReader::new(resp);
+    let mut exit_code: i32 = -1;
+    let mut saw_terminal = false;
+    for line in reader.lines() {
+        let line = line.context("reading exec stream")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let chunk: Value = serde_json::from_str(&line).context("parsing exec chunk")?;
+        // A transport/exec failure reported by the controller or agent.
+        if let Some(err) = chunk.get("error").and_then(Value::as_str) {
+            bail!("exec failed: {err}");
+        }
+        // The terminal frame carries the command's exit code.
+        if chunk.get("done").and_then(Value::as_bool).unwrap_or(false) {
+            exit_code = chunk.get("exit_code").and_then(Value::as_i64).unwrap_or(-1) as i32;
+            saw_terminal = true;
+            break;
+        }
+        // An output chunk: base64-decoded bytes for one of the standard streams.
+        if let Some(data_b64) = chunk.get("data").and_then(Value::as_str) {
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(data_b64)
+                .context("decoding exec output")?;
+            match chunk.get("stream").and_then(Value::as_str) {
+                Some("stderr") => {
+                    std::io::stderr().write_all(&data)?;
+                    std::io::stderr().flush()?;
+                }
+                _ => {
+                    std::io::stdout().write_all(&data)?;
+                    std::io::stdout().flush()?;
+                }
+            }
+        }
+    }
+    if !saw_terminal {
+        bail!("exec stream ended before the guest reported an exit code");
+    }
+    std::process::exit(exit_code);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -5,7 +5,8 @@
 //! `<state_root>/jails/<name>/vsock.sock`. `mm exec` connects to that socket, speaks
 //! the `CONNECT <port>\n` handshake, then streams the command's stdout/stderr back
 //! and exits with the guest command's exit code — no SSH, no in-guest setup. (The
-//! cluster path, controller -> agent -> guest, is Task 55.)
+//! cluster path, controller -> agent -> guest, lives in [`crate::commands::remote::exec`]
+//! and is used automatically when `--server` is set.)
 use std::io::Write;
 
 use anyhow::{Context, Result};

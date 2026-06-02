@@ -12,12 +12,14 @@
 //! single-threaded.
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mm_agent::actuator::{self, BootRequest, HostConfig};
 use mm_agent::capacity::{self, HostResources, Reservation};
+use mm_agent::exec;
 use mm_agent::local_store::LocalStore;
 use mm_proto::host_service_client::HostServiceClient;
 use mm_proto::machine_service_client::MachineServiceClient;
@@ -94,7 +96,8 @@ fn main() -> Result<()> {
 
 /// Run the agent: maintain a session with the controller, reconnecting forever.
 async fn run_agent(args: AgentArgs) -> Result<()> {
-    let store = LocalStore::open(args.state_root.join("agent.redb"))?;
+    // Shared (Arc) so the concurrent exec handler tasks can hold the registry too.
+    let store = Arc::new(LocalStore::open(args.state_root.join("agent.redb"))?);
     let host = HostConfig {
         state_root: args.state_root.clone(),
         kernel_path: args.kernel.clone(),
@@ -117,7 +120,7 @@ async fn run_agent(args: AgentArgs) -> Result<()> {
 /// One controller session: connect, report capacity, heartbeat, and process the
 /// assignment stream until it ends or errors.
 async fn serve_once(
-    store: &LocalStore,
+    store: &Arc<LocalStore>,
     host: &HostConfig,
     host_res: HostResources,
     args: &AgentArgs,
@@ -174,6 +177,56 @@ async fn serve_once(
         }
     }
     let _guard = AbortOnDrop(heartbeat);
+
+    // Cluster exec (FR-13): open the WatchExec reverse channel and handle pushed tasks
+    // concurrently with assignments. Spawned so a long-running exec never blocks the
+    // assignment loop; torn down with the session so a reconnect re-establishes it.
+    let exec_handler = {
+        let mut machines = machines.clone();
+        let store = store.clone();
+        let host = host.clone();
+        let host_id = args.host_id.clone();
+        tokio::spawn(async move {
+            let mut stream = match machines
+                .watch_exec(HostRef {
+                    host_id: host_id.clone(),
+                })
+                .await
+            {
+                Ok(s) => s.into_inner(),
+                Err(e) => {
+                    tracing::warn!("opening exec stream: {e}");
+                    return;
+                }
+            };
+            loop {
+                match stream.message().await {
+                    Ok(Some(task)) => {
+                        // Handle each task on its own so concurrent execs don't block.
+                        // These are detached: an exec in flight when the session ends
+                        // is not aborted with `_exec_guard` — it simply errors on its
+                        // now-dead report channel and logs, which is harmless.
+                        let mut machines = machines.clone();
+                        let store = store.clone();
+                        let host = host.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                exec::run_and_report(&mut machines, &store, &host, task).await
+                            {
+                                tracing::warn!("cluster exec failed: {e}");
+                            }
+                        });
+                    }
+                    Ok(None) => break, // controller closed the exec stream
+                    Err(e) => {
+                        tracing::warn!("exec stream error: {e}");
+                        break;
+                    }
+                }
+            }
+        })
+    };
+    let _exec_guard = AbortOnDrop(exec_handler);
 
     let mut stream = machines
         .watch_assignments(HostRef {

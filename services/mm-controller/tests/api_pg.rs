@@ -99,6 +99,7 @@ async fn rest_crud_roundtrip_and_cross_namespace_is_denied() {
         store,
         verifier: Arc::new(JwtVerifier::hs256(SECRET)),
         metrics: Arc::new(mm_controller::metrics::Metrics::new()),
+        exec: mm_controller::grpc::ExecDispatcher::default(),
     };
     let app = router(state);
 

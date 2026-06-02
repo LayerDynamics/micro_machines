@@ -54,14 +54,18 @@ pub enum Verb {
     Create,
     Update,
     Delete,
+    /// Run a command inside a running machine's guest (cluster exec, FR-13). An
+    /// operator-level action: it mutates guest state but does not create or destroy
+    /// the machine resource itself.
+    Exec,
 }
 
 /// The minimum role required for a verb. Reads (Get/List) need a viewer; mutations
-/// (Create/Update) need an operator; destruction (Delete) needs an admin.
+/// (Create/Update) and exec need an operator; destruction (Delete) needs an admin.
 fn required(verb: Verb) -> Role {
     match verb {
         Verb::Get | Verb::List => Role::Viewer,
-        Verb::Create | Verb::Update => Role::Operator,
+        Verb::Create | Verb::Update | Verb::Exec => Role::Operator,
         Verb::Delete => Role::Admin,
     }
 }
@@ -132,6 +136,21 @@ mod tests {
             Some(("team-a", Role::Operator)),
             "team-a",
             Verb::Delete
+        ));
+    }
+
+    #[test]
+    fn operator_can_exec_viewer_cannot() {
+        // Exec runs a command in the guest — an operator action, denied to viewers.
+        assert!(authorize(
+            Some(("team-a", Role::Operator)),
+            "team-a",
+            Verb::Exec
+        ));
+        assert!(!authorize(
+            Some(("team-a", Role::Viewer)),
+            "team-a",
+            Verb::Exec
         ));
     }
 

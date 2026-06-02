@@ -124,6 +124,42 @@ if [ "$booted" != 1 ]; then
 fi
 echo "PASS: c1 booted on the agent via the cluster"
 
+# --- 3.5 cluster exec: controller -> agent -> guest (FR-13) ----------------
+# Run here, right after boot: a successful boot proves the agent is connected and
+# processing its streams, so there is no reconnection race (the post-restart survival
+# of the reverse channel is checked separately in step 4.5, with a retry).
+echo "testing cluster exec (controller -> agent -> guest)..."
+out="$(mm exec c1 echo hello-from-guest)"
+echo "exec stdout: [$out]"
+if ! echo "$out" | grep -q "hello-from-guest"; then
+  echo "FAIL: cluster exec did not return the guest command's stdout" >&2
+  cat "$STATE"/jails/*/console.log 2>/dev/null || true
+  exit 1
+fi
+echo "PASS: cluster exec returned the guest's stdout"
+
+# A non-zero guest exit code must propagate all the way back to the client.
+set +e
+mm exec c1 sh -c 'exit 7' >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" != 7 ]; then
+  echo "FAIL: cluster exec did not propagate exit code 7 (got $rc)" >&2
+  exit 1
+fi
+echo "PASS: cluster exec propagated the guest's non-zero exit code"
+
+# An exec against an unknown machine must fail fast (not hang) with a non-zero exit.
+set +e
+mm exec no-such-machine true >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" = 0 ]; then
+  echo "FAIL: cluster exec against a missing machine unexpectedly succeeded" >&2
+  exit 1
+fi
+echo "PASS: cluster exec against a missing machine failed fast (rc=$rc)"
+
 # --- 4. restart the controller; the running VM must survive (NFR-R2) -------
 kill "$CTRL_PID"; wait "$CTRL_PID" 2>/dev/null || true
 CTRL_PID=""
@@ -139,6 +175,25 @@ else
   echo "FAIL: c1 not Running after controller restart" >&2
   exit 1
 fi
+
+# --- 4.5 cluster exec survives the controller restart ----------------------
+# The agent re-opens its WatchExec stream against the restarted controller on
+# reconnect (~5s). Retry until the reverse channel is back rather than racing that
+# sleep — proving the exec path re-establishes, not just the VM.
+exec_ok=0
+for _ in $(seq 1 30); do
+  if out="$(mm exec c1 echo exec-after-restart 2>/dev/null)" \
+     && echo "$out" | grep -q "exec-after-restart"; then
+    exec_ok=1
+    break
+  fi
+  sleep 2
+done
+if [ "$exec_ok" != 1 ]; then
+  echo "FAIL: cluster exec did not recover after the controller restart" >&2
+  exit 1
+fi
+echo "PASS: cluster exec reverse channel survived the controller restart"
 
 # --- 5. remove it ----------------------------------------------------------
 mm rm c1

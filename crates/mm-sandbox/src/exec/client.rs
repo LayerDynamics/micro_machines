@@ -16,6 +16,22 @@ pub struct ExecResult {
     pub stderr: Vec<u8>,
 }
 
+/// An incremental exec event, yielded by [`run_exec_streaming`] as the guest produces
+/// it: an output chunk on one of the standard streams, or the terminal exit code.
+/// Cluster exec forwards these up to the controller as they arrive (SPEC-1 FR-13),
+/// so output is not buffered end-to-end; the single-host path collects them back into
+/// an [`ExecResult`] via [`run_exec`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecEvent {
+    /// Bytes written to the guest command's stdout.
+    Stdout(Vec<u8>),
+    /// Bytes written to the guest command's stderr.
+    Stderr(Vec<u8>),
+    /// The terminal frame: the command's exit code (or -1 if the stream closed
+    /// before the guest sent an `Exit`).
+    Exit(i32),
+}
+
 /// Perform the firecracker-style hybrid vsock handshake on a freshly-connected host
 /// Unix-domain stream: request a connection to guest vsock `port`, then await the
 /// `OK <port>\n` acknowledgement. Reads one byte at a time so it stops exactly at the
@@ -86,6 +102,37 @@ pub fn run_exec<S: Read + Write>(
     cmd: &[String],
     timeout_ms: u64,
 ) -> std::io::Result<ExecResult> {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_code = -1;
+    run_exec_streaming(stream, id, cmd, timeout_ms, |event| {
+        match event {
+            ExecEvent::Stdout(data) => stdout.extend_from_slice(&data),
+            ExecEvent::Stderr(data) => stderr.extend_from_slice(&data),
+            ExecEvent::Exit(code) => exit_code = code,
+        }
+        Ok(())
+    })?;
+    Ok(ExecResult {
+        exit_code,
+        stdout,
+        stderr,
+    })
+}
+
+/// Run `cmd` over an already-connected `stream`, invoking `on_event` for each output
+/// chunk and the terminal exit code *as the guest produces them* — the streaming core
+/// that [`run_exec`] collects into an [`ExecResult`]. Frames for other request ids are
+/// ignored (so the channel may be shared). If the stream closes before an `Exit`, a
+/// final `ExecEvent::Exit(-1)` is delivered so every caller observes a terminal event.
+/// Returns early if `on_event` errors (e.g. the downstream consumer hung up).
+pub fn run_exec_streaming<S: Read + Write>(
+    stream: &mut S,
+    id: u64,
+    cmd: &[String],
+    timeout_ms: u64,
+    mut on_event: impl FnMut(ExecEvent) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     stream.write_all(&encode(&Frame::Exec {
         id,
         cmd: cmd.to_vec(),
@@ -95,8 +142,6 @@ pub fn run_exec<S: Read + Write>(
 
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
 
     loop {
         while let Some((frame, consumed)) = decode(&buf) {
@@ -106,28 +151,26 @@ pub fn run_exec<S: Read + Write>(
                     id: fid,
                     stream: which,
                     data,
-                } if fid == id => match which {
-                    Stream::Stdout => stdout.extend_from_slice(&data),
-                    Stream::Stderr => stderr.extend_from_slice(&data),
-                },
+                } if fid == id => {
+                    let event = match which {
+                        Stream::Stdout => ExecEvent::Stdout(data),
+                        Stream::Stderr => ExecEvent::Stderr(data),
+                    };
+                    on_event(event)?;
+                }
                 Frame::Exit { id: fid, code } if fid == id => {
-                    return Ok(ExecResult {
-                        exit_code: code,
-                        stdout,
-                        stderr,
-                    });
+                    on_event(ExecEvent::Exit(code))?;
+                    return Ok(());
                 }
                 _ => {} // a frame for another request id, or an unexpected Exec — skip
             }
         }
         let n = stream.read(&mut chunk)?;
         if n == 0 {
-            // Peer closed before sending Exit — surface what we have.
-            return Ok(ExecResult {
-                exit_code: -1,
-                stdout,
-                stderr,
-            });
+            // Peer closed before sending Exit — deliver a terminal event so the
+            // consumer always sees an exit code (parity with run_exec's -1).
+            on_event(ExecEvent::Exit(-1))?;
+            return Ok(());
         }
         buf.extend_from_slice(&chunk[..n]);
     }
@@ -208,6 +251,93 @@ mod tests {
                 cmd: vec!["echo".into(), "hello world".into()],
                 timeout_ms: 5000,
             }
+        );
+    }
+
+    #[test]
+    fn streaming_yields_events_in_order_then_exit() {
+        let mut guest = MockGuest::new(&[
+            Frame::Output {
+                id: 1,
+                stream: Stream::Stdout,
+                data: b"a".to_vec(),
+            },
+            Frame::Output {
+                id: 1,
+                stream: Stream::Stderr,
+                data: b"e".to_vec(),
+            },
+            Frame::Output {
+                id: 1,
+                stream: Stream::Stdout,
+                data: b"b".to_vec(),
+            },
+            Frame::Exit { id: 1, code: 2 },
+        ]);
+        let mut events = Vec::new();
+        run_exec_streaming(&mut guest, 1, &["x".into()], 1000, |ev| {
+            events.push(ev);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                ExecEvent::Stdout(b"a".to_vec()),
+                ExecEvent::Stderr(b"e".to_vec()),
+                ExecEvent::Stdout(b"b".to_vec()),
+                ExecEvent::Exit(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn streaming_delivers_terminal_exit_on_early_close() {
+        let mut guest = MockGuest::new(&[Frame::Output {
+            id: 1,
+            stream: Stream::Stdout,
+            data: b"partial".to_vec(),
+        }]);
+        let mut events = Vec::new();
+        run_exec_streaming(&mut guest, 1, &["x".into()], 1000, |ev| {
+            events.push(ev);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![ExecEvent::Stdout(b"partial".to_vec()), ExecEvent::Exit(-1)]
+        );
+    }
+
+    #[test]
+    fn streaming_stops_when_consumer_errors() {
+        let mut guest = MockGuest::new(&[
+            Frame::Output {
+                id: 1,
+                stream: Stream::Stdout,
+                data: b"first".to_vec(),
+            },
+            Frame::Output {
+                id: 1,
+                stream: Stream::Stdout,
+                data: b"second".to_vec(),
+            },
+            Frame::Exit { id: 1, code: 0 },
+        ]);
+        let mut seen = 0;
+        let err = run_exec_streaming(&mut guest, 1, &["x".into()], 1000, |_ev| {
+            seen += 1;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "consumer hung up",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            seen, 1,
+            "stops at the first event after the consumer errors"
         );
     }
 

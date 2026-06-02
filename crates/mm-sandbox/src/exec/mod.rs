@@ -9,5 +9,7 @@ pub mod protocol;
 /// targets. Shared so the host side and the guest agent (`mm-init`) cannot drift.
 pub const EXEC_PORT: u32 = 1025;
 
-pub use client::{run_exec, run_exec_over_uds, vsock_connect, ExecResult};
+pub use client::{
+    run_exec, run_exec_over_uds, run_exec_streaming, vsock_connect, ExecEvent, ExecResult,
+};
 pub use protocol::{decode, encode, Frame, Stream};
