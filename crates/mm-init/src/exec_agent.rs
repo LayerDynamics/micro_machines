@@ -85,6 +85,9 @@ mod linux {
             if conn < 0 {
                 continue;
             }
+            // Diagnostic (fork exec-independence bring-up): confirm the guest agent
+            // accepted a host connection after a snapshot/fork resume.
+            eprintln!("mm-init: exec agent: accepted connection");
             // One thread per connection so concurrent execs don't block each other.
             std::thread::spawn(move || handle_connection(conn));
         }
@@ -106,7 +109,11 @@ mod linux {
                     timeout_ms,
                 } = frame
                 {
+                    // Diagnostic (fork exec-independence bring-up): confirm the Exec
+                    // frame reached the guest agent over the restored vsock.
+                    eprintln!("mm-init: exec agent: received Exec cmd={cmd:?}");
                     handle_exec(&mut stream, id, &cmd, timeout_ms);
+                    eprintln!("mm-init: exec agent: finished Exec cmd={cmd:?}");
                 }
             }
             match stream.read(&mut chunk) {
