@@ -329,10 +329,10 @@ impl Vcpu {
     }
 }
 
-/// MSRs captured/restored across a snapshot: the SYSENTER/SYSCALL targets, the TSC,
-/// MISC_ENABLE, and the kvm-clock paravirt-clock MSRs the guest relies on (the guest
-/// is configured to use kvm-clock in `build_cpuid`). EFER and the FS/GS bases live in
-/// `sregs`, so they are not duplicated here.
+/// MSRs captured/restored across a snapshot: the SYSENTER/SYSCALL targets, the TSC and
+/// its LAPIC TSC-deadline timer, MISC_ENABLE, and the kvm-clock paravirt-clock MSRs the
+/// guest relies on (the guest is configured to use kvm-clock in `build_cpuid`). EFER
+/// and the FS/GS bases live in `sregs`, so they are not duplicated here.
 const SNAPSHOT_MSRS: &[u32] = &[
     MSR_IA32_SYSENTER_CS,
     MSR_IA32_SYSENTER_ESP,
@@ -343,11 +343,17 @@ const SNAPSHOT_MSRS: &[u32] = &[
     MSR_SYSCALL_MASK,
     MSR_KERNEL_GS_BASE,
     MSR_IA32_TSC,
+    MSR_IA32_TSC_DEADLINE,
     MSR_IA32_MISC_ENABLE,
     MSR_KVM_WALL_CLOCK_NEW,
     MSR_KVM_SYSTEM_TIME_NEW,
 ];
 
+/// The LAPIC TSC-deadline timer (the armed deadline at which KVM injects the next
+/// timer interrupt). Linux on KVM uses TSC-deadline timer mode, so without restoring
+/// this a resumed/forked guest gets no timer interrupt — `nanosleep`/the scheduler
+/// tick stall — which manifests as any guest code that sleeps hanging after a fork.
+const MSR_IA32_TSC_DEADLINE: u32 = 0x0000_06e0;
 /// kvm-clock paravirt-clock MSRs (the guest programs these to find its clock pages).
 const MSR_KVM_WALL_CLOCK_NEW: u32 = 0x4b56_4d00;
 const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
