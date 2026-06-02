@@ -1241,17 +1241,68 @@ fn cpuid_hash(kvm: &Kvm) -> Result<u64> {
     let cpuid = kvm
         .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
         .map_err(VmmError::Kvm)?;
+
+    // The fingerprint must be identical for two calls on the *same* host — otherwise a
+    // same-host snapshot→restore round trip wrongly trips the cross-host guard (it did:
+    // `snapshot_restore_round_trip_preserves_state` failed with two different hashes).
+    // Two sources of same-host instability are canonicalized away here so both the
+    // snapshot path and `verify_host` derive the identical value from this one place:
+    //
+    //   1. Entry *order*: KVM_GET_SUPPORTED_CPUID does not guarantee a stable order, so
+    //      sort by (function, index) before hashing.
+    //   2. Caller-context *fields*: CPUID leaf 0xD (XSAVE) reports XSAVE-area *sizes* that
+    //      KVM derives from the calling thread's live XCR0/XSS — sub-leaf 0 EBX/ECX and
+    //      sub-leaf 1 EBX. Those are not feature presence and vary with FPU context, so
+    //      zero them. The actual supported-feature bitmaps (EAX/EDX, and every other
+    //      leaf) are kept, so the guard still compares the real CPU feature set.
+    //
+    // NB: this canonicalization changes the hash value, so a fingerprint recorded by an
+    // older build won't match — fine for ephemeral/greenfield snapshots.
+    let mut entries: Vec<[u32; 7]> = cpuid
+        .as_slice()
+        .iter()
+        .map(|e| {
+            let (mut ebx, mut ecx) = (e.ebx, e.ecx);
+            if e.function == 0xD {
+                match e.index {
+                    0 => {
+                        ebx = 0; // XSAVE size for features enabled in the caller's XCR0
+                        ecx = 0; // max XSAVE size (size, redundant with the bitmaps)
+                    }
+                    1 => ebx = 0, // XSAVE size for XCR0|XSS-enabled features
+                    _ => {}
+                }
+            }
+            [e.function, e.index, e.flags, e.eax, ebx, ecx, e.edx]
+        })
+        .collect();
+    entries.sort_unstable();
+
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut h = FNV_OFFSET;
-    for e in cpuid.as_slice() {
-        for word in [e.function, e.index, e.flags, e.eax, e.ebx, e.ecx, e.edx] {
+    for e in &entries {
+        for word in e {
             for b in word.to_le_bytes() {
                 h ^= u64::from(b);
                 h = h.wrapping_mul(FNV_PRIME);
             }
         }
+        // Self-diagnosing (debug builds, incl. `cargo test`): print the exact canonical
+        // leaves hashed. The snapshot and restore-verify streams both land in the same
+        // --nocapture log, so if any field still differs between them it is visible by
+        // eye instead of just re-failing with two opaque hashes.
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "cpuid_fp: fn={:#010x} idx={} flags={:#x} eax={:#010x} ebx={:#010x} ecx={:#010x} edx={:#010x}",
+            e[0], e[1], e[2], e[3], e[4], e[5], e[6]
+        );
     }
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "cpuid_fp: canonical hash = {h:#018x} ({} leaves)",
+        entries.len()
+    );
     Ok(h)
 }
 
