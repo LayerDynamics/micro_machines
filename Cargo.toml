@@ -64,7 +64,9 @@ nix = { version = "0.30", features = ["mount", "sched", "user", "net", "fs", "re
 # userfaultfd: page-fault-driven copy-on-write for fork fan-out (kernel >=5.7 UFFD_WP).
 # tokio-vsock: async host<->guest vsock for the exec client. Both are referenced only
 # from linux-cfg'd tables, so non-Linux hosts never compile them.
-userfaultfd = "0.8"
+# linux5_7 enables UFFDIO_WRITEPROTECT (register/arm/remove write-protection +
+# WriteProtected fault events) — the FR-16 running-BRANCH mechanism.
+userfaultfd = { version = "0.8", features = ["linux5_7"] }
 tokio-vsock = "0.5"
 
 # CLI + observability + ergonomics (cross-platform).

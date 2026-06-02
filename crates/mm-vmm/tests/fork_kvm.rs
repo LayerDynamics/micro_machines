@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 use mm_sandbox::exec::{run_exec_over_uds_ready, ExecResult, EXEC_PORT};
 use mm_vmm::snapshot::{fork_children, load_state, snapshot, ForkPlan};
 use mm_vmm::{BlockDevice, Machine, VmConfig};
+use userfaultfd::{Event, FaultKind, FeatureFlags, RegisterMode, UffdBuilder};
+use vm_memory::GuestMemoryRegion;
 use vm_memory::{Bytes, GuestAddress};
 
 #[cfg(target_arch = "aarch64")]
@@ -320,4 +322,86 @@ fn forked_children_have_independent_guest_state() {
         child.shutdown().expect("stop forked child");
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// FR-16 Phase 0 feasibility probe (docs/plans/2026-06-02-fr16-running-branch-uffd-wp.md):
+/// does userfaultfd write-protect deliver faults for a *running KVM guest's* writes on
+/// this kernel? UFFD_WP on plain host memory is well-supported; on memory a KVM guest
+/// writes via EPT it depends on kernel/KVM support, and that gates the whole
+/// running-BRANCH design. Register the live guest's RAM in write-protect mode, arm
+/// protection, and confirm the guest's own writes raise a `WriteProtected` fault. Each
+/// fault is resolved (protection removed + waiter woken) so the guest never stays
+/// blocked, and all protection is lifted before teardown.
+#[test]
+#[ignore = "requires /dev/kvm and fixtures; FR-16 UFFD_WP feasibility probe"]
+fn uffd_wp_on_live_guest_is_supported() {
+    let cfg = fixture_config();
+    cfg.validate().unwrap();
+    let mut parent = Machine::boot(&cfg).expect("parent boots");
+    assert!(
+        parent
+            .wait_for_ready(Duration::from_secs(10))
+            .expect("readiness poll"),
+        "parent reached userspace"
+    );
+
+    // A non-blocking UFFD that *requires* the WP feature: create() fails loudly on a
+    // kernel without write-protect faults (feasibility = no, cleanly).
+    let uffd = UffdBuilder::new()
+        .require_features(FeatureFlags::PAGEFAULT_FLAG_WP)
+        .non_blocking(true)
+        .create()
+        .expect("create UFFD with PAGEFAULT_FLAG_WP (needs kernel >= 5.7 + uffd perms)");
+
+    // Register every guest RAM region for write faults and arm write-protection.
+    let gm = parent.guest_memory().clone();
+    let regions: Vec<(*mut std::ffi::c_void, usize)> = gm
+        .iter()
+        .map(|r| (r.as_ptr() as *mut std::ffi::c_void, r.len() as usize))
+        .collect();
+    for &(ptr, len) in &regions {
+        uffd.register_with_mode(ptr, len, RegisterMode::WRITE_PROTECT)
+            .expect("register guest RAM for write-protect faults");
+        uffd.write_protect(ptr, len).expect("arm write-protection");
+    }
+
+    // The running guest writes RAM; poll (bounded) for the first WriteProtected fault and
+    // resolve it so the guest proceeds. One fault proves UFFD_WP works on live KVM-guest
+    // memory here. read_event() returns Ok(None) when nothing is ready (non-blocking).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut wp_events = 0u64;
+    while Instant::now() < deadline {
+        match uffd.read_event() {
+            Ok(Some(Event::Pagefault {
+                kind: FaultKind::WriteProtected,
+                addr,
+                ..
+            })) => {
+                wp_events += 1;
+                let page = (addr as usize) & !0xfff;
+                let _ = uffd.remove_write_protection(page as *mut std::ffi::c_void, 0x1000, true);
+                break; // one fault is enough to confirm feasibility
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Lift all protection so no guest write is left blocked, then tear down.
+    for &(ptr, len) in &regions {
+        let _ = uffd.remove_write_protection(ptr, len, true);
+    }
+    drop(uffd);
+    println!(
+        "FR-16 UFFD_WP probe: observed {wp_events} write-protect fault(s) from the live guest"
+    );
+    parent.shutdown().expect("stop parent");
+
+    assert!(
+        wp_events > 0,
+        "no UFFD_WP fault from the running guest's writes — UFFD_WP on live KVM-guest \
+         memory appears unsupported on this kernel; the FR-16 BRANCH design is blocked \
+         (fall back to the proven snapshot-based fork)"
+    );
 }
