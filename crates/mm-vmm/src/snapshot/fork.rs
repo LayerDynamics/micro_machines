@@ -70,6 +70,7 @@ mod tests {
             state_file: "s".into(),
             kind: SnapshotKind::Full,
             parent_uid: None,
+            host: Default::default(),
         }
     }
 

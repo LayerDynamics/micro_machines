@@ -8,7 +8,7 @@ pub mod fork;
 pub mod manifest;
 
 pub use fork::{plan_fork, ForkError, ForkPlan};
-pub use manifest::{SnapshotKind, SnapshotManifest};
+pub use manifest::{HostFingerprint, SnapshotKind, SnapshotManifest};
 
 /// Serializable vCPU + device state (the snapshot `state_file`). Linux-only: it
 /// embeds `kvm_bindings`. The (de)serialization is pure and unit-tested on any Linux

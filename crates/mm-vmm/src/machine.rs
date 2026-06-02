@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 
 use kvm_bindings::{
     kvm_clock_data, kvm_irqchip, kvm_pit_config, kvm_pit_state2, kvm_userspace_memory_region,
-    KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_PIT_SPEAKER_DUMMY,
+    KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_MAX_CPUID_ENTRIES,
+    KVM_PIT_SPEAKER_DUMMY,
 };
 use kvm_ioctls::{Kvm, VmFd};
 use vm_memory::{
@@ -31,6 +32,7 @@ use crate::devices::{
     Balloon, Block, Bus, DevicePause, Interrupt, MmioTransport, Net, SerialDevice, VirtioDevice,
     Vsock, VsockReady, COM1_IRQ,
 };
+use crate::snapshot::manifest::HostFingerprint;
 use crate::snapshot::state::{DeviceState, IrqChipState, QueueCursor, VcpuState, VmState};
 use crate::vcpu::{Vcpu, VcpuRunExit};
 
@@ -895,10 +897,14 @@ impl Machine {
         vcpu_hook: Option<VcpuHook>,
         state: VmState,
         mem_path: &Path,
+        expected_host: &HostFingerprint,
     ) -> Result<Self> {
         // SAFETY: the caller guarantees `kvm_fd` is an open /dev/kvm fd we now own.
         let kvm = unsafe { Kvm::from_raw_fd(kvm_fd) };
         let mut machine = Self::with_resources(config, kvm, tap_fds)?;
+        // Refuse a cross-host restore onto an incompatible CPU before touching guest
+        // state, so the failure is loud and cheap rather than a guest crash mid-run.
+        machine.verify_host(expected_host)?;
         if let Some(fd) = vsock_listener_fd {
             // SAFETY: caller transfers an open, bound, listening UDS fd.
             machine.vsock_listener = Some(unsafe { UnixListener::from_raw_fd(fd) });
@@ -911,10 +917,34 @@ impl Machine {
     /// Restore a snapshot in-process (opens `/dev/kvm` itself), the restore
     /// counterpart to [`boot`](Self::boot). For the non-jailed path (tests, local
     /// single-host restore without inherited fds).
-    pub fn restore(config: &VmConfig, state: VmState, mem_path: &Path) -> Result<Self> {
+    pub fn restore(
+        config: &VmConfig,
+        state: VmState,
+        mem_path: &Path,
+        expected_host: &HostFingerprint,
+    ) -> Result<Self> {
         let mut machine = Self::with_resources(config, Kvm::new()?, Vec::new())?;
+        machine.verify_host(expected_host)?;
         machine.restore_start(state, mem_path)?;
         Ok(machine)
+    }
+
+    /// Hash of this host's KVM-supported CPUID leaves — the guest-visible CPU feature
+    /// set a snapshot taken here is tied to. Recorded in the manifest at snapshot and
+    /// compared at restore (see [`HostFingerprint`]).
+    pub fn cpuid_hash(&self) -> Result<u64> {
+        cpuid_hash(&self.kvm)
+    }
+
+    /// Refuse to restore a snapshot taken on `expected` onto this host if the CPU
+    /// feature sets differ (which would crash the guest). A no-op for a snapshot with
+    /// an unset fingerprint (taken before fingerprinting existed).
+    fn verify_host(&self, expected: &HostFingerprint) -> Result<()> {
+        let live = HostFingerprint {
+            cpuid_hash: cpuid_hash(&self.kvm)?,
+            tsc_khz: 0,
+        };
+        expected.check_restore_onto(&live).map_err(VmmError::Device)
     }
 
     /// Fork a running child microVM from a snapshot via copy-on-write memory
@@ -1202,6 +1232,27 @@ fn pit_from_bytes(bytes: &[u8]) -> Result<kvm_pit_state2> {
         );
     }
     Ok(pit)
+}
+
+/// FNV-1a hash of the host's KVM-supported CPUID leaves — a stable, order-sensitive
+/// fingerprint of the guest-visible CPU feature set. Recorded in a snapshot's manifest
+/// so a restore can refuse a host whose features differ (which would crash the guest).
+fn cpuid_hash(kvm: &Kvm) -> Result<u64> {
+    let cpuid = kvm
+        .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+        .map_err(VmmError::Kvm)?;
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    for e in cpuid.as_slice() {
+        for word in [e.function, e.index, e.flags, e.eax, e.ebx, e.ecx, e.edx] {
+            for b in word.to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+        }
+    }
+    Ok(h)
 }
 
 /// Re-activate a restored device's transport from its captured `DeviceState`. A free

@@ -42,6 +42,12 @@ pub fn snapshot(machine: &mut Machine, out_dir: &Path) -> Result<SnapshotManifes
         clock,
         irqchip,
     };
+    // Fingerprint this host so a restore can refuse an incompatible CPU (see
+    // HostFingerprint). tsc_khz is recorded from the captured vCPU state (diagnostic).
+    let host = crate::snapshot::manifest::HostFingerprint {
+        cpuid_hash: machine.cpuid_hash()?,
+        tsc_khz: vm_state.vcpus.first().map_or(0, |v| v.tsc_khz),
+    };
     let manifest = SnapshotManifest {
         version: SnapshotManifest::CURRENT_VERSION,
         vcpu_count: machine.config().vcpus,
@@ -50,6 +56,7 @@ pub fn snapshot(machine: &mut Machine, out_dir: &Path) -> Result<SnapshotManifes
         state_file: STATE_FILE.into(),
         kind: SnapshotKind::Full,
         parent_uid: None,
+        host,
     };
     write_snapshot_metadata(out_dir, &vm_state, &manifest)?;
     Ok(manifest)
@@ -98,6 +105,7 @@ pub fn restore(
         vcpu_hook,
         state,
         &mem_path,
+        &manifest.host,
     )
 }
 
@@ -164,6 +172,7 @@ mod tests {
             state_file: STATE_FILE.into(),
             kind: SnapshotKind::Full,
             parent_uid: None,
+            host: Default::default(),
         };
         write_snapshot_metadata(&dir, &sample_state(), &manifest).unwrap();
 

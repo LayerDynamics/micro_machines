@@ -75,8 +75,15 @@ fn snapshot_restore_round_trip_preserves_state() {
     // 3. Restore into a fresh Machine.
     let manifest = load_manifest(&dir1).expect("load manifest");
     let state = load_state(&dir1, &manifest).expect("load state");
-    let mut m2 = Machine::restore(&cfg, state, &dir1.join(&manifest.memory_file))
-        .expect("restore the snapshot into a fresh VM");
+    // Same host that took the snapshot, so the fingerprint check passes (and exercises
+    // it on the happy path).
+    let mut m2 = Machine::restore(
+        &cfg,
+        state,
+        &dir1.join(&manifest.memory_file),
+        &manifest.host,
+    )
+    .expect("restore the snapshot into a fresh VM");
 
     // 4. Fidelity: the restored VM is alive + pausable, and re-snapshots to the same
     //    shape. A successful re-snapshot is the proof the restore produced a working,
