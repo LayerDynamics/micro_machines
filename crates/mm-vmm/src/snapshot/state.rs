@@ -47,6 +47,15 @@ pub struct VcpuState {
     /// `kvm_fpu` is a fixed-size POD, so its bytes round-trip exactly. Length is
     /// `size_of::<kvm_fpu>()`; the capture/restore boundary (vcpu.rs) validates it.
     pub fpu: Vec<u8>,
+    /// Extended control registers — XCR0 — as the raw bytes of a `kvm_xcrs`
+    /// (`KVM_GET_XCRS` / `KVM_SET_XCRS`). Restored so the guest's enabled XSAVE
+    /// feature set (e.g. AVX) survives snapshot/fork: a fresh vCPU resets XCR0 to the
+    /// default (x87 only) while the restored guest kernel still expects what it
+    /// enabled, so its `XRSTOR` of FPU state faults (`ex_handler_fprestore`) and the
+    /// guest oopses. Bytes (POD, no serde impl); `#[serde(default)]` so snapshots
+    /// taken before this field still load (empty -> skip the restore).
+    #[serde(default)]
+    pub xcrs: Vec<u8>,
     /// Local APIC state (`KVM_GET_LAPIC`).
     pub lapic: kvm_lapic_state,
     /// Run state, e.g. runnable vs halted (`KVM_GET_MP_STATE`).
@@ -184,6 +193,7 @@ mod tests {
             // Arbitrary stand-in bytes; the real length is size_of::<kvm_fpu>() and
             // is validated at the vcpu.rs capture/restore boundary.
             fpu: vec![0xab; 16],
+            xcrs: vec![0xcd; 8],
             lapic: kvm_lapic_state::default(),
             mp_state: kvm_mp_state::default(),
             msrs: vec![

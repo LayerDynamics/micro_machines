@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{
-    kvm_cpuid_entry2, kvm_fpu, kvm_msr_entry, kvm_regs, kvm_segment, kvm_sregs, CpuId, Msrs,
-    KVM_MAX_CPUID_ENTRIES,
+    kvm_cpuid_entry2, kvm_fpu, kvm_msr_entry, kvm_regs, kvm_segment, kvm_sregs, kvm_xcrs, CpuId,
+    Msrs, KVM_MAX_CPUID_ENTRIES,
 };
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
@@ -235,6 +235,7 @@ impl Vcpu {
         let regs = self.fd.get_regs().map_err(VmmError::Kvm)?;
         let sregs = self.fd.get_sregs().map_err(VmmError::Kvm)?;
         let fpu = fpu_to_bytes(&self.fd.get_fpu().map_err(VmmError::Kvm)?);
+        let xcrs = xcrs_to_bytes(&self.fd.get_xcrs().map_err(VmmError::Kvm)?);
         let lapic = self.fd.get_lapic().map_err(VmmError::Kvm)?;
         let mp_state = self.fd.get_mp_state().map_err(VmmError::Kvm)?;
 
@@ -266,6 +267,7 @@ impl Vcpu {
             regs,
             sregs,
             fpu,
+            xcrs,
             lapic,
             mp_state,
             msrs,
@@ -284,6 +286,15 @@ impl Vcpu {
             }
         }
         self.fd.set_sregs(&state.sregs).map_err(VmmError::Kvm)?;
+        // Restore XCR0 after sregs (XSETBV requires CR4.OSXSAVE, set by set_sregs) and
+        // before the guest runs, so its enabled XSAVE feature set matches what the
+        // restored kernel expects — otherwise its first XRSTOR faults. Skipped for
+        // pre-XCRS snapshots (empty bytes).
+        if !state.xcrs.is_empty() {
+            self.fd
+                .set_xcrs(&xcrs_from_bytes(&state.xcrs)?)
+                .map_err(VmmError::Kvm)?;
+        }
         self.fd
             .set_fpu(&fpu_from_bytes(&state.fpu)?)
             .map_err(VmmError::Kvm)?;
@@ -340,6 +351,41 @@ const SNAPSHOT_MSRS: &[u32] = &[
 /// kvm-clock paravirt-clock MSRs (the guest programs these to find its clock pages).
 const MSR_KVM_WALL_CLOCK_NEW: u32 = 0x4b56_4d00;
 const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
+
+/// Serialize a `kvm_xcrs` to its raw bytes for the snapshot state file.
+fn xcrs_to_bytes(xcrs: &kvm_xcrs) -> Vec<u8> {
+    // SAFETY: `kvm_xcrs` is a fixed-size `repr(C)` POD; reading `size_of` bytes is
+    // sound and yields an exact, restorable copy.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (xcrs as *const kvm_xcrs).cast::<u8>(),
+            std::mem::size_of::<kvm_xcrs>(),
+        )
+    };
+    bytes.to_vec()
+}
+
+/// Rebuild a `kvm_xcrs` from snapshot bytes, validating the length.
+fn xcrs_from_bytes(bytes: &[u8]) -> Result<kvm_xcrs> {
+    let want = std::mem::size_of::<kvm_xcrs>();
+    if bytes.len() != want {
+        return Err(VmmError::Vcpu(format!(
+            "snapshot XCRS state is {} bytes, expected {want}",
+            bytes.len()
+        )));
+    }
+    let mut xcrs = kvm_xcrs::default();
+    // SAFETY: `kvm_xcrs` is POD; copy exactly `size_of` bytes into a zeroed instance
+    // (length checked above).
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            (&mut xcrs as *mut kvm_xcrs).cast::<u8>(),
+            want,
+        );
+    }
+    Ok(xcrs)
+}
 
 /// Serialize a `kvm_fpu` to its raw bytes for the snapshot state file.
 fn fpu_to_bytes(fpu: &kvm_fpu) -> Vec<u8> {

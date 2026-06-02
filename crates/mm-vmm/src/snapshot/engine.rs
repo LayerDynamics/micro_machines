@@ -133,6 +133,7 @@ mod tests {
                 },
                 sregs: kvm_sregs::default(),
                 fpu: vec![7u8; 32],
+                xcrs: vec![9u8; 8],
                 lapic: kvm_lapic_state::default(),
                 mp_state: kvm_mp_state::default(),
                 msrs: Vec::new(),
