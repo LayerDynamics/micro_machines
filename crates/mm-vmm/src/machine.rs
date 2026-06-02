@@ -1262,18 +1262,30 @@ fn cpuid_hash(kvm: &Kvm) -> Result<u64> {
         .as_slice()
         .iter()
         .map(|e| {
-            let (mut ebx, mut ecx) = (e.ebx, e.ecx);
-            if e.function == 0xD {
-                match e.index {
+            let (mut ebx, mut ecx, mut edx) = (e.ebx, e.ecx, e.edx);
+            match e.function {
+                // Leaf 1 EBX[31:24] is the *initial APIC ID* — the physical APIC ID of
+                // whichever logical CPU the KVM_GET_SUPPORTED_CPUID ioctl thread ran on,
+                // so it varies between two calls on the same host (it did: 0x00 vs 0x02).
+                // Mask those 8 bits; keep brand index / CLFLUSH size / max-logical-IDs.
+                0x1 => ebx &= 0x00FF_FFFF,
+                // Leaf 0xD (XSAVE) reports XSAVE-area *sizes* KVM derives from the caller's
+                // live XCR0/XSS — not feature presence. Zero the volatile size fields.
+                0xD => match e.index {
                     0 => {
                         ebx = 0; // XSAVE size for features enabled in the caller's XCR0
                         ecx = 0; // max XSAVE size (size, redundant with the bitmaps)
                     }
                     1 => ebx = 0, // XSAVE size for XCR0|XSS-enabled features
                     _ => {}
-                }
+                },
+                // Extended-topology leaves: EDX is the per-CPU x2APIC ID (pure identity,
+                // never a feature). KVM usually zeroes it for the system query, but mask
+                // it so a runner that doesn't can't destabilize the fingerprint.
+                0xB | 0x1F => edx = 0,
+                _ => {}
             }
-            [e.function, e.index, e.flags, e.eax, ebx, ecx, e.edx]
+            [e.function, e.index, e.flags, e.eax, ebx, ecx, edx]
         })
         .collect();
     entries.sort_unstable();

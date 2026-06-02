@@ -346,8 +346,16 @@ fn uffd_wp_on_live_guest_is_supported() {
 
     // A non-blocking UFFD that *requires* the WP feature: create() fails loudly on a
     // kernel without write-protect faults (feasibility = no, cleanly).
+    //
+    // user_mode_only(false) is essential, not incidental: a KVM guest's write to a
+    // WP'd page faults out via EPT in *kernel* context (KVM's fault handler forwards
+    // it to userfaultfd), so a UFFD_USER_MODE_ONLY uffd — the crate default — would
+    // never deliver guest faults and the probe would falsely observe zero. A full
+    // (non-user-mode-only) uffd needs privilege OR an accessible /dev/userfaultfd; the
+    // CI job grants the latter, which is exactly the unprivileged path the device adds.
     let uffd = UffdBuilder::new()
         .require_features(FeatureFlags::PAGEFAULT_FLAG_WP)
+        .user_mode_only(false)
         .non_blocking(true)
         .create()
         .expect("create UFFD with PAGEFAULT_FLAG_WP (needs kernel >= 5.7 + uffd perms)");

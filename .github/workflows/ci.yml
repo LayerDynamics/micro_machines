@@ -249,6 +249,20 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           sudo chmod 0666 /dev/kvm
           test -r /dev/kvm && test -w /dev/kvm
+      - name: Enable userfaultfd for the FR-16 UFFD_WP probe
+        run: |
+          set -euo pipefail
+          # The FR-16 Phase 0 probe creates a full (non-user-mode-only) userfaultfd to
+          # test whether KVM-guest writes deliver write-protect faults. The runner kernel
+          # (6.x) ships /dev/userfaultfd but root-only, and the userfaultfd crate does NOT
+          # fall back to the userfaultfd(2) syscall once the device exists — so grant the
+          # runner user access (mirrors the /dev/kvm rule above). Also allow unprivileged
+          # uffd for the syscall path as a fallback on kernels without the device node.
+          sudo sysctl -w vm.unprivileged_userfaultfd=1 || true
+          if [ -e /dev/userfaultfd ]; then
+            sudo chmod 0666 /dev/userfaultfd
+            test -r /dev/userfaultfd && test -w /dev/userfaultfd
+          fi
       - name: Install fixture build tools (musl linker + mke2fs)
         run: sudo apt-get update && sudo apt-get install -y musl-tools e2fsprogs
       - name: Fetch test fixtures (kernel + rootfs)
