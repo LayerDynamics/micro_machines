@@ -16,7 +16,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use mm_sandbox::exec::{run_exec_over_uds, ExecResult, EXEC_PORT};
+use mm_sandbox::exec::{run_exec_over_uds_ready, ExecResult, EXEC_PORT};
 use mm_vmm::snapshot::{fork_children, load_state, snapshot, ForkPlan};
 use mm_vmm::{BlockDevice, Machine, VmConfig};
 use vm_memory::{Bytes, GuestAddress};
@@ -193,23 +193,16 @@ fn fork_bridged_child(
 }
 
 /// Run `/sbin/marker <args>` inside a forked child over its vsock bridge at `uds`,
-/// returning the result. Retries the connect: a freshly-forked child's vsock device
-/// reactor may not be accepting on the UDS the instant `fork` returns.
+/// returning the result. Uses the connector's bounded retry: a child forked from a
+/// snapshot taken at boot-readiness must resume and *then* reach the point where its
+/// in-guest exec agent is listening, so the first handshakes are expected to fail
+/// until it comes up.
 fn exec_marker(uds: &Path, args: &[&str]) -> ExecResult {
     let cmd: Vec<String> = std::iter::once("/sbin/marker".to_string())
         .chain(args.iter().map(|s| s.to_string()))
         .collect();
-    let mut last_err = None;
-    for _ in 0..50 {
-        match run_exec_over_uds(uds, EXEC_PORT, 1, &cmd, 10_000) {
-            Ok(result) => return result,
-            Err(e) => {
-                last_err = Some(e);
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-    }
-    panic!("exec /sbin/marker {args:?} never connected over {uds:?}: {last_err:?}");
+    run_exec_over_uds_ready(uds, EXEC_PORT, 1, &cmd, 10_000, Duration::from_secs(60))
+        .unwrap_or_else(|e| panic!("exec /sbin/marker {args:?} over {uds:?}: {e}"))
 }
 
 /// Foundation check for in-guest fork independence: a child forked from a snapshot,

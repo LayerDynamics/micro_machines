@@ -7,11 +7,12 @@
 //! client-stream. Output is *streamed*, not buffered, so a long-running command's
 //! stdout reaches the originating `mm exec` caller as it is produced.
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mm_proto::machine_service_client::MachineServiceClient;
 use mm_proto::{ExecChunk, ExecTask};
-use mm_sandbox::exec::{run_exec_streaming, vsock_connect, ExecEvent, EXEC_PORT};
+use mm_sandbox::exec::{connect_exec_ready, run_exec_streaming, ExecEvent, EXEC_PORT};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
@@ -22,6 +23,12 @@ use crate::local_store::LocalStore;
 /// The in-guest exec request id. Each exec uses a fresh vsock connection, so a single
 /// id per connection suffices (matches the single-host `mm exec`).
 const GUEST_EXEC_ID: u64 = 1;
+/// How long to retry connecting to the guest exec agent. A machine can report
+/// `Running` (and so be a valid exec target) moments before its in-guest exec agent
+/// is listening, so we ride out that startup window rather than fail the first try.
+/// Kept under the controller's REST wait (command timeout + grace) so the two ends
+/// cannot desync.
+const EXEC_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The resolved target of an exec task: either a ready guest bridge + command, or a
 /// reason the command cannot run (reported to the caller as a terminal error chunk).
@@ -121,23 +128,19 @@ fn produce_chunks(target: Target, request_id: &str, tx: mpsc::Sender<ExecChunk>)
         }
     };
 
-    let mut stream = match std::os::unix::net::UnixStream::connect(&vsock_path) {
+    // Retry the connect+handshake: the guest exec agent may not be listening the
+    // instant the machine reports Running. A bounded retry rides out that window
+    // instead of failing (or, before the handshake had a read timeout, hanging).
+    let mut stream = match connect_exec_ready(&vsock_path, EXEC_PORT, EXEC_CONNECT_TIMEOUT) {
         Ok(s) => s,
         Err(e) => {
             let _ = tx.blocking_send(terminal_error(
                 request_id,
-                &format!("connecting to guest vsock bridge: {e}"),
+                &format!("connecting to guest exec agent: {e}"),
             ));
             return;
         }
     };
-    if let Err(e) = vsock_connect(&mut stream, EXEC_PORT) {
-        let _ = tx.blocking_send(terminal_error(
-            request_id,
-            &format!("guest vsock handshake: {e}"),
-        ));
-        return;
-    }
 
     let mut sent_terminal = false;
     let run = run_exec_streaming(&mut stream, GUEST_EXEC_ID, &cmd, timeout_ms, |event| {

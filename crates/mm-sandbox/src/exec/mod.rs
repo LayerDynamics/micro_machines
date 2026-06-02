@@ -10,6 +10,7 @@ pub mod protocol;
 pub const EXEC_PORT: u32 = 1025;
 
 pub use client::{
-    run_exec, run_exec_over_uds, run_exec_streaming, vsock_connect, ExecEvent, ExecResult,
+    connect_exec_ready, run_exec, run_exec_over_uds, run_exec_over_uds_ready, run_exec_streaming,
+    vsock_connect, ExecEvent, ExecResult,
 };
 pub use protocol::{decode, encode, Frame, Stream};

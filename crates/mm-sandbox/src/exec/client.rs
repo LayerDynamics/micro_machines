@@ -5,8 +5,20 @@
 //! the stream so it is unit-testable against a mock guest. Sends one [`Frame::Exec`],
 //! collects [`Frame::Output`] chunks, and returns the [`Frame::Exit`] result.
 use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use super::protocol::{decode, encode, Frame, Stream};
+
+/// How long a single connect+handshake attempt waits for the guest's `OK` before the
+/// attempt is abandoned and retried. Bounded so a guest whose exec agent is not yet
+/// listening fails the attempt fast instead of blocking the caller forever — without
+/// it, a CONNECT to a not-yet-listening port can never return, which is what hung
+/// cluster exec / forked-child exec against a just-started guest.
+const HANDSHAKE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often to retry connect+handshake while waiting for the guest exec agent.
+const HANDSHAKE_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 
 /// The outcome of a remote command: its exit code and the captured streams.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,16 +92,84 @@ pub fn vsock_connect<S: Read + Write>(stream: &mut S, port: u32) -> std::io::Res
 
 /// Connect to the host vsock bridge at `uds_path`, handshake to guest `port`, and run
 /// `cmd` there — the end-to-end host entry point used by the agent (SPEC-1 FR-13).
+///
+/// A single connect+handshake attempt: use [`run_exec_over_uds_ready`] when the guest
+/// may have only just started and its exec agent might not be listening yet. The
+/// handshake will not block indefinitely — a guest that does not answer within
+/// [`HANDSHAKE_ATTEMPT_TIMEOUT`] fails the call rather than hanging.
 pub fn run_exec_over_uds(
-    uds_path: &std::path::Path,
+    uds_path: &Path,
     port: u32,
     id: u64,
     cmd: &[String],
     timeout_ms: u64,
 ) -> std::io::Result<ExecResult> {
-    let mut stream = std::os::unix::net::UnixStream::connect(uds_path)?;
-    vsock_connect(&mut stream, port)?;
+    run_exec_over_uds_ready(uds_path, port, id, cmd, timeout_ms, Duration::ZERO)
+}
+
+/// Like [`run_exec_over_uds`], but retry connect+handshake until `ready_timeout`
+/// elapses before running `cmd`.
+///
+/// A guest signals boot readiness (and a cluster machine reports `Running`) *before*
+/// its in-guest exec agent has called `listen()` on `port`; likewise a snapshot is
+/// captured at that readiness point, so a freshly *forked* child resumes and only then
+/// reaches the listening state. During that window a CONNECT is refused / the stream is
+/// closed before `OK` / the handshake read times out. Retrying across the window makes
+/// exec robust against the guest exec agent's startup latency instead of failing (or,
+/// before the per-attempt timeout existed, hanging) on the first try.
+pub fn run_exec_over_uds_ready(
+    uds_path: &Path,
+    port: u32,
+    id: u64,
+    cmd: &[String],
+    timeout_ms: u64,
+    ready_timeout: Duration,
+) -> std::io::Result<ExecResult> {
+    let mut stream = connect_exec_ready(uds_path, port, ready_timeout)?;
     run_exec(&mut stream, id, cmd, timeout_ms)
+}
+
+/// Connect to the host vsock bridge at `uds_path` and complete the guest handshake to
+/// `port`, retrying connect+handshake until `ready_timeout` elapses. Returns a stream
+/// ready for [`run_exec`]/[`run_exec_streaming`] (with no read timeout — the command
+/// phase blocks, since the guest agent enforces the command's own `timeout_ms`).
+///
+/// `ready_timeout` of [`Duration::ZERO`] makes exactly one attempt (still bounded by
+/// the per-attempt handshake timeout, so it cannot hang).
+pub fn connect_exec_ready(
+    uds_path: &Path,
+    port: u32,
+    ready_timeout: Duration,
+) -> std::io::Result<UnixStream> {
+    let deadline = Instant::now() + ready_timeout;
+    loop {
+        let err = match connect_once(uds_path, port) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => e,
+        };
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "exec connect to vsock port {port} via {} did not become ready: {err}",
+                    uds_path.display()
+                ),
+            ));
+        }
+        std::thread::sleep(HANDSHAKE_RETRY_INTERVAL);
+    }
+}
+
+/// One connect + handshake attempt. A fresh `UnixStream` per call (a failed handshake
+/// leaves a dead stream); the handshake read is bounded by [`HANDSHAKE_ATTEMPT_TIMEOUT`]
+/// so a silent guest fails the attempt instead of blocking. On success the read timeout
+/// is cleared for the command phase.
+fn connect_once(uds_path: &Path, port: u32) -> std::io::Result<UnixStream> {
+    let mut stream = UnixStream::connect(uds_path)?;
+    stream.set_read_timeout(Some(HANDSHAKE_ATTEMPT_TIMEOUT))?;
+    vsock_connect(&mut stream, port)?;
+    stream.set_read_timeout(None)?;
+    Ok(stream)
 }
 
 /// Run `cmd` over an already-connected `stream`, collecting output until the guest

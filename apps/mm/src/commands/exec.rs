@@ -44,12 +44,15 @@ pub fn run(args: ExecArgs) -> Result<()> {
         );
     }
 
-    let result = mm_sandbox::exec::run_exec_over_uds(
+    // Retry the connect+handshake briefly: the guest's exec agent may not be listening
+    // the instant the machine is recorded running (e.g. `mm exec` right after `mm run`).
+    let result = mm_sandbox::exec::run_exec_over_uds_ready(
         &vsock_path,
         mm_sandbox::exec::EXEC_PORT,
         1,
         &args.command,
         args.timeout_ms,
+        std::time::Duration::from_secs(30),
     )
     .with_context(|| format!("running exec in {}", args.name))?;
 

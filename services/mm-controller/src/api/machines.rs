@@ -146,8 +146,10 @@ async fn set_running(
 const DEFAULT_EXEC_TIMEOUT_MS: u64 = 60_000;
 /// Grace the controller waits beyond the command's own timeout for the agent's
 /// terminal frame, so a guest-side timeout surfaces as the command's result rather
-/// than a premature controller timeout.
-const EXEC_WAIT_GRACE_MS: u64 = 5_000;
+/// than a premature controller timeout. Must exceed the agent's exec-connect retry
+/// window (mm-agent EXEC_CONNECT_TIMEOUT, 20s) so the controller does not give up
+/// while the agent is legitimately waiting for a just-started guest's exec agent.
+const EXEC_WAIT_GRACE_MS: u64 = 30_000;
 
 /// The exec request body: argv to run plus an optional per-command timeout.
 #[derive(serde::Deserialize)]
