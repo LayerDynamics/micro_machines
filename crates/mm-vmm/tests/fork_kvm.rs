@@ -192,16 +192,22 @@ fn fork_bridged_child(
         .expect("fork bridged child")
 }
 
+/// How long to wait for a forked child's in-guest exec agent to start serving before
+/// giving up. A hard cap so the test FAILS FAST with a diagnostic instead of appearing
+/// stuck — a healthy child reaches its listening state within a few seconds of resume.
+const FORK_EXEC_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Run `/sbin/marker <args>` inside a forked child over its vsock bridge at `uds`,
 /// returning the result. Uses the connector's bounded retry: a child forked from a
 /// snapshot taken at boot-readiness must resume and *then* reach the point where its
 /// in-guest exec agent is listening, so the first handshakes are expected to fail
-/// until it comes up.
+/// until it comes up. Bounded by [`FORK_EXEC_READY_TIMEOUT`] so a child that never
+/// comes up fails the test quickly rather than hanging.
 fn exec_marker(uds: &Path, args: &[&str]) -> ExecResult {
     let cmd: Vec<String> = std::iter::once("/sbin/marker".to_string())
         .chain(args.iter().map(|s| s.to_string()))
         .collect();
-    run_exec_over_uds_ready(uds, EXEC_PORT, 1, &cmd, 10_000, Duration::from_secs(60))
+    run_exec_over_uds_ready(uds, EXEC_PORT, 1, &cmd, 10_000, FORK_EXEC_READY_TIMEOUT)
         .unwrap_or_else(|e| panic!("exec /sbin/marker {args:?} over {uds:?}: {e}"))
 }
 
