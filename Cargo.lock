@@ -1487,7 +1487,6 @@ dependencies = [
  "libc",
  "linux-loader",
  "mm-api-types",
- "mm-sandbox",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

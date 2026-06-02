@@ -880,28 +880,9 @@ impl Machine {
     /// RAM); the child then restores device/clock/vCPU state and resumes. Opens
     /// `/dev/kvm` itself (non-jailed); `config` must match the snapshot.
     pub fn fork(config: &VmConfig, state: VmState, mem_path: &Path) -> Result<Self> {
-        Self::fork_with_vsock(config, state, mem_path, None)
-    }
-
-    /// Like [`fork`](Self::fork), but bridge the child's vsock device to the host
-    /// through `vsock_listener` (an already-bound Unix-domain listener), so the host
-    /// can `exec` into the forked child over its own bridge. Each child must get a
-    /// *distinct* listener — that is what makes them independently reachable and lets a
-    /// test prove per-child guest isolation end-to-end (not just at the host
-    /// memory-mapping level). With `None` the child's vsock is unbridged (the lean
-    /// fan-out path that needs no host exec channel).
-    pub fn fork_with_vsock(
-        config: &VmConfig,
-        state: VmState,
-        mem_path: &Path,
-        vsock_listener: Option<UnixListener>,
-    ) -> Result<Self> {
         let guest_memory = Self::allocate_cow_guest_memory(config.memory_mib, mem_path)?;
         let mut machine =
             Self::with_resources_memory(config, Kvm::new()?, Vec::new(), guest_memory)?;
-        // Set before resume: `resume_from_state` takes the listener to build a
-        // host-bridged vsock (vs. the unbridged `Vsock::new`).
-        machine.vsock_listener = vsock_listener;
         machine.resume_from_state(state)?;
         Ok(machine)
     }

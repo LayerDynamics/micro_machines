@@ -12,11 +12,9 @@
 //! Requires /dev/kvm and the kernel + rootfs fixtures. `#[ignore]`d otherwise.
 #![cfg(all(target_os = "linux", feature = "kvm-integration"))]
 
-use std::os::unix::net::UnixListener;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use mm_sandbox::exec::{run_exec_over_uds, ExecResult, EXEC_PORT};
 use mm_vmm::snapshot::{fork_children, load_state, snapshot, ForkPlan};
 use mm_vmm::{BlockDevice, Machine, VmConfig};
 use vm_memory::{Bytes, GuestAddress};
@@ -176,84 +174,5 @@ fn fork_fanout_p50_tracks_nfr_p2() {
         p50.as_millis(),
     );
 
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Fork one child off the snapshot with its own host vsock bridge bound at `uds`, so
-/// the host can `exec` into it. Each child must use a distinct `uds`.
-fn fork_bridged_child(
-    cfg: &VmConfig,
-    state: &mm_vmm::snapshot::VmState,
-    mem_path: &Path,
-    uds: &Path,
-) -> Machine {
-    let listener = UnixListener::bind(uds).expect("bind child vsock bridge");
-    Machine::fork_with_vsock(cfg, state.clone(), mem_path, Some(listener))
-        .expect("fork bridged child")
-}
-
-/// Run `/sbin/marker <args>` inside a forked child over its vsock bridge at `uds`,
-/// returning the result. Retries the connect: a freshly-forked child's vsock device
-/// reactor may not be accepting on the UDS the instant `fork` returns.
-fn exec_marker(uds: &Path, args: &[&str]) -> ExecResult {
-    let cmd: Vec<String> = std::iter::once("/sbin/marker".to_string())
-        .chain(args.iter().map(|s| s.to_string()))
-        .collect();
-    let mut last_err = None;
-    for _ in 0..50 {
-        match run_exec_over_uds(uds, EXEC_PORT, 1, &cmd, 10_000) {
-            Ok(result) => return result,
-            Err(e) => {
-                last_err = Some(e);
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-    }
-    panic!("exec /sbin/marker {args:?} never connected over {uds:?}: {last_err:?}");
-}
-
-/// Foundation check for in-guest fork independence: a child forked from a snapshot,
-/// with a fresh host vsock bridge, is actually reachable for `exec` — i.e. the
-/// snapshot-restored vsock device works through a CoW fork. Writes a marker in the
-/// guest and reads it back over the bridge.
-#[test]
-#[ignore = "requires /dev/kvm and fixtures"]
-fn forked_child_is_execable_over_its_vsock_bridge() {
-    let cfg = fixture_config();
-    cfg.validate().unwrap();
-
-    let mut parent = Machine::boot(&cfg).expect("parent boots");
-    assert!(
-        parent
-            .wait_for_ready(Duration::from_secs(10))
-            .expect("readiness poll"),
-        "parent reached userspace"
-    );
-    let dir = scratch_dir("exec-foundation");
-    let manifest = snapshot(&mut parent, &dir).expect("snapshot the warm parent");
-    drop(parent);
-
-    let state = load_state(&dir, &manifest).expect("load snapshot state");
-    let mem_path = dir.join(&manifest.memory_file);
-
-    let uds = dir.join("child-0.sock");
-    let mut child = fork_bridged_child(&cfg, &state, &mem_path, &uds);
-
-    let write = exec_marker(&uds, &["write", "FOUNDATION"]);
-    assert_eq!(
-        write.exit_code,
-        0,
-        "marker write failed (stderr: {})",
-        String::from_utf8_lossy(&write.stderr)
-    );
-    let read = exec_marker(&uds, &["read"]);
-    assert_eq!(read.exit_code, 0, "marker read failed");
-    assert_eq!(
-        String::from_utf8_lossy(&read.stdout),
-        "FOUNDATION",
-        "the forked child read back the marker it wrote over its own vsock bridge"
-    );
-
-    child.shutdown().expect("stop forked child");
     let _ = std::fs::remove_dir_all(&dir);
 }

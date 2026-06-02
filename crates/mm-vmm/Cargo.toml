@@ -30,8 +30,6 @@ tracing = { workspace = true }
 virtio-queue = { workspace = true, features = ["test-utils"] }
 # The fork integration test reads/writes guest RAM directly to prove CoW isolation.
 vm-memory = { workspace = true }
-# The fork exec-independence test execs into each forked child over its vsock bridge.
-mm-sandbox = { path = "../mm-sandbox" }
 
 [features]
 # KVM-dependent integration tests, run only on linux+kvm hosts.

@@ -154,66 +154,6 @@ EOF
   cp "${proj}/target/${MUSL_TARGET}/release/ready" "${stage}/sbin/ready"
 }
 
-# A tiny guest helper for the fork exec-independence test (fork_kvm.rs): the minimal
-# rootfs has no shell, so we ship a purpose-built static binary the guest exec agent
-# can run. `marker write <v>` records <v> in the guest's (writable, ephemeral-overlay)
-# filesystem; `marker read` prints it back. Forking N children and asserting each reads
-# back only its own value proves per-child guest isolation end to end.
-build_marker_helper() {
-  local stage="$1"
-  local proj="${stage}/.marker-src"
-  mkdir -p "${proj}/src"
-
-  cat >"${proj}/Cargo.toml" <<'EOF'
-[package]
-name = "marker"
-version = "0.0.0"
-edition = "2021"
-
-[[bin]]
-name = "marker"
-path = "src/main.rs"
-
-[profile.release]
-opt-level = "z"
-strip = true
-panic = "abort"
-EOF
-
-  cat >"${proj}/src/main.rs" <<'EOF'
-// In-guest marker for the fork exec-independence test. Pure std, no deps.
-//   marker write <value>  -> write <value> to /tmp/mm-marker (writable overlay)
-//   marker read           -> print /tmp/mm-marker, or "EMPTY" if unset
-use std::io::Write;
-
-const PATH: &str = "/tmp/mm-marker";
-
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some("write") => {
-            let value = args.get(2).cloned().unwrap_or_default();
-            if std::fs::write(PATH, value.as_bytes()).is_err() {
-                std::process::exit(1);
-            }
-        }
-        Some("read") => {
-            let out = std::fs::read(PATH).unwrap_or_else(|_| b"EMPTY".to_vec());
-            let _ = std::io::stdout().write_all(&out);
-            let _ = std::io::stdout().flush();
-        }
-        _ => {
-            let _ = writeln!(std::io::stderr(), "usage: marker write <value> | marker read");
-            std::process::exit(2);
-        }
-    }
-}
-EOF
-
-  ( cd "${proj}" && cargo build --release --target "${MUSL_TARGET}" )
-  cp "${proj}/target/${MUSL_TARGET}/release/marker" "${stage}/sbin/marker"
-}
-
 build_rootfs() {
   if [[ -f "${ROOTFS}" ]]; then
     echo "rootfs already present: ${ROOTFS}"
@@ -232,7 +172,6 @@ build_rootfs() {
 
   cp "${REPO_ROOT}/target/${MUSL_TARGET}/release/mm-init" "${stage}/init"
   build_ready_helper "${stage}"
-  build_marker_helper "${stage}"
 
   # Populate an ext4 image directly from the staging directory.
   mke2fs -q -t ext4 -F -d "${stage}" "${ROOTFS}.tmp" 64M
