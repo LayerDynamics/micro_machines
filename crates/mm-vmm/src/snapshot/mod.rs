@@ -6,9 +6,11 @@
 //! `cfg(target_os = "linux")`.
 pub mod fork;
 pub mod manifest;
+pub mod store;
 
 pub use fork::{plan_fork, ForkError, ForkPlan};
 pub use manifest::{HostFingerprint, SnapshotKind, SnapshotManifest};
+pub use store::{SnapshotRef, SnapshotStore};
 
 /// Serializable vCPU + device state (the snapshot `state_file`). Linux-only: it
 /// embeds `kvm_bindings`. The (de)serialization is pure and unit-tested on any Linux
