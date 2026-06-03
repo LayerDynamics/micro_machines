@@ -96,16 +96,25 @@ fn mm_branch_clone_is_reachable_at_a_unique_ip_without_colliding_with_the_source
         false
     };
 
-    // 1. Boot the source and wait until its exec agent answers. This test gates the
-    //    per-clone NETWORKING (#2) on the *reliable* clone path — a resume-in-place
-    //    snapshot clone (`mm branch` of a non-branchable source). The write-protect branch
-    //    path (`mm run --branchable`) has a separate, intermittent guest-fidelity issue
-    //    (a clone can kernel-panic in the IRQ path) tracked in the FR-16 follow-ups; gating
-    //    networking on it would make this e2e flaky, so it is deliberately not exercised
-    //    here. (`mm branch` of a non-branchable source falls back to snapshot-in-place.)
-    let launch = mm(&["run", "--ssh", "--detach", "--name", src, IMAGE])
-        .output()
-        .expect("spawn `mm run`");
+    // 1. Boot the source `--branchable` and wait until its exec agent answers. This
+    //    exercises the real near-zero-pause write-protect branch path through the full
+    //    jail/netns CLI — `mm branch` of a `--branchable` source uses the WP engine (not
+    //    the resume-in-place snapshot fallback). That path previously had two now-fixed
+    //    bugs: a clone kernel-panic in the IRQ/softirq path (missing FS/GS-base MSRs in the
+    //    snapshot, b39886a) and an `exit -1` after sustained execs (a PID-1 reaper race in
+    //    mm-init, fc36487/f6f14ca). Gating the per-clone NETWORKING (#2) on this path
+    //    confirms both on the exact jailed path where the panic was first observed.
+    let launch = mm(&[
+        "run",
+        "--ssh",
+        "--branchable",
+        "--detach",
+        "--name",
+        src,
+        IMAGE,
+    ])
+    .output()
+    .expect("spawn `mm run`");
     assert!(
         launch.status.success(),
         "`mm run` failed: {}\n{}",
@@ -163,6 +172,25 @@ fn mm_branch_clone_is_reachable_at_a_unique_ip_without_colliding_with_the_source
         src_reachable,
         "source not reachable at {src_ip} after the clone came up (collision/regression)"
     );
+
+    // 4b. Hammer the live WP-branch clone with sustained execs — the exact load that
+    //     surfaced the PID-1 reaper race (`exit -1`) on the jailed exec path. Each must
+    //     exit 0 AND echo its own value back: the race corrupted the EXIT CODE (the agent
+    //     sent Exit{-1} when PID 1 stole its child) even though stdout still streamed, so
+    //     asserting `status.success()` — not just the token — is what catches a regression.
+    for i in 0..15 {
+        let val = format!("HAMMER{i}");
+        let out = mm(&["exec", clone, "--", "echo", &val])
+            .output()
+            .expect("run `mm exec` on the clone");
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains(&val),
+            "clone exec #{i} failed (reaper-race regression?): status={:?}\nstdout={}\nstderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
 
     // 5. Teardown leaves no residue: removing the clone deletes its netns + host veth.
     let _ = mm(&["stop", clone]).output();
