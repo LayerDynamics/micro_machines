@@ -4,6 +4,7 @@ pub mod ps;
 pub mod remote;
 pub mod rm;
 pub mod run;
+pub mod snapshot;
 pub mod ssh;
 pub mod stop;
 pub mod worker;
