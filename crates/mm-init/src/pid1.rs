@@ -460,10 +460,14 @@ fn run_sandbox(_cfg: &InitConfig) -> ExitCode {
 /// connection handlers) so they do not linger as zombies. Diverges.
 fn reap_forever() -> ! {
     loop {
-        // SAFETY: waitpid(-1, ...) reaps any child; WNOHANG makes it non-blocking.
-        let reaped = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
-        if reaped <= 0 {
-            // No child ready (0) or none exist (-1/ECHILD): sleep briefly and retry.
+        // Reap orphans only — NOT the exec agent's `Command` children. A bare
+        // `waitpid(-1)` here races the exec agent (another thread of this PID-1 process)
+        // and can steal a child it is waiting on, making its `child.wait()` fail with
+        // ECHILD so it reports a bogus exit code (observed as `exit -1` after a handful of
+        // sustained execs). `reap_one_orphan` peeks with WNOWAIT and leaves owned children
+        // for the agent. It returns true while it is draining orphans; sleep only when
+        // there is nothing (or only an owned child) to reap.
+        if !crate::exec_agent::reap_one_orphan() {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
     }

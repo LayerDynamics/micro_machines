@@ -36,19 +36,75 @@ pub fn build_command(cmd: &[String]) -> Option<Command> {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::serve;
+pub use linux::{reap_one_orphan, serve};
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::collections::HashSet;
     use std::fs::File;
     use std::io::{Read, Write};
     use std::os::unix::io::{FromRawFd, RawFd};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
     use mm_sandbox::exec::{decode, encode, Frame, Stream};
 
     use super::{build_command, SPAWN_FAILED_EXIT_CODE, TIMEOUT_EXIT_CODE};
+
+    /// PIDs of the `Command` children the exec agent is actively waiting on. PID 1 runs a
+    /// generic orphan reaper ([`crate::pid1::reap_forever`]) in another thread of this same
+    /// process; a bare `waitpid(-1)` there races the agent and can reap an exec child first,
+    /// making the agent's `child.wait()` fail with `ECHILD` so it reports a bogus exit code
+    /// (and risks PID recycling). The agent registers each child here while it owns it, and
+    /// the reaper consults [`reap_one_orphan`] to leave owned children alone.
+    fn owned_children() -> &'static Mutex<HashSet<i32>> {
+        static OWNED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+        OWNED.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    fn track_child(pid: i32) {
+        if let Ok(mut set) = owned_children().lock() {
+            set.insert(pid);
+        }
+    }
+
+    fn untrack_child(pid: i32) {
+        if let Ok(mut set) = owned_children().lock() {
+            set.remove(&pid);
+        }
+    }
+
+    fn is_owned(pid: i32) -> bool {
+        owned_children()
+            .lock()
+            .map(|set| set.contains(&pid))
+            .unwrap_or(false)
+    }
+
+    /// Reap a single externally-orphaned child (e.g. a finished `dropbear`/sshd connection
+    /// handler reparented to PID 1) WITHOUT consuming any child the exec agent is waiting
+    /// on. PID 1's reaper must call this instead of a bare `waitpid(-1, WNOHANG)`.
+    ///
+    /// It first *peeks* the next reapable child with `WNOWAIT` (which leaves the zombie in
+    /// place): if that child is owned by the exec agent, it does nothing — the agent reaps
+    /// it itself; otherwise it consumes the orphan. Returns `true` if it reaped an orphan
+    /// (the caller can loop to drain), `false` if nothing reapable / the front child is
+    /// owned (the caller should sleep before retrying).
+    pub fn reap_one_orphan() -> bool {
+        let mut status: libc::c_int = 0;
+        // SAFETY: waitpid with WNOWAIT peeks the next ready child without consuming it.
+        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WNOWAIT) };
+        if pid <= 0 {
+            return false; // 0 = none ready yet, -1 = no children (ECHILD)
+        }
+        if is_owned(pid) {
+            return false; // the exec agent owns this child and will reap it
+        }
+        // A genuine orphan: actually consume the zombie now.
+        // SAFETY: reaping a specific, non-agent-owned pid that we just observed as ready.
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        true
+    }
 
     /// Listen on `port` (vsock) and serve exec requests, one connection per client.
     /// Diverges: runs for the lifetime of the sandbox. Best-effort: a failure to set
@@ -142,6 +198,11 @@ mod linux {
                 return;
             }
         };
+        // Claim this child so PID 1's orphan reaper does not race us for it (see
+        // `owned_children`). Registered before the first await so the reaper's WNOWAIT peek
+        // sees it owned; cleared on every exit path once we have reaped it ourselves.
+        let child_pid = child.id() as i32;
+        track_child(child_pid);
 
         // Shared writer so the stdout + stderr streamers can interleave Output frames.
         let writer = match stream.try_clone() {
@@ -149,6 +210,7 @@ mod linux {
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                untrack_child(child_pid);
                 return;
             }
         };
@@ -180,6 +242,7 @@ mod linux {
         } else {
             status.and_then(|s| s.code()).unwrap_or(-1)
         };
+        untrack_child(child_pid);
         let mut w = writer.lock().expect("writer mutex");
         let _ = w.write_all(&encode(&Frame::Exit { id, code }));
         let _ = w.flush();
