@@ -531,10 +531,13 @@ jobs:
         run: echo "+cpu +memory" | sudo tee /sys/fs/cgroup/cgroup.subtree_control || true
       - name: Build the mm-snapshot integration test
         run: cargo test -p mm --test snapshot_cli_kvm --no-run
-      - name: Run `mm snapshot`/`mm restore` end to end as root
+      - name: Run `mm snapshot`/`mm restore`/`mm branch` end to end as root
+        # --test-threads=1: each test boots multiple microVMs; serialize so two
+        # resource-heavy KVM tests don't contend (and the branch test's source+clone
+        # share an IP — running it alongside the restore test must not race).
         run: |
           sudo -E env "PATH=$PATH" \
-            cargo test -p mm --test snapshot_cli_kvm -- --ignored --nocapture
+            cargo test -p mm --test snapshot_cli_kvm -- --ignored --nocapture --test-threads=1
 
   # Confirm the static dropbear sshd (injected into guest rootfs images for FR-12)
   # builds and is statically linked, so it runs in any guest userland.

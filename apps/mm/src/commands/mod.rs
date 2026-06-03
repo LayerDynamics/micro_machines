@@ -1,4 +1,5 @@
 //! `mm` subcommands and shared state-location helpers.
+pub mod branch;
 pub mod exec;
 pub mod ps;
 pub mod remote;

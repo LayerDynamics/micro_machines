@@ -48,6 +48,8 @@ enum Command {
     Snapshot(commands::snapshot::SnapshotArgs),
     /// Restore a snapshot into a new machine.
     Restore(commands::restore::RestoreArgs),
+    /// Clone a running machine into a new live machine (branch).
+    Branch(commands::branch::BranchArgs),
     /// (internal) Jailed VMM worker, spawned by `mm run`. Not for direct use.
     #[command(name = "__vmm-worker", hide = true)]
     Worker(commands::worker::WorkerArgs),
@@ -87,6 +89,9 @@ fn main() -> anyhow::Result<()> {
             Command::Restore(_) => {
                 anyhow::bail!("`mm restore` is single-host only; restore a cluster machine via the controller's Snapshot resource (REST)")
             }
+            Command::Branch(_) => {
+                anyhow::bail!("`mm branch` is single-host only; branch a cluster machine via the controller's Snapshot resource (REST, kind=branch)")
+            }
             Command::Worker(_) => unreachable!("handled above"),
         };
     }
@@ -101,6 +106,7 @@ fn main() -> anyhow::Result<()> {
         Command::Exec(args) => commands::exec::run(args),
         Command::Snapshot(args) => commands::snapshot::run(args),
         Command::Restore(args) => commands::restore::run(args),
+        Command::Branch(args) => commands::branch::run(args),
         Command::Worker(_) => unreachable!("handled above"),
     }
 }

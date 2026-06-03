@@ -1,5 +1,8 @@
-//! End-to-end: the `mm snapshot`/`mm restore` user surface over the worker control
-//! channel (SPEC-1 FR-14). Boots a real sandbox microVM, snapshots the **live** guest
+//! End-to-end: the `mm snapshot`/`mm restore`/`mm branch` user surface over the worker
+//! control channel (SPEC-1 FR-14/FR-16). Two tests: a snapshot→restore round-trip
+//! (stopped-source restore), and a live `mm branch` clone that leaves the source running.
+//!
+//! The first test boots a real sandbox microVM, snapshots the **live** guest
 //! via `mm snapshot create` (the worker control.sock), lists it, then restores it into a
 //! fresh machine with `mm restore` and proves the restored guest is alive over its own
 //! vsock bridge (`mm exec`) — and came back with the network device + IP captured in
@@ -176,5 +179,96 @@ fn mm_snapshot_then_restore_round_trips_a_live_guest() {
     assert!(
         ip_ok,
         "restored guest did not come back with its captured IP.\n{ip_diag}\n{diag}"
+    );
+}
+
+/// End-to-end for `mm branch`: clone a *running* guest into a new live machine and prove
+/// both keep running. Unlike restore (stopped source), branch acts on the live source —
+/// so the source must still serve `mm exec` afterwards (it was never frozen) and the
+/// clone must be independently alive. Both are reached over their own vsock bridges; the
+/// clone shares the source's captured IP (the documented re-IP-per-clone follow-up), so
+/// this asserts liveness via vsock exec, not networking.
+#[test]
+#[ignore = "requires /dev/kvm, root, skopeo/umoci, network, fixtures"]
+fn mm_branch_clones_a_running_guest() {
+    let root = repo_root();
+    let kernel = root.join("crates/mm-vmm/tests/fixtures/vmlinux");
+    let mm_init = root.join("target/x86_64-unknown-linux-musl/release/mm-init");
+    for (what, p) in [("kernel", &kernel), ("mm-init", &mm_init)] {
+        assert!(p.exists(), "missing {what} fixture {}", p.display());
+    }
+
+    let state = std::env::temp_dir().join(format!("mm-branch-test-{}", std::process::id()));
+    std::fs::create_dir_all(&state).expect("create state root");
+    let mm_bin = env!("CARGO_BIN_EXE_mm");
+    let src = "branch-src";
+    let clone = "branch-clone";
+
+    let mm = |args: &[&str]| {
+        let mut c = Command::new(mm_bin);
+        c.args(args)
+            .env("MM_ROOT", &state)
+            .env("MM_KERNEL", &kernel)
+            .env("MM_INIT", &mm_init);
+        c
+    };
+
+    // 1. Boot a sandbox source VM (detached) and wait until its guest exec agent answers.
+    let launch = mm(&["run", "--ssh", "--detach", "--name", src, IMAGE])
+        .output()
+        .expect("spawn `mm run`");
+    assert!(
+        launch.status.success(),
+        "`mm run` failed: {}\n{}",
+        String::from_utf8_lossy(&launch.stdout),
+        String::from_utf8_lossy(&launch.stderr),
+    );
+    assert!(
+        wait_exec_ready(&mm, src, 90),
+        "source guest never became exec-ready"
+    );
+
+    // 2. Branch the LIVE source into a new machine. The source is NOT stopped first — the
+    //    whole point is that a branch leaves it running.
+    let branch = mm(&["branch", src, clone]).output().expect("mm branch");
+    assert!(
+        branch.status.success(),
+        "`mm branch` failed: {}\n{}",
+        String::from_utf8_lossy(&branch.stdout),
+        String::from_utf8_lossy(&branch.stderr),
+    );
+
+    // 3. The clone is independently alive over its own vsock bridge...
+    let clone_ready = wait_exec_ready(&mm, clone, 90);
+    // 4. ...and the source is STILL running (a branch must not freeze it — this is the
+    //    regression the cluster e2e first caught for plain snapshots, asserted here for
+    //    the branch path too).
+    let src_alive = wait_exec_ready(&mm, src, 30);
+
+    // Diagnostics before teardown so a failure self-explains.
+    let mut diag = String::new();
+    if !clone_ready || !src_alive {
+        for who in [clone, src] {
+            let console = state.join(format!("jails/{who}/console.log"));
+            let log = std::fs::read_to_string(&console)
+                .unwrap_or_else(|e| format!("(no console.log: {e})"));
+            diag.push_str(&format!(
+                "--- {who} console ({}) ---\n{log}\n",
+                console.display()
+            ));
+        }
+    }
+
+    let _ = mm(&["stop", clone]).output();
+    let _ = mm(&["stop", src]).output();
+    let _ = std::fs::remove_dir_all(&state);
+
+    assert!(
+        clone_ready,
+        "branched clone never became exec-ready (branch boot broke?).\n{diag}"
+    );
+    assert!(
+        src_alive,
+        "source guest stopped serving exec after the branch (branch must leave it running).\n{diag}"
     );
 }
