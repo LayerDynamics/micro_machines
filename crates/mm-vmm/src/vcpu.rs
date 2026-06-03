@@ -52,6 +52,8 @@ const MSR_STAR: u32 = 0xc000_0081;
 const MSR_LSTAR: u32 = 0xc000_0082;
 const MSR_CSTAR: u32 = 0xc000_0083;
 const MSR_SYSCALL_MASK: u32 = 0xc000_0084;
+const MSR_FS_BASE: u32 = 0xc000_0100;
+const MSR_GS_BASE: u32 = 0xc000_0101;
 const MSR_KERNEL_GS_BASE: u32 = 0xc000_0102;
 
 /// How a vCPU run loop ended.
@@ -386,6 +388,13 @@ const SNAPSHOT_MSRS: &[u32] = &[
     MSR_LSTAR,
     MSR_CSTAR,
     MSR_SYSCALL_MASK,
+    // The 64-bit FS/GS bases. KVM treats these MSRs (not the sregs segment .base fields)
+    // as authoritative in long mode; without restoring the active GS base a resumed guest
+    // faults in per-CPU (GS-relative) accesses — e.g. crashes in __do_softirq on the first
+    // interrupt after resume (SPEC-1 FR-16 live BRANCH fidelity). KERNEL_GS_BASE is the
+    // SWAPGS shadow; all three are needed (mirrors Firecracker's snapshot MSR set).
+    MSR_FS_BASE,
+    MSR_GS_BASE,
     MSR_KERNEL_GS_BASE,
     MSR_IA32_TSC,
     MSR_IA32_TSC_DEADLINE,
