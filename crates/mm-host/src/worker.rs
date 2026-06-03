@@ -273,7 +273,12 @@ mod linux {
                             .new_snapshot_dir(SNAPSHOT_BUCKET)
                             .map_err(|e| e.to_string())?;
                         match req {
-                            ControlRequest::Snapshot => mm_vmm::snapshot::snapshot(&mut m, &dir)
+                            // Resume-in-place: the guest keeps running after the snapshot
+                            // (a live `mm snapshot`/cluster Snapshot must not freeze it).
+                            // The freeze-only `snapshot::snapshot` exits the device/vCPU
+                            // workers and is for the restore-into-a-fresh-VM flow only.
+                            ControlRequest::Snapshot => m
+                                .snapshot_in_place(&dir)
                                 .map(|_| id)
                                 .map_err(|e| e.to_string()),
                             ControlRequest::Branch => {

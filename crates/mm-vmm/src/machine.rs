@@ -745,6 +745,66 @@ impl Machine {
         captured
     }
 
+    /// Snapshot a **running** guest into `out_dir` and **resume it in place** (SPEC-1
+    /// FR-14). Unlike [`crate::snapshot::snapshot`] — which pauses the vCPUs and lets the
+    /// device workers *exit* (the guest is frozen afterwards, for a restore-into-a-fresh-
+    /// `Machine` flow) — this parks every participant at the checkpoint barrier, captures
+    /// the coherent [`VmState`], dumps guest RAM **while parked**, then releases the
+    /// barrier so the guest keeps executing exactly where it was. This is what the live
+    /// worker (`mm snapshot` / the cluster Snapshot resource) needs: the snapshot is a
+    /// side effect, not the end of the VM's life.
+    ///
+    /// The guest is paused for the full RAM-dump duration (fine for typical guests;
+    /// [`branch`](Self::branch) is the near-zero-pause variant that copies RAM
+    /// concurrently under write-protection). The resulting directory is layout-identical
+    /// to a frozen [`snapshot`](crate::snapshot::snapshot), so restore is unchanged.
+    pub fn snapshot_in_place(
+        &mut self,
+        out_dir: &Path,
+    ) -> Result<crate::snapshot::SnapshotManifest> {
+        std::fs::create_dir_all(out_dir).map_err(VmmError::Io)?;
+
+        // Park vCPUs + device workers at the barrier, then capture everything and dump
+        // RAM before releasing — one coherent point-in-time (nothing mutates guest state
+        // while parked, exactly as the freeze path relies on for its dump).
+        self.quiesce_at_barrier(true)?;
+        let captured = (|| -> Result<VmState> {
+            let vcpus = self.collect_vcpu_states()?;
+            let devices = self.collect_device_states()?;
+            let clock = self.capture_clock()?;
+            let irqchip = self.capture_irqchip()?;
+            self.dump_guest_memory(&out_dir.join("memory.bin"))?;
+            Ok(VmState {
+                vcpus,
+                devices,
+                clock,
+                irqchip,
+            })
+        })();
+        // Resume on every path so a vCPU is never stranded parked; surface a capture
+        // error in preference to a release error.
+        let released = self.release_barrier();
+        let vm_state = captured?;
+        released?;
+
+        let host = crate::snapshot::manifest::HostFingerprint {
+            cpuid_hash: self.cpuid_hash()?,
+            tsc_khz: vm_state.vcpus.first().map_or(0, |v| v.tsc_khz),
+        };
+        let manifest = crate::snapshot::SnapshotManifest {
+            version: crate::snapshot::SnapshotManifest::CURRENT_VERSION,
+            vcpu_count: self.config().vcpus,
+            memory_mib: self.config().memory_mib,
+            memory_file: "memory.bin".into(),
+            state_file: "state.bin".into(),
+            kind: crate::snapshot::SnapshotKind::Full,
+            parent_uid: None,
+            host,
+        };
+        crate::snapshot::engine::write_snapshot_metadata(out_dir, &vm_state, &manifest)?;
+        Ok(manifest)
+    }
+
     /// Request a checkpoint and quiesce all participants at the barrier: optionally wake
     /// the device workers (so they drain in-flight DMA, capture their cursors, and park),
     /// then kick the vCPUs out of `KVM_RUN` until **every** participant has parked. Each

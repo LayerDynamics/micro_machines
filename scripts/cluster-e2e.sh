@@ -197,6 +197,18 @@ if ! echo "$list_resp" | grep -q "\"name\":\"$snap_id\""; then
 fi
 echo "PASS: cluster snapshot appears in the snapshot list"
 
+# Regression guard: a live snapshot must RESUME the guest, not freeze it. Exec the
+# guest right here (before any restart, so nothing else can confound it) — if the
+# snapshot left the vCPUs/device workers parked, the guest's vsock exec would hang.
+out="$(mm exec c1 echo alive-after-snapshot)"
+echo "post-snapshot exec stdout: [$out]"
+if ! echo "$out" | grep -q "alive-after-snapshot"; then
+  echo "FAIL: guest did not keep running after the snapshot (snapshot must resume it)" >&2
+  cat "$STATE"/jails/*/console.log 2>/dev/null || true
+  exit 1
+fi
+echo "PASS: guest still serves exec after the snapshot (resume-in-place)"
+
 # --- 4. restart the controller; the running VM must survive (NFR-R2) -------
 kill "$CTRL_PID"; wait "$CTRL_PID" 2>/dev/null || true
 CTRL_PID=""
