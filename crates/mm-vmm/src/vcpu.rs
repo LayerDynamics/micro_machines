@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{
-    kvm_cpuid_entry2, kvm_fpu, kvm_msr_entry, kvm_regs, kvm_segment, kvm_sregs, kvm_xcrs, CpuId,
-    Msrs, KVM_MAX_CPUID_ENTRIES,
+    kvm_cpuid_entry2, kvm_fpu, kvm_msr_entry, kvm_regs, kvm_segment, kvm_sregs, kvm_vcpu_events,
+    kvm_xcrs, CpuId, Msrs, KVM_MAX_CPUID_ENTRIES,
 };
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
@@ -269,6 +269,10 @@ impl Vcpu {
         let xcrs = xcrs_to_bytes(&self.fd.get_xcrs().map_err(VmmError::Kvm)?);
         let lapic = self.fd.get_lapic().map_err(VmmError::Kvm)?;
         let mp_state = self.fd.get_mp_state().map_err(VmmError::Kvm)?;
+        // Pending event-injection state (exceptions / interrupt being injected / NMI /
+        // interrupt shadow). Required for resume fidelity: a guest paused mid-injection
+        // resumes inconsistent and crashes in the IRQ path without it (FR-16 live BRANCH).
+        let vcpu_events = vcpu_events_to_bytes(&self.fd.get_vcpu_events().map_err(VmmError::Kvm)?);
 
         // Query the curated MSR set: build a `Msrs` holding the indices, let KVM fill
         // in the data, then read it back as plain pairs.
@@ -303,6 +307,7 @@ impl Vcpu {
             mp_state,
             msrs,
             tsc_khz,
+            vcpu_events,
         })
     }
 
@@ -353,6 +358,15 @@ impl Vcpu {
             )));
         }
 
+        // Restore pending event-injection state (exceptions / in-flight interrupt / NMI /
+        // interrupt shadow) so a guest captured mid-injection resumes consistently rather
+        // than faulting in the IRQ path. Skipped for pre-events state files (empty bytes).
+        if !state.vcpu_events.is_empty() {
+            self.fd
+                .set_vcpu_events(&vcpu_events_from_bytes(&state.vcpu_events)?)
+                .map_err(VmmError::Kvm)?;
+        }
+
         // Set general-purpose registers last so RIP/RSP are not perturbed by the
         // other ioctls.
         self.fd.set_regs(&state.regs).map_err(VmmError::Kvm)?;
@@ -388,6 +402,42 @@ const MSR_IA32_TSC_DEADLINE: u32 = 0x0000_06e0;
 /// kvm-clock paravirt-clock MSRs (the guest programs these to find its clock pages).
 const MSR_KVM_WALL_CLOCK_NEW: u32 = 0x4b56_4d00;
 const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
+
+/// Serialize a `kvm_vcpu_events` to its raw bytes for the snapshot state file (it has
+/// unions, so no serde — same byte-copy approach as `kvm_xcrs`/`kvm_fpu`).
+fn vcpu_events_to_bytes(ev: &kvm_vcpu_events) -> Vec<u8> {
+    // SAFETY: `kvm_vcpu_events` is a fixed-size `repr(C)` POD; reading `size_of` bytes is
+    // sound and yields an exact, restorable copy.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (ev as *const kvm_vcpu_events).cast::<u8>(),
+            std::mem::size_of::<kvm_vcpu_events>(),
+        )
+    };
+    bytes.to_vec()
+}
+
+/// Rebuild a `kvm_vcpu_events` from snapshot bytes, validating the length.
+fn vcpu_events_from_bytes(bytes: &[u8]) -> Result<kvm_vcpu_events> {
+    let want = std::mem::size_of::<kvm_vcpu_events>();
+    if bytes.len() != want {
+        return Err(VmmError::Vcpu(format!(
+            "snapshot VCPU_EVENTS state is {} bytes, expected {want}",
+            bytes.len()
+        )));
+    }
+    let mut ev = kvm_vcpu_events::default();
+    // SAFETY: `kvm_vcpu_events` is POD; copy exactly `size_of` bytes into a zeroed instance
+    // (length checked above).
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            (&mut ev as *mut kvm_vcpu_events).cast::<u8>(),
+            want,
+        );
+    }
+    Ok(ev)
+}
 
 /// Serialize a `kvm_xcrs` to its raw bytes for the snapshot state file.
 fn xcrs_to_bytes(xcrs: &kvm_xcrs) -> Vec<u8> {

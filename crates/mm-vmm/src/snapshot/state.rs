@@ -65,6 +65,14 @@ pub struct VcpuState {
     /// TSC frequency in kHz (`KVM_GET_TSC_KHZ`), re-applied at restore so the guest's
     /// time base matches; 0 means the host does not support querying/scaling it.
     pub tsc_khz: u32,
+    /// Pending event-injection state — exceptions, an interrupt being injected, NMI/SMI,
+    /// the interrupt shadow (`KVM_GET_VCPU_EVENTS`), as raw `kvm_vcpu_events` bytes (it has
+    /// unions, so no serde). Without this, a guest captured mid-interrupt-injection resumes
+    /// with inconsistent event state and crashes in the IRQ/softirq path (SPEC-1 FR-16
+    /// live BRANCH). `#[serde(default)]` (empty) tolerates a pre-events state file; bincode
+    /// layout is per-run/ephemeral so the appended field is safe.
+    #[serde(default)]
+    pub vcpu_events: Vec<u8>,
 }
 
 /// A virtio queue's restorable cursor state — a `serde` mirror of
@@ -207,6 +215,7 @@ mod tests {
                 },
             ],
             tsc_khz: 2_500_000,
+            vcpu_events: vec![0xef; 8],
         }
     }
 

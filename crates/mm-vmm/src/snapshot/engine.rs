@@ -147,6 +147,7 @@ mod tests {
                 mp_state: kvm_mp_state::default(),
                 msrs: Vec::new(),
                 tsc_khz: 3_000_000,
+                vcpu_events: vec![0xef; 8],
             }],
             devices: vec![DeviceState {
                 device_type: 2,
