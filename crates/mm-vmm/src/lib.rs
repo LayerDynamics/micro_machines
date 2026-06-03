@@ -24,6 +24,12 @@ pub use ratelimit::TokenBucket;
 pub mod vsock_proto;
 pub use vsock_proto::{CreditTracker, VsockHeader};
 
+// Capture-and-continue checkpoint barrier for resume-in-place (FR-16 running BRANCH).
+// Pure std (atomics) — compiled on any host under `test` so its unit tests run on the
+// non-Linux dev host, and always on Linux where the vCPU threads use it.
+#[cfg(any(target_os = "linux", test))]
+mod checkpoint;
+
 // Linux-only KVM machinery (Tasks 5–8), behind `cfg(target_os = "linux")`.
 #[cfg(target_os = "linux")]
 pub mod boot;

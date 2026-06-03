@@ -412,3 +412,83 @@ fn uffd_wp_on_live_guest_is_supported() {
          (fall back to the proven snapshot-based fork)"
     );
 }
+
+/// FR-16 resume-in-place (Phase 1a): the foundation the running BRANCH is built on —
+/// `Machine::checkpoint_in_place` pauses the vCPUs at a quiescent barrier, captures
+/// their state, and **resumes them**, leaving the parent running (unlike the freeze-only
+/// snapshot pause). Proven end-to-end through the guest: write a marker over the parent's
+/// vsock bridge BEFORE the checkpoint, then read it back AFTER. The read only succeeds if
+/// the parent's vCPUs re-entered KVM_RUN and the guest kept executing (its exec agent is
+/// still serving); a broken resume leaves the guest dead and the bounded exec timeout
+/// fails the test fast instead of hanging.
+#[test]
+#[ignore = "requires /dev/kvm and fixtures; FR-16 resume-in-place"]
+fn checkpoint_in_place_keeps_parent_running() {
+    let cfg = fixture_config();
+    cfg.validate().unwrap();
+    let dir = scratch_dir("checkpoint-resume");
+
+    // Boot the parent with its own host vsock bridge so the host can exec into it.
+    let uds = dir.join("parent.sock");
+    let listener = UnixListener::bind(&uds).expect("bind parent vsock bridge");
+    let mut parent = Machine::boot_with_vsock(&cfg, Some(listener)).expect("parent boots bridged");
+    assert!(
+        parent
+            .wait_for_ready(Duration::from_secs(10))
+            .expect("readiness poll"),
+        "parent reached userspace"
+    );
+
+    // Parent serves exec BEFORE the checkpoint: write a marker into its guest fs.
+    let write_cmd: Vec<String> = ["/sbin/marker", "write", "RESUMED"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let w = run_exec_over_uds_ready(
+        &uds,
+        EXEC_PORT,
+        1,
+        &write_cmd,
+        10_000,
+        FORK_EXEC_READY_TIMEOUT,
+    )
+    .expect("pre-checkpoint exec");
+    assert_eq!(
+        w.exit_code,
+        0,
+        "pre-checkpoint marker write (stderr: {})",
+        String::from_utf8_lossy(&w.stderr)
+    );
+
+    // Checkpoint the RUNNING parent: pause vCPUs at the barrier, capture, resume in place.
+    let states = parent.checkpoint_in_place().expect("checkpoint in place");
+    assert_eq!(
+        states.len(),
+        cfg.vcpus as usize,
+        "captured one vcpu state per vcpu"
+    );
+
+    // The parent must STILL be running: read the marker back over the same bridge.
+    let read_cmd: Vec<String> = ["/sbin/marker", "read"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let r = run_exec_over_uds_ready(
+        &uds,
+        EXEC_PORT,
+        1,
+        &read_cmd,
+        10_000,
+        FORK_EXEC_READY_TIMEOUT,
+    )
+    .expect("post-checkpoint exec");
+    assert_eq!(r.exit_code, 0, "post-checkpoint marker read failed");
+    assert_eq!(
+        String::from_utf8_lossy(&r.stdout),
+        "RESUMED",
+        "parent kept running after the checkpoint and its guest state survived"
+    );
+
+    parent.shutdown().expect("stop parent");
+    let _ = std::fs::remove_dir_all(&dir);
+}

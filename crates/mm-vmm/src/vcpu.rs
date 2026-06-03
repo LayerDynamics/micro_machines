@@ -17,6 +17,7 @@ use kvm_bindings::{
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
+use crate::checkpoint::Checkpoint;
 use crate::machine::{IoDispatch, Result, VmmError};
 use crate::snapshot::state::{MsrEntry, VcpuState};
 
@@ -141,12 +142,13 @@ impl Vcpu {
     /// guest `HLT` is handled inside KVM (KVM_RUN blocks rather than returning), so
     /// teardown signals the thread: the signal interrupts KVM_RUN with `EINTR`, we
     /// observe `stop`, and return.
-    pub fn run(
+    pub(crate) fn run(
         &mut self,
         dispatch: &Arc<dyn IoDispatch>,
         stop: &AtomicBool,
         pause: &AtomicBool,
         pause_out: &Mutex<Option<VcpuState>>,
+        checkpoint: &Checkpoint,
     ) -> Result<VcpuRunExit> {
         loop {
             if stop.load(Ordering::Acquire) {
@@ -155,15 +157,25 @@ impl Vcpu {
             if pause.load(Ordering::Acquire) {
                 return self.do_pause(pause_out);
             }
+            // Capture-and-continue checkpoint (FR-16 running BRANCH): unlike the
+            // freeze-only `pause` above, capture state into the slot, park at the
+            // barrier, then resume KVM_RUN where we left off — the vCPU never exits.
+            if checkpoint.is_requested() {
+                self.checkpoint(pause_out, checkpoint)?;
+                continue;
+            }
             let exit = match self.fd.run() {
                 Ok(exit) => exit,
-                // A stop/pause signal interrupts KVM_RUN with EINTR; re-check both.
+                // A stop/pause/checkpoint signal interrupts KVM_RUN with EINTR; re-check.
                 Err(e) if e.errno() == libc::EINTR => {
                     if stop.load(Ordering::Acquire) {
                         return Ok(VcpuRunExit::Halted);
                     }
                     if pause.load(Ordering::Acquire) {
                         return self.do_pause(pause_out);
+                    }
+                    if checkpoint.is_requested() {
+                        self.checkpoint(pause_out, checkpoint)?;
                     }
                     continue;
                 }
@@ -226,6 +238,25 @@ impl Vcpu {
             *slot = Some(state);
         }
         Ok(VcpuRunExit::Paused)
+    }
+
+    /// Capture-and-continue: store this vCPU's state into `pause_out`, then park at the
+    /// `checkpoint` barrier until the orchestrator releases. Like [`do_pause`] the
+    /// state is read **outside** `KVM_RUN` (the caller checks the flag at the top of
+    /// the loop or right after `EINTR`), but the vCPU resumes instead of exiting — the
+    /// resume-in-place primitive the running BRANCH is built on. The store must happen
+    /// before `park` so "all parked" implies "all captured" for the orchestrator.
+    fn checkpoint(
+        &self,
+        pause_out: &Mutex<Option<VcpuState>>,
+        checkpoint: &Checkpoint,
+    ) -> Result<()> {
+        let state = self.capture_state()?;
+        if let Ok(mut slot) = pause_out.lock() {
+            *slot = Some(state);
+        }
+        checkpoint.park();
+        Ok(())
     }
 
     /// Capture this vCPU's full execution context for a snapshot (SPEC-1 FR-14).

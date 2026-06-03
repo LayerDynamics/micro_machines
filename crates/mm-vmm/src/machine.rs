@@ -27,6 +27,7 @@ use vm_memory::{
 };
 use vmm_sys_util::eventfd::EventFd;
 
+use crate::checkpoint::Checkpoint;
 use crate::config::{ConfigError, VirtioDevice as ConfigDevice, VmConfig};
 use crate::devices::{
     Balloon, Block, Bus, DevicePause, Interrupt, MmioTransport, Net, SerialDevice, VirtioDevice,
@@ -135,9 +136,14 @@ pub struct Machine {
     /// Set by `pause_and_capture_vcpus` to ask the vCPU threads to capture their
     /// state and freeze (snapshot, SPEC-1 FR-14), distinct from the teardown stop.
     vcpu_pause: Arc<AtomicBool>,
-    /// Per-vCPU capture slots, filled when the threads observe `vcpu_pause`, then
-    /// drained by `pause_and_capture_vcpus`. One per vCPU, in index order.
+    /// Per-vCPU capture slots, filled when the threads observe `vcpu_pause` (freeze)
+    /// **or** a `checkpoint` request (capture-and-continue), then drained by
+    /// `pause_and_capture_vcpus` / `checkpoint_in_place`. One per vCPU, in index order.
     vcpu_states: Vec<Arc<Mutex<Option<VcpuState>>>>,
+    /// Capture-and-continue barrier for resume-in-place (SPEC-1 FR-16 running BRANCH):
+    /// `checkpoint_in_place` uses it to pause the vCPUs at a quiescent point, capture
+    /// their state, and resume them — without the freeze-and-exit of `vcpu_pause`.
+    checkpoint: Arc<Checkpoint>,
     /// Snapshot capture handles for the snapshottable devices, in device-attach
     /// order. Each lets `pause_devices` signal the device's worker and read back its
     /// queue cursors (SPEC-1 FR-14).
@@ -251,6 +257,7 @@ impl Machine {
             vcpu_stop: Arc::new(AtomicBool::new(false)),
             vcpu_pause: Arc::new(AtomicBool::new(false)),
             vcpu_states: Vec::new(),
+            checkpoint: Arc::new(Checkpoint::default()),
             device_captures: Vec::new(),
             vcpu_tids: Arc::new(Mutex::new(Vec::new())),
         })
@@ -271,6 +278,22 @@ impl Machine {
     pub fn boot_with_hook(config: &VmConfig, vcpu_hook: Option<VcpuHook>) -> Result<Self> {
         let mut machine = Self::new(config)?;
         machine.vcpu_hook = vcpu_hook;
+        machine.start()?;
+        Ok(machine)
+    }
+
+    /// Like [`Machine::boot`], but bridge the boot vsock device to the host through
+    /// `vsock_listener` (an already-bound Unix-domain listener), so the host can `exec`
+    /// into the running guest over its own bridge — the non-jailed counterpart of
+    /// [`fork_with_vsock`](Self::fork_with_vsock)'s child bridging. `start` consumes the
+    /// listener (vs. the unbridged `Vsock::new`). With `None` this is exactly
+    /// [`boot`](Self::boot).
+    pub fn boot_with_vsock(
+        config: &VmConfig,
+        vsock_listener: Option<UnixListener>,
+    ) -> Result<Self> {
+        let mut machine = Self::new(config)?;
+        machine.vsock_listener = vsock_listener;
         machine.start()?;
         Ok(machine)
     }
@@ -443,6 +466,7 @@ impl Machine {
             let hook = self.vcpu_hook.clone();
             let stop = self.vcpu_stop.clone();
             let pause = self.vcpu_pause.clone();
+            let checkpoint = self.checkpoint.clone();
             let tids = self.vcpu_tids.clone();
             // Per-vCPU slot the thread fills if it is paused for a snapshot.
             let pause_out = Arc::new(Mutex::new(None));
@@ -461,7 +485,7 @@ impl Machine {
                     if let Some(hook) = &hook {
                         hook(vcpu.index())?;
                     }
-                    vcpu.run(&dispatch, &stop, &pause, &pause_out)
+                    vcpu.run(&dispatch, &stop, &pause, &pause_out, &checkpoint)
                 })
                 .map_err(VmmError::Io)?;
             self.vcpu_threads.push(handle);
@@ -646,6 +670,79 @@ impl Machine {
         for (index, slot) in self.vcpu_states.iter().enumerate() {
             let captured = slot.lock().ok().and_then(|mut g| g.take()).ok_or_else(|| {
                 VmmError::Vcpu(format!("vcpu {index} state was not captured during pause"))
+            })?;
+            states.push(captured);
+        }
+        Ok(states)
+    }
+
+    /// Pause the vCPUs at a quiescent barrier, capture each one's state, and **resume
+    /// them in place** (SPEC-1 FR-16 running BRANCH) — the running counterpart to the
+    /// freeze-only [`pause_and_capture_vcpus`](Self::pause_and_capture_vcpus). The vCPU
+    /// threads do **not** exit: after this returns the guest keeps executing exactly
+    /// where it was. Returns the captured [`VcpuState`]s in vCPU-index order (the basis
+    /// a branch's children resume from).
+    ///
+    /// Orchestration mirrors the snapshot pause's repeating kicker but **releases** the
+    /// barrier instead of joining the threads: request a checkpoint, kick the vCPUs out
+    /// of any blocking `KVM_RUN` until all have parked (each captures its state before
+    /// parking, so "all parked" ⇒ "all captured"), release them to resume, then read
+    /// the captured slots. The barrier is released on every exit path so a vCPU is
+    /// never stranded parked.
+    pub fn checkpoint_in_place(&mut self) -> Result<Vec<VcpuState>> {
+        let n = self.vcpu_states.len();
+        if n == 0 {
+            return Err(VmmError::Vcpu(
+                "checkpoint_in_place: no running vcpus".into(),
+            ));
+        }
+        self.checkpoint.request();
+
+        let tids: Vec<libc::pthread_t> = self
+            .vcpu_tids
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+
+        // Kick the vCPUs out of KVM_RUN until every one has parked at the barrier.
+        // Bounded so a stuck vCPU cannot hang the caller forever.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self
+            .checkpoint
+            .wait_until_parked(n, Duration::from_millis(20))
+        {
+            for &tid in &tids {
+                // SAFETY: VCPU_STOP_SIGNAL has a no-op handler; this only interrupts a
+                // blocking KVM_RUN so the thread observes the checkpoint request.
+                unsafe {
+                    libc::pthread_kill(tid, VCPU_STOP_SIGNAL);
+                }
+            }
+            if Instant::now() >= deadline {
+                self.checkpoint.release();
+                let _ = self.checkpoint.wait_until_resumed(Duration::from_secs(2));
+                return Err(VmmError::Vcpu(
+                    "vcpus did not reach the checkpoint barrier within the timeout".into(),
+                ));
+            }
+        }
+
+        // All vCPUs are parked at a quiescent point and have captured their state.
+        // Release them to resume; the per-vCPU slots stay stable afterwards (the
+        // request flag is now cleared, so a resumed vCPU will not rewrite its slot).
+        self.checkpoint.release();
+        if !self.checkpoint.wait_until_resumed(Duration::from_secs(5)) {
+            return Err(VmmError::Vcpu(
+                "vcpus did not resume from the checkpoint barrier within the timeout".into(),
+            ));
+        }
+
+        let mut states = Vec::with_capacity(n);
+        for (index, slot) in self.vcpu_states.iter().enumerate() {
+            let captured = slot.lock().ok().and_then(|mut g| g.take()).ok_or_else(|| {
+                VmmError::Vcpu(format!(
+                    "vcpu {index} state was not captured at the checkpoint"
+                ))
             })?;
             states.push(captured);
         }
@@ -1140,6 +1237,7 @@ impl Machine {
             let hook = self.vcpu_hook.clone();
             let stop = self.vcpu_stop.clone();
             let pause = self.vcpu_pause.clone();
+            let checkpoint = self.checkpoint.clone();
             let tids = self.vcpu_tids.clone();
             let pause_out = Arc::new(Mutex::new(None));
             self.vcpu_states.push(pause_out.clone());
@@ -1154,7 +1252,7 @@ impl Machine {
                     if let Some(hook) = &hook {
                         hook(vcpu.index())?;
                     }
-                    vcpu.run(&dispatch, &stop, &pause, &pause_out)
+                    vcpu.run(&dispatch, &stop, &pause, &pause_out, &checkpoint)
                 })
                 .map_err(VmmError::Io)?;
             self.vcpu_threads.push(handle);
