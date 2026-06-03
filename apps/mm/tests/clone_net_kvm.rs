@@ -118,7 +118,7 @@ fn mm_branch_clone_is_reachable_at_a_unique_ip_without_colliding_with_the_source
     );
     let src_ip = scan_ip(&String::from_utf8_lossy(&launch.stdout), src)
         .expect("mm run printed the source IP");
-    assert!(wait_exec(src, 90), "source never became exec-ready");
+    assert!(wait_exec(src, 120), "source never became exec-ready");
 
     // 2. Branch a live clone; capture its (distinct, host-routable) clone_ip.
     let branch = mm(&["branch", src, clone]).output().expect("mm branch");
@@ -136,8 +136,10 @@ fn mm_branch_clone_is_reachable_at_a_unique_ip_without_colliding_with_the_source
     );
 
     // 3. Both are independently alive over their own vsock bridges (the source kept
-    //    running through the branch; the clone is a live copy).
-    let clone_exec = wait_exec(clone, 90);
+    //    running through the branch; the clone is a live copy). The clone gets a generous
+    //    window: the --branchable source boots an extra uffd + the WP branch + the clone's
+    //    own boot all run under nested-KVM CI, which is slow and variable.
+    let clone_exec = wait_exec(clone, 150);
     let src_still = wait_exec(src, 30);
 
     // 4. The whole point: the clone is reachable at its clone_ip from the host, AND the
