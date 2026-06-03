@@ -40,18 +40,20 @@ mod tests {
         // with no Machine/KVM.
         let mut calls = Vec::new();
         let mut act = |req: &ControlRequest| -> std::result::Result<String, String> {
-            calls.push(req.clone());
+            calls.push(*req);
             match req {
-                ControlRequest::Snapshot { dir } => Ok(dir.clone()),
-                ControlRequest::Branch { .. } => Err("no branch".into()),
+                ControlRequest::Snapshot => Ok("snap-id".into()),
+                ControlRequest::Branch => Err("no branch".into()),
             }
         };
         assert_eq!(
-            dispatch_control(&ControlRequest::Snapshot { dir: "s1".into() }, &mut act),
-            ControlResponse::Ok { id: "s1".into() }
+            dispatch_control(&ControlRequest::Snapshot, &mut act),
+            ControlResponse::Ok {
+                id: "snap-id".into()
+            }
         );
         assert_eq!(
-            dispatch_control(&ControlRequest::Branch { dir: "b1".into() }, &mut act),
+            dispatch_control(&ControlRequest::Branch, &mut act),
             ControlResponse::Err {
                 msg: "no branch".into()
             }
@@ -131,13 +133,11 @@ mod linux {
     use mm_sandbox::{CgroupLimits, JailSpec};
     use mm_vmm::{Machine, VcpuHook, VmConfig, VmmError};
 
+    use mm_vmm::snapshot::SnapshotStore;
+
     use super::WorkerArgs;
     use crate::control_proto::{ControlRequest, ControlResponse};
-
-    /// Where the worker writes snapshots, *inside* the chroot. The privileged parent
-    /// creates `<jail_root>/snapshots/<id>` (writable by the dropped uid) before launch;
-    /// post-chroot that is `/snapshots/<id>`.
-    const SNAPSHOT_ROOT: &str = "/snapshots";
+    use crate::SNAPSHOT_BUCKET;
 
     pub fn run(args: WorkerArgs) -> Result<()> {
         // Read + parse the config while still privileged and outside the chroot.
@@ -176,7 +176,7 @@ mod linux {
 
         // Boot using the inherited KVM + TAP fds (the confined process cannot open
         // them itself).
-        let mut machine = Machine::boot_jailed(
+        let machine = Machine::boot_jailed(
             &config,
             args.kvm_fd,
             vec![args.tap_fd],
@@ -250,17 +250,19 @@ mod linux {
                         let mut m = machine
                             .lock()
                             .map_err(|_| "machine lock poisoned".to_string())?;
-                        let root = std::path::Path::new(SNAPSHOT_ROOT);
+                        // We are chrooted to the jail, so the host state root is "/"; the
+                        // worker owns `/snapshots` (writable) and allocates the id itself.
+                        let store = SnapshotStore::new("/");
+                        let (id, dir) = store
+                            .new_snapshot_dir(SNAPSHOT_BUCKET)
+                            .map_err(|e| e.to_string())?;
                         match req {
-                            ControlRequest::Snapshot { dir } => {
-                                mm_vmm::snapshot::snapshot(&mut m, &root.join(dir))
-                                    .map(|_| dir.clone())
-                                    .map_err(|e| e.to_string())
-                            }
-                            ControlRequest::Branch { dir } => m
-                                .branch(&root.join(dir))
-                                .map(|_| dir.clone())
+                            ControlRequest::Snapshot => mm_vmm::snapshot::snapshot(&mut m, &dir)
+                                .map(|_| id)
                                 .map_err(|e| e.to_string()),
+                            ControlRequest::Branch => {
+                                m.branch(&dir).map(|_| id).map_err(|e| e.to_string())
+                            }
                         }
                     };
                     super::dispatch_control(&req, &mut act)

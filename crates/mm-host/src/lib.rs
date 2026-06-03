@@ -27,6 +27,12 @@ mod worker;
 pub use config::{build_vm_config, default_name, mac_from_ip, NETMASK};
 pub use worker::{run as run_worker, WorkerArgs};
 
+/// The `SnapshotStore` machine-bucket used for a single host's per-VM snapshots. The
+/// per-VM jail already scopes snapshots to one machine, so a fixed bucket name is used
+/// on both sides: the worker writes `<chroot>/snapshots/<bucket>/<id>` and the CLI reads
+/// `<jail_root>/snapshots/<bucket>/<id>` — the same directory.
+pub const SNAPSHOT_BUCKET: &str = "local";
+
 /// Everything needed to boot one microVM, decoupled from any registry. The caller
 /// resolves the machine name + the IPs already in use (so launch never reads a
 /// store) and the on-disk locations of the kernel, mm-init, and optional sshd.
