@@ -643,7 +643,8 @@ fn branch_of_running_parent_forks_independent_child() {
     let branch_dir = dir.join("branch");
     let manifest = parent
         .branch(&branch_dir)
-        .expect("branch the running parent");
+        .expect("branch the running parent")
+        .manifest;
 
     // (1) The parent kept running: write a NEW marker over the same bridge and read it.
     let w2 = run_exec_over_uds_ready(
@@ -692,6 +693,76 @@ fn branch_of_running_parent_forks_independent_child() {
     child.shutdown().expect("stop child");
     parent.shutdown().expect("stop parent");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// FR-16 write-protect path determinism (the gate for the jailed-uffd branch): force the
+/// running parent to write its RAM *during* the branch window and assert the engine
+/// serviced ≥1 write-protect fault. The earlier `branch_of_running_parent_*` test relies
+/// on the idle guest's incidental writes (which can be zero — flaky as a WP assertion);
+/// here a host thread churns the guest's high (idle) RAM while the branch is armed, so the
+/// write-protect handler is *guaranteed* to fire. `faulted == 0` would mean the engine
+/// silently materialized everything via the copier without the WP path — exactly the
+/// silent-fallback this asserts against.
+#[test]
+#[ignore = "requires /dev/kvm and fixtures; FR-16 WP-path determinism gate"]
+fn branch_wp_path_services_faults_under_concurrent_writes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let cfg = fixture_config();
+    cfg.validate().unwrap();
+    let dir = scratch_dir("branch-wp");
+    let puds = dir.join("parent.sock");
+    let listener = UnixListener::bind(&puds).expect("bind parent vsock bridge");
+    let mut parent = Machine::boot_with_vsock(&cfg, Some(listener)).expect("parent boots");
+    assert!(
+        parent
+            .wait_for_ready(Duration::from_secs(10))
+            .expect("readiness poll"),
+        "parent reached userspace"
+    );
+
+    // A host thread churns the guest's upper RAM (96–120 MiB — unused by the idle 128 MiB
+    // guest) so that, once `branch` arms write-protection, the first write to each armed
+    // page faults out to the handler. The handler removes WP after preserving the page, so
+    // each page faults at most once; the continuous loop guarantees overlap with the
+    // armed window regardless of scheduling.
+    let gm = parent.guest_memory().clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let gm = gm.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut churn: u8 = 1;
+            while !stop.load(Ordering::Relaxed) {
+                churn = churn.wrapping_add(1);
+                let mut off = 0x0600_0000u64; // 96 MiB
+                while off < 0x0780_0000 {
+                    // 120 MiB
+                    let _ = gm.write_obj(churn, GuestAddress(off));
+                    off += 4096;
+                }
+            }
+        })
+    };
+
+    let branch_dir = dir.join("branch");
+    let outcome = parent
+        .branch(&branch_dir)
+        .expect("branch under concurrent writes");
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = writer.join();
+    parent.shutdown().expect("stop parent");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        outcome.faulted > 0,
+        "the write-protect path must service ≥1 fault under concurrent parent writes \
+         (faulted={}, copied={}); faulted=0 would mean a silent non-WP fallback",
+        outcome.faulted,
+        outcome.copied
+    );
 }
 
 /// Run an exec `cmd` over a child's vsock bridge at `uds` with the fork readiness retry,

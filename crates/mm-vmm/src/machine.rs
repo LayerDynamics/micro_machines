@@ -189,6 +189,19 @@ fn install_vcpu_stop_handler() {
     });
 }
 
+/// The result of [`Machine::branch`]: the written manifest plus how each guest page's
+/// T-version reached the branch file. `copied` is the count the background copier wrote
+/// (untouched pages); `faulted` is the count the write-protect handler serviced (pages the
+/// running parent wrote during materialization). `faulted > 0` is direct evidence the
+/// userfaultfd write-protect path actually ran — the discriminator a deterministic test
+/// asserts so a silent fallback can't pass.
+#[cfg(feature = "branch")]
+pub struct BranchOutcome {
+    pub manifest: crate::snapshot::SnapshotManifest,
+    pub copied: u64,
+    pub faulted: u64,
+}
+
 impl Machine {
     /// Create the VM: validate the config, open `/dev/kvm`, allocate and map guest
     /// RAM, set up the in-kernel IRQ chip + PIT, and create the vCPUs.
@@ -923,12 +936,11 @@ impl Machine {
     /// from it with the proven `MAP_PRIVATE` path
     /// ([`fork_children`](crate::snapshot::fork_children)).
     ///
-    /// Returns the written [`SnapshotManifest`]. Requires the `branch` feature.
+    /// Returns the written [`SnapshotManifest`] plus how the T-image was materialized
+    /// (see [`BranchOutcome`]) — `faulted > 0` proves the write-protect path actually
+    /// serviced the running parent's writes. Requires the `branch` feature.
     #[cfg(feature = "branch")]
-    pub fn branch(
-        &mut self,
-        out_dir: &std::path::Path,
-    ) -> Result<crate::snapshot::SnapshotManifest> {
+    pub fn branch(&mut self, out_dir: &std::path::Path) -> Result<BranchOutcome> {
         use crate::snapshot::branch::BranchEngine;
 
         std::fs::create_dir_all(out_dir).map_err(VmmError::Io)?;
@@ -1010,7 +1022,11 @@ impl Machine {
             host,
         };
         crate::snapshot::engine::write_snapshot_metadata(out_dir, &vm_state, &manifest)?;
-        Ok(manifest)
+        Ok(BranchOutcome {
+            manifest,
+            copied: copier,
+            faulted,
+        })
     }
 
     /// The parent's guest RAM regions as `(host_base_addr, len_bytes)` in ascending
