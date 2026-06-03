@@ -133,6 +133,11 @@ pub struct Machine {
     vsock_listener: Option<UnixListener>,
     /// Set by `shutdown` to ask the vCPU threads to stop.
     vcpu_stop: Arc<AtomicBool>,
+    /// Set by each vCPU thread as it exits its run loop (guest powered off / shut down
+    /// / errored). Lets a holder of a *shared* `Machine` (the jailed worker's control
+    /// loop) poll liveness with [`is_powered_off`](Self::is_powered_off) without taking
+    /// a long-lived `&mut` borrow.
+    powered_off: Arc<AtomicBool>,
     /// Set by `pause_and_capture_vcpus` to ask the vCPU threads to capture their
     /// state and freeze (snapshot, SPEC-1 FR-14), distinct from the teardown stop.
     vcpu_pause: Arc<AtomicBool>,
@@ -255,6 +260,7 @@ impl Machine {
             tap_fds,
             vsock_listener: None,
             vcpu_stop: Arc::new(AtomicBool::new(false)),
+            powered_off: Arc::new(AtomicBool::new(false)),
             vcpu_pause: Arc::new(AtomicBool::new(false)),
             vcpu_states: Vec::new(),
             checkpoint: Arc::new(Checkpoint::default()),
@@ -467,6 +473,7 @@ impl Machine {
             let stop = self.vcpu_stop.clone();
             let pause = self.vcpu_pause.clone();
             let checkpoint = self.checkpoint.clone();
+            let powered_off = self.powered_off.clone();
             let tids = self.vcpu_tids.clone();
             // Per-vCPU slot the thread fills if it is paused for a snapshot.
             let pause_out = Arc::new(Mutex::new(None));
@@ -482,10 +489,17 @@ impl Machine {
                     }
                     // Run the pre-run hook (e.g. seccomp install) on this thread,
                     // after the VMM's opens, before any guest code executes.
-                    if let Some(hook) = &hook {
-                        hook(vcpu.index())?;
-                    }
-                    vcpu.run(&dispatch, &stop, &pause, &pause_out, &checkpoint)
+                    let result = (|| {
+                        if let Some(hook) = &hook {
+                            hook(vcpu.index())?;
+                        }
+                        vcpu.run(&dispatch, &stop, &pause, &pause_out, &checkpoint)
+                    })();
+                    // Signal power-off however the run loop ended (shutdown, error, or a
+                    // failed hook), so a holder of a shared Machine stops waiting on a
+                    // dead guest.
+                    powered_off.store(true, Ordering::Release);
+                    result
                 })
                 .map_err(VmmError::Io)?;
             self.vcpu_threads.push(handle);
@@ -548,6 +562,14 @@ impl Machine {
             return Err(VmmError::Io(std::io::Error::last_os_error()));
         }
         Ok(rc > 0 && (poll_fd.revents & libc::POLLIN) != 0)
+    }
+
+    /// Whether a vCPU thread has exited its run loop (the guest powered off, shut down,
+    /// or a vCPU errored). Cheap and lock-free: the jailed worker's control loop holds
+    /// the `Machine` behind a `Mutex` and polls this to decide when to stop serving and
+    /// reap, without taking a long-lived `&mut` borrow that would block snapshots.
+    pub fn is_powered_off(&self) -> bool {
+        self.powered_off.load(Ordering::Acquire)
     }
 
     /// Serve the guest until it powers itself off: join the vCPU threads, each of
@@ -1434,6 +1456,7 @@ impl Machine {
             let stop = self.vcpu_stop.clone();
             let pause = self.vcpu_pause.clone();
             let checkpoint = self.checkpoint.clone();
+            let powered_off = self.powered_off.clone();
             let tids = self.vcpu_tids.clone();
             let pause_out = Arc::new(Mutex::new(None));
             self.vcpu_states.push(pause_out.clone());
@@ -1445,10 +1468,15 @@ impl Machine {
                     if let Ok(mut guard) = tids.lock() {
                         guard.push(tid);
                     }
-                    if let Some(hook) = &hook {
-                        hook(vcpu.index())?;
-                    }
-                    vcpu.run(&dispatch, &stop, &pause, &pause_out, &checkpoint)
+                    let result = (|| {
+                        if let Some(hook) = &hook {
+                            hook(vcpu.index())?;
+                        }
+                        vcpu.run(&dispatch, &stop, &pause, &pause_out, &checkpoint)
+                    })();
+                    // Signal power-off on any exit path (see the boot spawn site).
+                    powered_off.store(true, Ordering::Release);
+                    result
                 })
                 .map_err(VmmError::Io)?;
             self.vcpu_threads.push(handle);

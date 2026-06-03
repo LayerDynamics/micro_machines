@@ -11,6 +11,55 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+use crate::control_proto::{ControlRequest, ControlResponse};
+
+/// Map one control request to its response via `act`, which performs the snapshot or
+/// branch on the live `Machine` and returns the new snapshot id (or an error message).
+/// Pure glue between the wire protocol and the engine — unit-tested without KVM.
+// The only non-test caller is the Linux-only worker control loop, so on non-Linux this
+// is exercised solely by the unit test; allow it to be "unused" in a non-test build.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn dispatch_control(
+    req: &ControlRequest,
+    act: &mut impl FnMut(&ControlRequest) -> std::result::Result<String, String>,
+) -> ControlResponse {
+    match act(req) {
+        Ok(id) => ControlResponse::Ok { id },
+        Err(msg) => ControlResponse::Err { msg },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_dispatch_maps_requests_to_responses() {
+        // A fake "actor" stands in for the live-Machine snapshot/branch, so the
+        // request→response mapping (verb dispatch, id echo, error mapping) is tested
+        // with no Machine/KVM.
+        let mut calls = Vec::new();
+        let mut act = |req: &ControlRequest| -> std::result::Result<String, String> {
+            calls.push(req.clone());
+            match req {
+                ControlRequest::Snapshot { dir } => Ok(dir.clone()),
+                ControlRequest::Branch { .. } => Err("no branch".into()),
+            }
+        };
+        assert_eq!(
+            dispatch_control(&ControlRequest::Snapshot { dir: "s1".into() }, &mut act),
+            ControlResponse::Ok { id: "s1".into() }
+        );
+        assert_eq!(
+            dispatch_control(&ControlRequest::Branch { dir: "b1".into() }, &mut act),
+            ControlResponse::Err {
+                msg: "no branch".into()
+            }
+        );
+        assert_eq!(calls.len(), 2);
+    }
+}
+
 /// Arguments for the internal `__vmm-worker` subcommand. Shared so both the `mm`
 /// CLI and the cluster agent can expose the same hidden subcommand and dispatch it
 /// to [`run`].
@@ -29,6 +78,10 @@ pub struct WorkerArgs {
     /// readiness-only path.
     #[arg(long)]
     pub vsock_fd: Option<i32>,
+    /// Inherited control UDS listener fd number (parent↔worker live snapshot/branch
+    /// channel); absent when the worker is launched without a control channel.
+    #[arg(long)]
+    pub control_fd: Option<i32>,
     /// Per-VM chroot root.
     #[arg(long)]
     pub chroot: PathBuf,
@@ -68,7 +121,10 @@ pub fn run(args: WorkerArgs) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::sync::Arc;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::io::FromRawFd;
+    use std::os::unix::net::UnixListener;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use anyhow::{Context, Result};
@@ -76,6 +132,12 @@ mod linux {
     use mm_vmm::{Machine, VcpuHook, VmConfig, VmmError};
 
     use super::WorkerArgs;
+    use crate::control_proto::{ControlRequest, ControlResponse};
+
+    /// Where the worker writes snapshots, *inside* the chroot. The privileged parent
+    /// creates `<jail_root>/snapshots/<id>` (writable by the dropped uid) before launch;
+    /// post-chroot that is `/snapshots/<id>`.
+    const SNAPSHOT_ROOT: &str = "/snapshots";
 
     pub fn run(args: WorkerArgs) -> Result<()> {
         // Read + parse the config while still privileged and outside the chroot.
@@ -131,11 +193,81 @@ mod linux {
             tracing::warn!("guest did not signal readiness within 10s");
         }
 
-        // Serve the guest for its full lifetime — until it powers itself off (a
-        // workload that exits, or `mm stop` killing this process). We must NOT call
-        // shutdown() here: that would force the vCPUs to stop right after readiness,
-        // tearing down a long-running guest (and releasing its TAP) immediately.
-        machine.wait_for_vcpus().context("running microVM")?;
+        // Share the Machine so a control thread can act on the *live* guest while the
+        // main thread reaps. The control loop only locks it briefly per request (a
+        // snapshot pauses→captures→resumes; a branch arms WP then copies concurrently),
+        // and the reaper polls liveness without holding the lock during the wait.
+        let machine = Arc::new(Mutex::new(machine));
+
+        if let Some(fd) = args.control_fd {
+            // SAFETY: `fd` is the inherited, bound, listening control socket (fd 13);
+            // we take sole ownership of it here.
+            let listener = unsafe { UnixListener::from_raw_fd(fd) };
+            let machine = machine.clone();
+            std::thread::Builder::new()
+                .name("mm-control".into())
+                .spawn(move || serve_control(listener, machine))
+                .context("spawning control thread")?;
+        }
+
+        // Reaper: serve the guest for its full lifetime — until it powers itself off (a
+        // workload that exits, or `mm stop` killing this process). Poll the lock-free
+        // power-off signal WITHOUT holding the machine lock (so an in-flight
+        // snapshot/branch on the control thread is never blocked), then join the threads.
+        // We must NOT call shutdown() here: that would tear down a long-running guest.
+        loop {
+            let off = machine.lock().map(|m| m.is_powered_off()).unwrap_or(true);
+            if off {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        machine
+            .lock()
+            .expect("machine lock")
+            .wait_for_vcpus()
+            .context("running microVM")?;
         Ok(())
+    }
+
+    /// Serve the parent↔worker control UDS: one request line, one response line per
+    /// connection. Each `SNAPSHOT`/`BRANCH` briefly locks the shared `Machine` and runs
+    /// the engine into `/snapshots/<dir>` (inside the chroot), then replies `OK <id>` or
+    /// `ERR <msg>`. Loops until the listener closes (process teardown).
+    fn serve_control(listener: UnixListener, machine: Arc<Mutex<Machine>>) {
+        for conn in listener.incoming() {
+            let mut conn = match conn {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let mut line = String::new();
+            if BufReader::new(&conn).read_line(&mut line).is_err() {
+                continue;
+            }
+            let resp = match ControlRequest::parse(line.trim_end()) {
+                Ok(req) => {
+                    let mut act = |req: &ControlRequest| -> std::result::Result<String, String> {
+                        let mut m = machine
+                            .lock()
+                            .map_err(|_| "machine lock poisoned".to_string())?;
+                        let root = std::path::Path::new(SNAPSHOT_ROOT);
+                        match req {
+                            ControlRequest::Snapshot { dir } => {
+                                mm_vmm::snapshot::snapshot(&mut m, &root.join(dir))
+                                    .map(|_| dir.clone())
+                                    .map_err(|e| e.to_string())
+                            }
+                            ControlRequest::Branch { dir } => m
+                                .branch(&root.join(dir))
+                                .map(|_| dir.clone())
+                                .map_err(|e| e.to_string()),
+                        }
+                    };
+                    super::dispatch_control(&req, &mut act)
+                }
+                Err(e) => ControlResponse::Err { msg: e },
+            };
+            let _ = conn.write_all(resp.encode().as_bytes());
+        }
     }
 }
