@@ -40,3 +40,13 @@ pub use fork_engine::fork_children;
 /// cannot (no Linux kernel headers).
 #[cfg(all(target_os = "linux", feature = "branch"))]
 pub mod branch;
+
+/// Lazy post-copy branching (SPEC-1 FR-16 Phase 2): serve a child's RAM on demand from the
+/// parent (still-T pages) + the sparse branch file (diverged pages), avoiding the eager
+/// full-RAM copy. The engine is complete + compile-checked here; the Machine wiring
+/// (`branch_lazy`/`fork_lazy`) + KVM e2e are the remaining step (see
+/// `docs/plans/2026-06-03-lazy-post-copy.md`) — `allow(dead_code)` marks the not-yet-wired
+/// gap honestly until then.
+#[cfg(all(target_os = "linux", feature = "branch"))]
+#[allow(dead_code)]
+pub(crate) mod lazy;
