@@ -84,6 +84,10 @@ pub struct WorkerArgs {
     /// channel); absent when the worker is launched without a control channel.
     #[arg(long)]
     pub control_fd: Option<i32>,
+    /// Restore the guest from this snapshot directory (chroot-relative, e.g. `/restore`)
+    /// instead of cold-booting from the kernel/rootfs. Set by `mm restore`/`mm branch`.
+    #[arg(long)]
+    pub restore_dir: Option<PathBuf>,
     /// Per-VM chroot root.
     #[arg(long)]
     pub chroot: PathBuf,
@@ -174,16 +178,28 @@ mod linux {
             })
         };
 
-        // Boot using the inherited KVM + TAP fds (the confined process cannot open
-        // them itself).
-        let machine = Machine::boot_jailed(
-            &config,
-            args.kvm_fd,
-            vec![args.tap_fd],
-            args.vsock_fd,
-            Some(hook),
-        )
-        .context("booting jailed microVM")?;
+        // Bring the guest up using the inherited KVM + TAP fds (the confined process
+        // cannot open them itself): either cold-boot from the kernel/rootfs, or — when a
+        // restore dir was passed — restore the snapshot in that (chroot-relative) dir.
+        let machine = match &args.restore_dir {
+            Some(dir) => mm_vmm::snapshot::restore(
+                &config,
+                args.kvm_fd,
+                vec![args.tap_fd],
+                args.vsock_fd,
+                Some(hook),
+                dir,
+            )
+            .context("restoring jailed microVM from snapshot")?,
+            None => Machine::boot_jailed(
+                &config,
+                args.kvm_fd,
+                vec![args.tap_fd],
+                args.vsock_fd,
+                Some(hook),
+            )
+            .context("booting jailed microVM")?,
+        };
         let ready = machine
             .wait_for_ready(Duration::from_secs(10))
             .context("waiting for guest readiness")?;

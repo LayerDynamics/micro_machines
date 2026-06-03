@@ -60,6 +60,29 @@ pub struct LaunchSpec {
     pub reserved_ips: Vec<Ipv4Addr>,
 }
 
+/// Everything needed to restore a microVM from a snapshot directory into a fresh jail.
+/// Unlike [`LaunchSpec`] there is no OCI image — the guest comes from the snapshot's
+/// memory + state; the caller supplies the source machine's rootfs + kernel (the device
+/// set must match the snapshot) and the snapshot directory.
+pub struct RestoreSpec {
+    /// New machine name (already resolved + collision-checked by the caller).
+    pub name: String,
+    /// Snapshot directory holding `manifest.json` + `state.bin` + `memory.bin`.
+    pub snapshot_dir: PathBuf,
+    /// The source machine's rootfs image (linked into the new jail as `/rootfs.ext4`).
+    pub rootfs_path: PathBuf,
+    /// Guest kernel (linked into the new jail as `/vmlinux`).
+    pub kernel_path: PathBuf,
+    pub cpus: u8,
+    pub memory_mib: u64,
+    /// Run the worker detached (its own session) and return immediately.
+    pub detach: bool,
+    /// Root directory for host state (per-VM jails + managed SSH key).
+    pub state_root: PathBuf,
+    /// IPs already allocated to other machines, to seed the IPAM pool.
+    pub reserved_ips: Vec<Ipv4Addr>,
+}
+
 /// The result of a successful [`launch`] — what the caller persists.
 pub struct LaunchOutcome {
     pub name: String,
@@ -93,5 +116,19 @@ pub fn launch(spec: &LaunchSpec) -> anyhow::Result<LaunchOutcome> {
     {
         let _ = spec;
         anyhow::bail!("booting a microVM requires a Linux/KVM host")
+    }
+}
+
+/// Restore a microVM from a snapshot directory into a fresh jail (SPEC-1 FR-14), the
+/// counterpart of [`launch`] for `mm restore`/`mm branch`. Linux/KVM only.
+pub fn restore_launch(spec: &RestoreSpec) -> anyhow::Result<LaunchOutcome> {
+    #[cfg(target_os = "linux")]
+    {
+        launch::restore_launch(spec)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = spec;
+        anyhow::bail!("restoring a microVM requires a Linux/KVM host")
     }
 }

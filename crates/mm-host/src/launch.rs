@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use mm_image::ImageStore;
 
 use crate::config::{build_vm_config, mac_from_ip, NETMASK};
-use crate::{LaunchOutcome, LaunchSpec};
+use crate::{LaunchOutcome, LaunchSpec, RestoreSpec};
 
 /// The `/24` MicroMachines guests live on, plus the bridge name.
 const SUBNET_BASE: [u8; 3] = [10, 0, 0];
@@ -161,6 +161,7 @@ pub fn launch(spec: &LaunchSpec) -> Result<LaunchOutcome> {
         mem_max,
         spec.detach,
         &console_log,
+        None, // cold boot from the image rootfs
     )?;
     let pid = child.id();
 
@@ -184,6 +185,137 @@ pub fn launch(spec: &LaunchSpec) -> Result<LaunchOutcome> {
     })
 }
 
+/// Restore a microVM from a snapshot directory into a fresh jail (SPEC-1 FR-14): like
+/// [`launch`] but the guest comes from `spec.snapshot_dir` (memory + device + vCPU
+/// state) rather than a cold boot from an OCI image. The source machine's rootfs +
+/// kernel are linked into the new jail; the snapshot is linked to `<jail_root>/restore`;
+/// and the worker resumes via `mm_vmm::snapshot::restore` (`--restore-dir /restore`).
+pub fn restore_launch(spec: &RestoreSpec) -> Result<LaunchOutcome> {
+    let root = spec.state_root.as_path();
+    let name = spec.name.clone();
+
+    // 1. Allocate a fresh IP + host networking (same as a cold boot). The restored
+    //    guest resumes with the IP captured in its RAM; the caller is responsible for
+    //    not running two machines on the same guest IP (re-IP per clone is a follow-up).
+    let mut ipam = mm_net::Ipam::new(SUBNET_BASE, 1);
+    for ip in &spec.reserved_ips {
+        ipam.reserve(*ip);
+    }
+    let ip = ipam.allocate().context("guest IP pool exhausted")?;
+    let gateway = ipam.gateway();
+    mm_net::ensure_bridge(BRIDGE, gateway, 24).context("ensuring bridge")?;
+    let tap_name = format!("mm-{name}");
+    let tap = mm_net::create_tap(&tap_name, BRIDGE).context("creating TAP")?;
+    let egress = default_egress_iface().unwrap_or_else(|| "eth0".to_string());
+    mm_net::enable_nat(SUBNET_CIDR, &egress).context("enabling NAT")?;
+
+    // 2. Inheritable /dev/kvm fd.
+    let kvm_fd = open_kvm_inheritable()?;
+
+    // 3. Jail: link the kernel + the source rootfs in (the device set must match the
+    //    snapshot), then link the snapshot dir to `<jail_root>/restore`.
+    let jail = root.join("jails").join(&name);
+    let jail_root = jail.join("root");
+    std::fs::create_dir_all(&jail_root)
+        .with_context(|| format!("creating jail {}", jail_root.display()))?;
+    let jail_kernel = jail_root.join("vmlinux");
+    let jail_rootfs = jail_root.join("rootfs.ext4");
+    link_or_copy(&spec.kernel_path, &jail_kernel)?;
+    link_or_copy(&spec.rootfs_path, &jail_rootfs)?;
+    prepare_jail_permissions(&jail, &jail_root, &[&jail_kernel, &jail_rootfs])?;
+
+    let restore_in_jail = jail_root.join("restore");
+    std::fs::create_dir_all(&restore_in_jail)
+        .with_context(|| format!("creating {}", restore_in_jail.display()))?;
+    link_snapshot_dir(&spec.snapshot_dir, &restore_in_jail)?;
+    chown_to_worker(&restore_in_jail)?;
+
+    // 4. Writable snapshots dir so the restored VM can itself be snapshotted later.
+    let jail_snapshots = jail_root.join("snapshots");
+    std::fs::create_dir_all(&jail_snapshots)
+        .with_context(|| format!("creating {}", jail_snapshots.display()))?;
+    chown_to_worker(&jail_snapshots)?;
+
+    // 5. VM config with the snapshot's device set. The cmdline is discarded on restore
+    //    (the guest already booted), so no workload/key/seed are injected.
+    let worker_cfg = build_vm_config(
+        spec.cpus,
+        spec.memory_mib,
+        std::path::PathBuf::from("/vmlinux"),
+        std::path::PathBuf::from("/rootfs.ext4"),
+        ip,
+        gateway,
+        NETMASK,
+        &name,
+        tap_name.clone(),
+        mac_from_ip(ip),
+        None,
+        None,
+        None,
+    );
+    worker_cfg.validate().context("validating VM config")?;
+    let cfg_path = jail.join("config.json");
+    std::fs::write(&cfg_path, serde_json::to_vec(&worker_cfg)?)
+        .with_context(|| format!("writing {}", cfg_path.display()))?;
+
+    // 6. vsock + control UDSes (same as a cold boot).
+    let vsock_path = jail.join("vsock.sock");
+    let vsock_listener = bind_vsock_listener(&vsock_path)?;
+    let control_path = jail.join("control.sock");
+    let control_listener = bind_vsock_listener(&control_path)?;
+
+    // 7. Spawn the jailed worker in restore mode.
+    let cgroup = format!("micro_machines/{name}");
+    let cpu_max = format!("{} 100000", u64::from(spec.cpus) * 100_000);
+    let mem_max = spec.memory_mib * 1024 * 1024;
+    let console_log = jail.join("console.log");
+    let child = spawn_worker(
+        &cfg_path,
+        kvm_fd,
+        tap.as_raw_fd(),
+        vsock_listener.as_raw_fd(),
+        control_listener.as_raw_fd(),
+        &jail_root,
+        &cgroup,
+        &cpu_max,
+        mem_max,
+        spec.detach,
+        &console_log,
+        Some(std::path::Path::new("/restore")),
+    )?;
+    let pid = child.id();
+
+    // SAFETY: `kvm_fd` is the fd we opened; the child inherited its own copy.
+    unsafe { libc::close(kvm_fd) };
+    drop(tap);
+    drop(vsock_listener);
+    drop(control_listener);
+
+    Ok(LaunchOutcome {
+        name,
+        ip,
+        tap_name,
+        pid,
+        console_log,
+        vsock_path,
+        control_path,
+        child,
+    })
+}
+
+/// Link a snapshot's three files into the worker-visible restore dir, making each
+/// readable by the dropped worker uid (the snapshot dir lives under the same state
+/// root, so a hardlink is used; `link_or_copy` falls back to a copy across filesystems).
+fn link_snapshot_dir(src: &Path, dst: &Path) -> Result<()> {
+    for file in ["manifest.json", "state.bin", "memory.bin"] {
+        let s = src.join(file);
+        let d = dst.join(file);
+        link_or_copy(&s, &d)?;
+        chown_to_worker(&d)?;
+    }
+    Ok(())
+}
+
 /// Spawn the `__vmm-worker` subcommand of the current executable, dup'ing the KVM +
 /// TAP fds to fixed numbers in the child so they survive `exec` at predictable
 /// descriptors. When `detach` is set, the worker is put in its own session
@@ -202,6 +334,7 @@ fn spawn_worker(
     mem_max: u64,
     detach: bool,
     log_path: &Path,
+    restore_dir: Option<&Path>,
 ) -> Result<Child> {
     let exe = std::env::current_exe().context("locating current executable")?;
     let mut cmd = Command::new(exe);
@@ -228,6 +361,10 @@ fn spawn_worker(
         .arg(cpu_max)
         .arg("--mem-max")
         .arg(mem_max.to_string());
+    // Restore path: tell the worker to resume from the (chroot-relative) snapshot dir.
+    if let Some(dir) = restore_dir {
+        cmd.arg("--restore-dir").arg(dir);
+    }
     // Enter a user namespace by default (additive hardening); MM_NO_USERNS=1
     // disables it for kernels without unprivileged-userns or for debugging.
     if std::env::var_os("MM_NO_USERNS").is_none() {

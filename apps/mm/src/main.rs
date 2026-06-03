@@ -46,6 +46,8 @@ enum Command {
     Exec(commands::exec::ExecArgs),
     /// Manage snapshots of a machine (create/ls/rm/gc).
     Snapshot(commands::snapshot::SnapshotArgs),
+    /// Restore a snapshot into a new machine.
+    Restore(commands::restore::RestoreArgs),
     /// (internal) Jailed VMM worker, spawned by `mm run`. Not for direct use.
     #[command(name = "__vmm-worker", hide = true)]
     Worker(commands::worker::WorkerArgs),
@@ -82,6 +84,9 @@ fn main() -> anyhow::Result<()> {
             Command::Snapshot(_) => {
                 anyhow::bail!("`mm snapshot` is single-host only; cluster snapshots are managed via the controller's Snapshot resource (REST)")
             }
+            Command::Restore(_) => {
+                anyhow::bail!("`mm restore` is single-host only; restore a cluster machine via the controller's Snapshot resource (REST)")
+            }
             Command::Worker(_) => unreachable!("handled above"),
         };
     }
@@ -95,6 +100,7 @@ fn main() -> anyhow::Result<()> {
         Command::Ssh(args) => commands::ssh::run(args),
         Command::Exec(args) => commands::exec::run(args),
         Command::Snapshot(args) => commands::snapshot::run(args),
+        Command::Restore(args) => commands::restore::run(args),
         Command::Worker(_) => unreachable!("handled above"),
     }
 }

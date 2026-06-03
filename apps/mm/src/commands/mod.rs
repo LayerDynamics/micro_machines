@@ -2,6 +2,7 @@
 pub mod exec;
 pub mod ps;
 pub mod remote;
+pub mod restore;
 pub mod rm;
 pub mod run;
 pub mod snapshot;

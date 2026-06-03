@@ -37,7 +37,7 @@ pub struct RunArgs {
 }
 
 /// Path to the guest kernel (`MM_KERNEL`, else `<root>/vmlinux`).
-fn kernel_path() -> PathBuf {
+pub(crate) fn kernel_path() -> PathBuf {
     std::env::var_os("MM_KERNEL")
         .map(PathBuf::from)
         .unwrap_or_else(|| crate::commands::state_root().join("vmlinux"))
