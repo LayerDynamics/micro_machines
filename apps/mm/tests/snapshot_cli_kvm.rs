@@ -79,11 +79,16 @@ fn mm_snapshot_then_restore_round_trips_a_live_guest() {
         String::from_utf8_lossy(&launch.stdout),
         String::from_utf8_lossy(&launch.stderr),
     );
-    let src_ip = String::from_utf8_lossy(&launch.stdout)
+    // Find the `<name>\t<ip>` line `mm run` prints — scanning, not first-line, because
+    // tracing logs also go to stdout and may precede it.
+    let launch_out = String::from_utf8_lossy(&launch.stdout);
+    let src_ip = launch_out
         .lines()
-        .next()
-        .and_then(|l| l.split('\t').nth(1).map(str::to_owned))
-        .expect("mm run printed <name>\\t<ip>");
+        .find_map(|l| l.strip_prefix(&format!("{src}\t")))
+        .map(|ip| ip.trim().to_string())
+        .unwrap_or_else(|| {
+            panic!("mm run did not print '{src}\\t<ip>'; stdout was:\n{launch_out}")
+        });
 
     assert!(
         wait_exec_ready(&mm, src, 90),
@@ -100,13 +105,16 @@ fn mm_snapshot_then_restore_round_trips_a_live_guest() {
         snap.status.success(),
         "`mm snapshot create` failed: {snap_out}\n{snap_err}"
     );
+    // The id is a 20-digit zero-padded timestamp; scan for it (tracing may also be on
+    // stdout).
     let id = snap_out
         .lines()
-        .next()
-        .expect("snapshot id on stdout")
-        .trim()
-        .to_string();
-    assert!(!id.is_empty(), "empty snapshot id");
+        .map(str::trim)
+        .find(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            panic!("mm snapshot create printed no snapshot id; stdout:\n{snap_out}")
+        });
 
     // 3. `mm snapshot ls` shows it.
     let ls = mm(&["snapshot", "ls", src])
