@@ -28,9 +28,14 @@ pub struct BranchArgs {
 }
 
 pub fn run(args: BranchArgs) -> Result<()> {
-    let store = crate::commands::open_store()?;
-    if store.get(&args.new_name)?.is_some() {
-        anyhow::bail!("a machine named {} already exists", args.new_name);
+    // Pre-flight in a scope so this store handle is dropped before `request_snapshot`,
+    // which opens the same exclusive single-writer redb store internally (holding it
+    // across that call would self-deadlock with "Database already open").
+    {
+        let store = crate::commands::open_store()?;
+        if store.get(&args.new_name)?.is_some() {
+            anyhow::bail!("a machine named {} already exists", args.new_name);
+        }
     }
 
     // 1. Branch the *live* source guest: the worker arms WP + copies RAM concurrently and
@@ -55,6 +60,7 @@ pub fn run(args: BranchArgs) -> Result<()> {
     }
 
     // 3. Boot a fresh machine from the branch image — a live clone of the source.
+    let store = crate::commands::open_store()?;
     let reserved_ips = store.list()?.into_iter().filter_map(|r| r.ip).collect();
     let spec = RestoreSpec {
         name: args.new_name.clone(),
