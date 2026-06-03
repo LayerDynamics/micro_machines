@@ -914,10 +914,10 @@ fn fork_snapshot_survives_sustained_interrupt_activity() {
 /// no snapshot, no fork, no resume of any kind — runs the *identical* 8×15 `/sbin/marker`
 /// hammer directly over its own vsock bridge. This is the one variable neither hammer
 /// controlled: do sustained execs destabilize *any* guest (an exec-agent / vsock leak),
-/// or only a CoW-forked/resumed one?
-///   - FAILS here  -> root cause is the exec agent / vsock under sustained load; fork and
-///                    snapshot are red herrings.
-///   - SURVIVES    -> the destabilization is specific to fork/resume; the agent is fine.
+/// or only a CoW-forked/resumed one? FAILS here -> the root cause is the exec agent /
+/// vsock under sustained load (fork and snapshot are red herrings); SURVIVES -> the
+/// destabilization is specific to fork/resume and the agent itself is fine.
+///
 /// All execs target the same long-lived guest (a real client opens a fresh connection per
 /// exec), so it exercises exactly the per-exec accumulation the forked hammers hit.
 #[test]
