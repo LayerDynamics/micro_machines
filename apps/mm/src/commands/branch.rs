@@ -5,18 +5,21 @@
 //! the *live* source: it snapshots the running guest in place (a brief pause to capture +
 //! dump RAM, then the source resumes — see `Machine::snapshot_in_place`) and boots a
 //! fresh machine from that image. The source keeps running throughout. The clone resumes
-//! with the IP captured in the source's RAM, so — exactly like `mm restore` — don't rely
-//! on two machines sharing that IP at once (re-IP-per-clone is a follow-up); reach the
-//! clone over its own vsock bridge with `mm exec`.
+//! with the source's captured internal IP, so it is launched in its **own network
+//! namespace** with that IP NAT'd to a unique host-routable `clone_ip` (SPEC-1 FR-16
+//! per-clone networking): the clone is reachable at `clone_ip` while the source stays
+//! reachable at its own IP, no collision. `mm rm` of the clone tears the netns down.
 //!
 //! (The near-zero-pause write-protected branch engine — `Machine::branch`, which arms
 //! userfaultfd to copy RAM concurrently — needs the uffd created outside the jailed
 //! worker to stay within the VMM seccomp sandbox; that's a follow-up. The in-place
 //! snapshot path here needs no userfaultfd and works through the jail today.)
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result};
 use mm_api_types::{ObjectMeta, State};
 use mm_host::control_proto::ControlRequest;
-use mm_host::{restore_launch, RestoreSpec, SNAPSHOT_BUCKET};
+use mm_host::{restore_launch, CloneNetConfig, RestoreSpec, SNAPSHOT_BUCKET};
 use time::OffsetDateTime;
 
 use crate::store::MachineRecord;
@@ -35,13 +38,38 @@ pub struct BranchArgs {
 pub fn run(args: BranchArgs) -> Result<()> {
     // Pre-flight in a scope so this store handle is dropped before `request_snapshot`,
     // which opens the same exclusive single-writer redb store internally (holding it
-    // across that call would self-deadlock with "Database already open").
-    {
+    // across that call would self-deadlock with "Database already open"). Capture the
+    // source's internal IP and allocate this clone a unique veth slot + host-routable
+    // clone_ip so it never collides with the still-running source.
+    let (internal_ip, clone_index, clone_ip) = {
         let store = crate::commands::open_store()?;
         if store.get(&args.new_name)?.is_some() {
             anyhow::bail!("a machine named {} already exists", args.new_name);
         }
-    }
+        let src = store
+            .get(&args.name)?
+            .ok_or_else(|| anyhow::anyhow!("no such machine: {}", args.name))?;
+        let internal_ip = src.ip.ok_or_else(|| {
+            anyhow::anyhow!("source machine {} has no recorded IP to clone", args.name)
+        })?;
+        let records = store.list()?;
+        // Smallest veth slot not already taken by a live clone.
+        let used: BTreeSet<u32> = records.iter().filter_map(|r| r.clone_index).collect();
+        let clone_index = (0u32..)
+            .find(|i| !used.contains(i))
+            .expect("a free clone index exists in u32");
+        // A unique host-routable address from the guest /24, disjoint from every machine's
+        // IP (the source keeps its internal IP inside the netns; the host reaches the
+        // clone here).
+        let mut ipam = mm_net::Ipam::new([10, 0, 0], 1);
+        for r in &records {
+            if let Some(ip) = r.ip {
+                ipam.reserve(ip);
+            }
+        }
+        let clone_ip = ipam.allocate().context("clone IP pool exhausted")?;
+        (internal_ip, clone_index, clone_ip)
+    };
 
     // 1. Snapshot the *live* source in place (brief pause to capture+dump RAM, then the
     //    source resumes — it keeps running throughout), returning the new snapshot id.
@@ -64,7 +92,8 @@ pub fn run(args: BranchArgs) -> Result<()> {
         );
     }
 
-    // 3. Boot a fresh machine from the branch image — a live clone of the source.
+    // 3. Boot the clone in its own network namespace, NAT'ing its captured internal IP to
+    //    the unique clone_ip so it is host-reachable without colliding with the source.
     let store = crate::commands::open_store()?;
     let reserved_ips = store.list()?.into_iter().filter_map(|r| r.ip).collect();
     let spec = RestoreSpec {
@@ -78,6 +107,12 @@ pub fn run(args: BranchArgs) -> Result<()> {
         detach: true,
         state_root: crate::commands::state_root(),
         reserved_ips,
+        clone_net: Some(CloneNetConfig {
+            index: clone_index,
+            internal_ip,
+            clone_ip,
+            upstream: None,
+        }),
     };
     let outcome = restore_launch(&spec)
         .with_context(|| format!("booting clone {} from branch {id}", args.new_name))?;
@@ -91,6 +126,8 @@ pub fn run(args: BranchArgs) -> Result<()> {
         ip: Some(outcome.ip),
         tap: Some(outcome.tap_name.clone()),
         pid: Some(outcome.pid),
+        clone_index: Some(clone_index),
+        clone_upstream: None,
     };
     store.put(&record)?;
 
@@ -102,9 +139,9 @@ pub fn run(args: BranchArgs) -> Result<()> {
 
     println!("{}\t{}", args.new_name, outcome.ip);
     println!(
-        "branched live from {} (id {id}); the source keeps running. \
-         reach the clone with: mm exec {} -- <cmd>",
-        args.name, args.new_name
+        "branched live from {} (id {id}); the source keeps running. the clone is reachable \
+         at {} (its own netns) and over its vsock with: mm exec {} -- <cmd>",
+        args.name, outcome.ip, args.new_name
     );
     Ok(())
 }

@@ -95,8 +95,29 @@ pub fn wire_clone_net(plan: &CloneNetPlan) -> Result<(), HostNetError> {
     ip_in(&plan.netns, &plan.netns_tap_up_args())?;
     ip_in(&plan.netns, &plan.netns_default_route_args())?;
 
+    // Forwarding: route between the veth and the TAP inside the netns (host-wide
+    // ip_forward is assumed enabled by setup/CI), with a permissive FORWARD policy on
+    // both sides so the NAT'd path is not dropped.
+    run(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            &plan.netns,
+            "sysctl",
+            "-q",
+            "-w",
+            "net.ipv4.ip_forward=1",
+        ],
+    )?;
+    iptables_in(
+        &plan.netns,
+        &["-P".into(), "FORWARD".into(), "ACCEPT".into()],
+    )?;
+    run("iptables", &["-P", "FORWARD", "ACCEPT"])?;
+
     // NAT: rewrite the guest's internal IP ↔ the unique clone_ip, and masquerade the
-    // /30 out the host upstream. ip_forward is assumed enabled host-wide (CI/setup).
+    // /30 out the host upstream.
     iptables_in(&plan.netns, &plan.snat_args("-A"))?;
     iptables_in(&plan.netns, &plan.dnat_args("-A"))?;
     run("iptables", &refs(&plan.host_masq_args("-A")))?;

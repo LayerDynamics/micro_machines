@@ -35,7 +35,24 @@ pub fn run(args: RmArgs) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn cleanup_host_resources(record: &crate::store::MachineRecord) {
-    if let Some(tap) = &record.tap {
+    if let Some(index) = record.clone_index {
+        // A live `mm branch` clone: tear down its per-clone networking (netns + veth +
+        // host route + MASQUERADE). Deleting the netns also removes the in-netns TAP, so
+        // the shared-bridge `teardown_tap` below is skipped for clones.
+        if let Some(clone_ip) = record.ip {
+            if let Err(e) = mm_host::teardown_clone_net(
+                &record.meta.name,
+                index,
+                clone_ip,
+                record.clone_upstream.clone(),
+            ) {
+                tracing::warn!(
+                    "failed to tear down clone net for {}: {e}",
+                    record.meta.name
+                );
+            }
+        }
+    } else if let Some(tap) = &record.tap {
         if let Err(e) = mm_net::teardown_tap(tap) {
             tracing::warn!("failed to remove TAP {tap}: {e}");
         }

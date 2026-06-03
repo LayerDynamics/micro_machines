@@ -83,6 +83,28 @@ pub struct RestoreSpec {
     pub state_root: PathBuf,
     /// IPs already allocated to other machines, to seed the IPAM pool.
     pub reserved_ips: Vec<Ipv4Addr>,
+    /// When set, isolate this restore in its own network namespace and NAT its
+    /// (captured) internal IP to a unique host-routable `clone_ip` (SPEC-1 FR-16 live
+    /// clones). `None` = the shared-bridge restore (a stopped-source `mm restore`); `Some`
+    /// = a live clone (`mm branch`) that must not collide with the still-running source.
+    pub clone_net: Option<CloneNetConfig>,
+}
+
+/// Per-clone networking inputs for a [`RestoreSpec`] (SPEC-1 FR-16). The parent builds a
+/// [`mm_net::CloneNetPlan`] from these: a unique netns + veth `/30` (by `index`) and NAT
+/// that maps the guest's `internal_ip` ↔ the host-routable `clone_ip`.
+pub struct CloneNetConfig {
+    /// Clone slot — selects the veth `/30` and the interface names (must be unique among
+    /// live clones; the caller allocates it).
+    pub index: u32,
+    /// The guest's internal IP, captured in the snapshot RAM (DNAT target; the guest
+    /// keeps using it inside the netns).
+    pub internal_ip: Ipv4Addr,
+    /// The unique, host-routable address the clone is reached at (SNAT source on egress).
+    pub clone_ip: Ipv4Addr,
+    /// The host upstream/egress interface to masquerade clone traffic out of; `None`
+    /// auto-detects it (the default route's device).
+    pub upstream: Option<String>,
 }
 
 /// The result of a successful [`launch`] — what the caller persists.
@@ -132,5 +154,42 @@ pub fn restore_launch(spec: &RestoreSpec) -> anyhow::Result<LaunchOutcome> {
     {
         let _ = spec;
         anyhow::bail!("restoring a microVM requires a Linux/KVM host")
+    }
+}
+
+/// Tear down the per-clone networking a live `mm branch` clone created (its netns + veth +
+/// host route + MASQUERADE) — called by `mm rm` for a clone machine. `machine` is the
+/// clone's name (the netns is derived from it), `index` its veth slot, `clone_ip` its
+/// host-routable address, and `upstream` the masquerade egress iface (`None` auto-detects).
+/// Linux only; idempotent/best-effort (a partially-built clone still cleans up).
+pub fn teardown_clone_net(
+    machine: &str,
+    index: u32,
+    clone_ip: Ipv4Addr,
+    upstream: Option<String>,
+) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let up = upstream
+            .or_else(launch::default_egress_iface)
+            .unwrap_or_else(|| "eth0".to_string());
+        // internal_ip is irrelevant to teardown (the in-netns SNAT/DNAT vanish with the
+        // netns); pass clone_ip as a placeholder. The netns name + veth slot + route +
+        // masquerade are what the host-side teardown actually uses.
+        let plan = mm_net::CloneNetPlan::new(
+            index,
+            machine,
+            clone_ip,
+            clone_ip,
+            &up,
+            &format!("mmtap{index}"),
+        )
+        .ok_or_else(|| anyhow::anyhow!("clone index {index} overflows the veth /16"))?;
+        mm_net::teardown_clone_net(&plan).map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (machine, index, clone_ip, upstream);
+        anyhow::bail!("clone-net teardown requires a Linux host")
     }
 }

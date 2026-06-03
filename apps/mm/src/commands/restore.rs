@@ -56,6 +56,9 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         detach: true,
         state_root: crate::commands::state_root(),
         reserved_ips,
+        // A stopped-source restore shares the bridge (the captured IP is free); live
+        // clones (`mm branch`) use a per-clone netns instead.
+        clone_net: None,
     };
     let outcome = restore_launch(&spec)
         .with_context(|| format!("restoring snapshot {} of {}", args.id, args.name))?;
@@ -69,6 +72,8 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         ip: Some(outcome.ip),
         tap: Some(outcome.tap_name.clone()),
         pid: Some(outcome.pid),
+        clone_index: None,
+        clone_upstream: None,
     };
     store.put(&record)?;
     println!("{}\t{}", args.new_name, outcome.ip);

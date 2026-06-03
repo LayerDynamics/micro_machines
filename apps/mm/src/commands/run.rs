@@ -100,6 +100,8 @@ pub fn run(args: RunArgs) -> Result<()> {
         ip: Some(outcome.ip),
         tap: Some(outcome.tap_name.clone()),
         pid: Some(outcome.pid),
+        clone_index: None,
+        clone_upstream: None,
     };
     store.put(&record)?;
     println!("{name}\t{}", outcome.ip);

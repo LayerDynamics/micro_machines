@@ -600,3 +600,45 @@ jobs:
         run: |
           sudo -E env "PATH=$PATH" \
             cargo test -p mm-net --test clone_netns_spike -- --ignored --nocapture
+
+  # FR-16 per-clone networking end-to-end: `mm branch` a live clone into its own netns and
+  # prove it is reachable at a unique clone_ip while the source stays reachable — and that
+  # `mm rm` leaves no netns/veth residue. Needs KVM + OCI tooling + ip_forward + root.
+  clone-net-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: x86_64-unknown-linux-musl }
+      - uses: Swatinem/rust-cache@v2
+      - name: Enable /dev/kvm access for the runner user
+        run: |
+          set -euo pipefail
+          sudo modprobe kvm || true
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+      - name: Install OCI tooling (skopeo + umoci) + fixture build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools e2fsprogs skopeo iptables iproute2
+          sudo curl -fsSL -o /usr/local/bin/umoci \
+            https://github.com/opencontainers/umoci/releases/download/v0.4.7/umoci.amd64
+          sudo chmod 0755 /usr/local/bin/umoci
+      - name: Fetch test fixtures (kernel + musl mm-init)
+        run: ./scripts/fetch-test-fixtures.sh
+      - name: Enable cgroup v2 cpu+memory controllers + IP forwarding
+        run: |
+          echo "+cpu +memory" | sudo tee /sys/fs/cgroup/cgroup.subtree_control || true
+          sudo sysctl -w net.ipv4.ip_forward=1
+      - name: Build the clone-net integration test
+        run: cargo test -p mm --test clone_net_kvm --no-run
+      - name: Run `mm branch` per-clone networking end to end as root
+        run: |
+          sudo -E env "PATH=$PATH" \
+            cargo test -p mm --test clone_net_kvm -- --ignored --nocapture --test-threads=1

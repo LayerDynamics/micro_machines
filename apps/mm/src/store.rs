@@ -24,6 +24,15 @@ pub struct MachineRecord {
     pub ip: Option<Ipv4Addr>,
     pub tap: Option<String>,
     pub pid: Option<u32>,
+    /// For a live `mm branch` clone: its per-clone-networking veth slot. `mm rm` uses it
+    /// (with the name-derived netns + `ip` as the clone_ip + `clone_upstream`) to tear the
+    /// netns/veth/NAT down. `None` for ordinary machines + shared-bridge restores.
+    #[serde(default)]
+    pub clone_index: Option<u32>,
+    /// The masquerade egress interface recorded for a clone's teardown (`None` = was
+    /// auto-detected; teardown re-detects).
+    #[serde(default)]
+    pub clone_upstream: Option<String>,
 }
 
 /// The on-disk machine registry.
@@ -114,6 +123,8 @@ mod tests {
             ip: Some(Ipv4Addr::new(10, 0, 0, 2)),
             tap: Some("mm-tap0".to_string()),
             pid: Some(1234),
+            clone_index: None,
+            clone_upstream: None,
         }
     }
 

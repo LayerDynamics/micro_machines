@@ -190,24 +190,99 @@ pub fn launch(spec: &LaunchSpec) -> Result<LaunchOutcome> {
 /// state) rather than a cold boot from an OCI image. The source machine's rootfs +
 /// kernel are linked into the new jail; the snapshot is linked to `<jail_root>/restore`;
 /// and the worker resumes via `mm_vmm::snapshot::restore` (`--restore-dir /restore`).
+/// Owns the worker's TAP fd for the lifetime of `restore_launch`, regardless of whether
+/// it is a shared-bridge TAP or a TAP opened inside a clone netns. Held until just after
+/// the worker is spawned (which inherits its own dup of the fd), then dropped.
+enum TapOwner {
+    Bridge(mm_net::Tap),
+    Netns(std::fs::File),
+}
+
+impl TapOwner {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            TapOwner::Bridge(t) => t.as_raw_fd(),
+            TapOwner::Netns(f) => f.as_raw_fd(),
+        }
+    }
+}
+
 pub fn restore_launch(spec: &RestoreSpec) -> Result<LaunchOutcome> {
     let root = spec.state_root.as_path();
     let name = spec.name.clone();
 
-    // 1. Allocate a fresh IP + host networking (same as a cold boot). The restored
-    //    guest resumes with the IP captured in its RAM; the caller is responsible for
-    //    not running two machines on the same guest IP (re-IP per clone is a follow-up).
-    let mut ipam = mm_net::Ipam::new(SUBNET_BASE, 1);
-    for ip in &spec.reserved_ips {
-        ipam.reserve(*ip);
+    // 1. Networking. Two modes, but the worker is identical either way — it boots from
+    //    the inherited TAP fd; only where that TAP lives and what address the host reaches
+    //    the guest at differ:
+    //    - None: a shared-bridge restore (a stopped-source `mm restore`). The guest
+    //      resumes with the IP captured in its RAM; the caller must not run two machines
+    //      on that IP at once.
+    //    - Some: a live clone (`mm branch`) isolated in its own netns, its captured
+    //      internal IP NAT'd to a unique host-routable `clone_ip` so it never collides
+    //      with the still-running source (SPEC-1 FR-16).
+    let ip; // the host-reachable address recorded for this machine
+    let config_ip; // the guest's own IP (cosmetic on restore — the cmdline is discarded)
+    let config_gateway;
+    let tap_name;
+    let tap_owner;
+    match &spec.clone_net {
+        None => {
+            let mut ipam = mm_net::Ipam::new(SUBNET_BASE, 1);
+            for r in &spec.reserved_ips {
+                ipam.reserve(*r);
+            }
+            let allocated = ipam.allocate().context("guest IP pool exhausted")?;
+            let gateway = ipam.gateway();
+            mm_net::ensure_bridge(BRIDGE, gateway, 24).context("ensuring bridge")?;
+            let tname = format!("mm-{name}");
+            let tap = mm_net::create_tap(&tname, BRIDGE).context("creating TAP")?;
+            let egress = default_egress_iface().unwrap_or_else(|| "eth0".to_string());
+            mm_net::enable_nat(SUBNET_CIDR, &egress).context("enabling NAT")?;
+            ip = allocated;
+            config_ip = allocated;
+            config_gateway = gateway;
+            tap_name = tname;
+            tap_owner = TapOwner::Bridge(tap);
+        }
+        Some(cn) => {
+            let upstream = cn
+                .upstream
+                .clone()
+                .or_else(default_egress_iface)
+                .unwrap_or_else(|| "eth0".to_string());
+            let tname = format!("mmtap{}", cn.index);
+            let plan = mm_net::CloneNetPlan::new(
+                cn.index,
+                &name,
+                cn.internal_ip,
+                cn.clone_ip,
+                &upstream,
+                &tname,
+            )
+            .ok_or_else(|| anyhow::anyhow!("clone index {} overflows the veth /16", cn.index))?;
+            mm_net::create_netns(&plan).context("creating clone netns")?;
+            // Tear the netns back down if TAP-open or wiring fails, so a failed branch
+            // leaks no namespace/veth/rules.
+            let tapfile = match (|| -> Result<std::fs::File> {
+                let f = mm_net::open_tun_in_netns(&plan.netns, &plan.tap)
+                    .context("opening TAP inside the clone netns")?;
+                mm_net::wire_clone_net(&plan).context("wiring clone networking")?;
+                Ok(f)
+            })() {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = mm_net::teardown_clone_net(&plan);
+                    return Err(e);
+                }
+            };
+            let o = cn.internal_ip.octets();
+            ip = cn.clone_ip;
+            config_ip = cn.internal_ip;
+            config_gateway = std::net::Ipv4Addr::new(o[0], o[1], o[2], 1);
+            tap_name = tname;
+            tap_owner = TapOwner::Netns(tapfile);
+        }
     }
-    let ip = ipam.allocate().context("guest IP pool exhausted")?;
-    let gateway = ipam.gateway();
-    mm_net::ensure_bridge(BRIDGE, gateway, 24).context("ensuring bridge")?;
-    let tap_name = format!("mm-{name}");
-    let tap = mm_net::create_tap(&tap_name, BRIDGE).context("creating TAP")?;
-    let egress = default_egress_iface().unwrap_or_else(|| "eth0".to_string());
-    mm_net::enable_nat(SUBNET_CIDR, &egress).context("enabling NAT")?;
 
     // 2. Inheritable /dev/kvm fd.
     let kvm_fd = open_kvm_inheritable()?;
@@ -243,12 +318,12 @@ pub fn restore_launch(spec: &RestoreSpec) -> Result<LaunchOutcome> {
         spec.memory_mib,
         std::path::PathBuf::from("/vmlinux"),
         std::path::PathBuf::from("/rootfs.ext4"),
-        ip,
-        gateway,
+        config_ip,
+        config_gateway,
         NETMASK,
         &name,
         tap_name.clone(),
-        mac_from_ip(ip),
+        mac_from_ip(config_ip),
         None,
         None,
         None,
@@ -272,7 +347,7 @@ pub fn restore_launch(spec: &RestoreSpec) -> Result<LaunchOutcome> {
     let child = spawn_worker(
         &cfg_path,
         kvm_fd,
-        tap.as_raw_fd(),
+        tap_owner.as_raw_fd(),
         vsock_listener.as_raw_fd(),
         control_listener.as_raw_fd(),
         &jail_root,
@@ -287,7 +362,7 @@ pub fn restore_launch(spec: &RestoreSpec) -> Result<LaunchOutcome> {
 
     // SAFETY: `kvm_fd` is the fd we opened; the child inherited its own copy.
     unsafe { libc::close(kvm_fd) };
-    drop(tap);
+    drop(tap_owner);
     drop(vsock_listener);
     drop(control_listener);
 
@@ -586,7 +661,7 @@ fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// Determine the default egress interface from the host routing table.
-fn default_egress_iface() -> Option<String> {
+pub(crate) fn default_egress_iface() -> Option<String> {
     if let Ok(iface) = std::env::var("MM_EGRESS") {
         return Some(iface);
     }
