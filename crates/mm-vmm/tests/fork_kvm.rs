@@ -788,21 +788,15 @@ fn branch_clone_survives_sustained_interrupt_activity() {
         "parent reached userspace"
     );
     // Branch right at readiness (no settle) — matching the clone-net flake's early-boot
-    // branch point — and rely on the long stress + the loop to surface the intermittency.
-
-    // A guest workload that takes many timer interrupts over a couple of seconds: if the
-    // branch captured an inconsistent timer/IRQ/clock state, a clone running this panics or
-    // its exec never returns.
-    let stress: Vec<String> = [
-        "/bin/sh",
-        "-c",
-        "i=0; while [ $i -lt 40 ]; do sleep 0.05; i=$((i+1)); done; echo ALIVE",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+    // branch point — and rely on the loop + repeated exec to surface the intermittency.
 
     const ITERATIONS: usize = 8;
+    // Per clone: spawn many short guest processes (each `/sbin/marker` exec forks/execs/
+    // exits in the guest), driving the scheduler + timer/IRQ path. If the branch captured
+    // inconsistent interrupt/clock state, a clone crashes (its exec agent stops answering)
+    // or returns wrong data under this load. `/sbin/marker` is the known-present fixture
+    // binary (the guest rootfs has no /bin/sh).
+    const EXECS_PER_CLONE: usize = 15;
     for i in 0..ITERATIONS {
         let branch_dir = dir.join(format!("branch-{i}"));
         let manifest = parent
@@ -815,31 +809,29 @@ fn branch_clone_survives_sustained_interrupt_activity() {
         let cuds = dir.join(format!("child-{i}.sock"));
         let mut child = fork_bridged_child(&cfg, &state, &mem_path, &cuds);
 
-        let r = run_exec_over_uds_ready(
-            &cuds,
-            EXEC_PORT,
-            1,
-            &stress,
-            20_000,
-            FORK_EXEC_READY_TIMEOUT,
-        )
-        .unwrap_or_else(|e| {
-            let console = dir.join(format!("child-{i}.console"));
-            let _ = console; // child console isn't separately captured here; --nocapture shows it
-            panic!("iteration {i}: clone exec failed (clone likely panicked): {e}")
-        });
-        assert_eq!(
-            r.exit_code,
-            0,
-            "iteration {i}: clone stress exited {} (stderr: {})",
-            r.exit_code,
-            String::from_utf8_lossy(&r.stderr)
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&r.stdout).trim(),
-            "ALIVE",
-            "iteration {i}: clone did not survive sustained timer activity",
-        );
+        for j in 0..EXECS_PER_CLONE {
+            let val = format!("IT{i}E{j}");
+            let w = exec_marker(&cuds, &["write", &val]);
+            assert_eq!(
+                w.exit_code,
+                0,
+                "iteration {i} exec {j}: marker write exited {} — clone likely panicked \
+                 (Fatal exception in interrupt); stderr: {}",
+                w.exit_code,
+                String::from_utf8_lossy(&w.stderr)
+            );
+            let rd = exec_marker(&cuds, &["read"]);
+            assert_eq!(
+                rd.exit_code, 0,
+                "iteration {i} exec {j}: marker read exited {}",
+                rd.exit_code
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&rd.stdout).trim(),
+                val,
+                "iteration {i} exec {j}: clone returned wrong data under load (state corruption)",
+            );
+        }
         child
             .shutdown()
             .unwrap_or_else(|e| panic!("iteration {i}: stop child: {e}"));
