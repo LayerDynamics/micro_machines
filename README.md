@@ -6,8 +6,8 @@ shipping the batteries a typical dev/deploy workflow needs out of the box.
 
 You `mm run` an OCI image and get a real hardware-isolated VM that boots in well under
 a second, comes up with an IP and SSH already wired, and can be snapshotted, forked,
-and exec'd into — locally on one host, or scheduled across a cluster through a
-Git-friendly control plane.
+branched while still running, and exec'd into — locally on one host, or scheduled
+across a cluster through a Git-friendly control plane.
 
 ## Why MicroMachines
 
@@ -164,7 +164,7 @@ touches KVM) alongside a pnpm-managed JS/TS workspace scaffolded for future tool
 | Crate | Role |
 | --- | --- |
 | `crates/mm-api-types` | Shared contract types every other crate depends on |
-| `crates/mm-vmm` | Native VMM core on the rust-vmm crates: vCPUs, memory, virtio block/net/vsock, boot, snapshot/restore, copy-on-write fork, rate limiting |
+| `crates/mm-vmm` | Native VMM core on the rust-vmm crates: vCPUs, memory, virtio block/net/vsock, boot, snapshot/restore, copy-on-write fork, live branch (userfaultfd write-protect), rate limiting |
 | `crates/mm-net` | Host networking: IPAM, bridge/TAP, NAT, guest boot params |
 | `crates/mm-image` | OCI image handling: read-only base rootfs + per-instance writable overlays |
 | `crates/mm-init` | Guest `init`: cmdline parsing, mounts, workload exec, the in-guest exec agent |
