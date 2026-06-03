@@ -34,9 +34,11 @@ pub struct RunArgs {
     /// capturing the guest console to a per-VM log, instead of staying foreground.
     #[arg(long, short = 'd')]
     pub detach: bool,
-    /// Boot "branchable" (SPEC-1 FR-16): prepare the running-BRANCH userfaultfd at boot
-    /// so a later `mm branch` of this machine uses the near-zero-pause write-protect
-    /// engine instead of an in-place snapshot. Small per-VM cost; off by default.
+    /// Boot "branchable" (SPEC-1 FR-16): prepare the running-BRANCH userfaultfd at boot so
+    /// a later `mm branch` of this machine uses the near-zero-pause write-protect engine
+    /// instead of an in-place snapshot. EXPERIMENTAL — the WP-branch image has a known
+    /// intermittent guest-fidelity issue (a clone can panic in the IRQ path); the default
+    /// (non-branchable) `mm branch` uses the reliable resume-in-place snapshot. Off by default.
     #[arg(long)]
     pub branchable: bool,
 }
