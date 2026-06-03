@@ -13,7 +13,7 @@ use sqlx::FromRow;
 use uuid::Uuid;
 
 use crate::authz::Role;
-use crate::model::{Machine, MachineSpec, MachineStatus};
+use crate::model::{Machine, MachineSpec, MachineStatus, Snapshot};
 
 /// Thin handle over a Postgres connection pool.
 #[derive(Clone)]
@@ -52,6 +52,34 @@ impl MachineRow {
 
 fn decode_err(e: serde_json::Error) -> sqlx::Error {
     sqlx::Error::Decode(Box::new(e))
+}
+
+/// Raw snapshot row (all scalar columns; `memory_mib` is a Postgres BIGINT → `i64`).
+#[derive(FromRow)]
+struct SnapshotRow {
+    uid: Uuid,
+    namespace: String,
+    machine: String,
+    name: String,
+    kind: String,
+    host_id: String,
+    memory_mib: i64,
+    status: String,
+}
+
+impl SnapshotRow {
+    fn into_snapshot(self) -> Snapshot {
+        Snapshot {
+            uid: self.uid,
+            namespace: self.namespace,
+            machine: self.machine,
+            name: self.name,
+            kind: self.kind,
+            host_id: self.host_id,
+            memory_mib: self.memory_mib.max(0) as u64,
+            status: self.status,
+        }
+    }
 }
 
 impl Store {
@@ -273,6 +301,83 @@ impl Store {
         let res = sqlx::query("DELETE FROM machines WHERE namespace = $1 AND name = $2")
             .bind(namespace)
             .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    // --- snapshots --------------------------------------------------------
+
+    /// Record a completed snapshot (the agent reports the worker-allocated id + size).
+    /// Errors with a unique violation if `(namespace, machine, name)` already exists.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_snapshot(
+        &self,
+        namespace: &str,
+        machine: &str,
+        name: &str,
+        kind: &str,
+        host_id: &str,
+        memory_mib: u64,
+        status: &str,
+    ) -> Result<Snapshot, sqlx::Error> {
+        let row: SnapshotRow = sqlx::query_as(
+            "INSERT INTO snapshots (uid, namespace, machine, name, kind, host_id, memory_mib, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             RETURNING uid, namespace, machine, name, kind, host_id, memory_mib, status",
+        )
+        .bind(Uuid::new_v4())
+        .bind(namespace)
+        .bind(machine)
+        .bind(name)
+        .bind(kind)
+        .bind(host_id)
+        .bind(memory_mib as i64)
+        .bind(status)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.into_snapshot())
+    }
+
+    /// A machine's snapshots, newest first (ids are sortable timestamps).
+    pub async fn list_snapshots(
+        &self,
+        namespace: &str,
+        machine: &str,
+    ) -> Result<Vec<Snapshot>, sqlx::Error> {
+        let rows: Vec<SnapshotRow> = sqlx::query_as(
+            "SELECT uid, namespace, machine, name, kind, host_id, memory_mib, status
+             FROM snapshots WHERE namespace = $1 AND machine = $2 ORDER BY name DESC",
+        )
+        .bind(namespace)
+        .bind(machine)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(SnapshotRow::into_snapshot).collect())
+    }
+
+    /// Locate a snapshot by id within a namespace (ids are unique per namespace).
+    pub async fn get_snapshot(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<Snapshot>, sqlx::Error> {
+        let row: Option<SnapshotRow> = sqlx::query_as(
+            "SELECT uid, namespace, machine, name, kind, host_id, memory_mib, status
+             FROM snapshots WHERE namespace = $1 AND name = $2",
+        )
+        .bind(namespace)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(SnapshotRow::into_snapshot))
+    }
+
+    /// Delete a snapshot record by id. Returns rows changed (0 if absent).
+    pub async fn delete_snapshot(&self, namespace: &str, id: &str) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query("DELETE FROM snapshots WHERE namespace = $1 AND name = $2")
+            .bind(namespace)
+            .bind(id)
             .execute(&self.pool)
             .await?;
         Ok(res.rows_affected())

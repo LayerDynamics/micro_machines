@@ -103,3 +103,61 @@ pub struct CreateMachine {
 fn default_fleet() -> String {
     "default".to_string()
 }
+
+/// A snapshot of a machine as returned by the API (SPEC-1 FR-18). Created on the agent
+/// that owns the machine's host (the worker allocates `name`, the sortable id) and
+/// recorded durably so it can be listed and restored.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Snapshot {
+    pub uid: Uuid,
+    pub namespace: String,
+    /// Source machine name.
+    pub machine: String,
+    /// Snapshot id (worker-allocated, sortable timestamp).
+    pub name: String,
+    /// `"full"` (paused snapshot) or `"branch"` (live branch).
+    pub kind: String,
+    /// Host whose disk holds the snapshot's files.
+    pub host_id: String,
+    pub memory_mib: u64,
+    /// `"creating" | "ready" | "failed"`.
+    pub status: String,
+}
+
+/// Request body to create a snapshot (machine comes from the URL path). `branch` =
+/// live branch (FR-16) rather than a paused snapshot.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CreateSnapshot {
+    #[serde(default)]
+    pub branch: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_json_round_trips() {
+        let s = Snapshot {
+            uid: Uuid::nil(),
+            namespace: "team-a".into(),
+            machine: "web".into(),
+            name: "00000000000000000042".into(),
+            kind: "full".into(),
+            host_id: "host-1".into(),
+            memory_mib: 512,
+            status: "ready".into(),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Snapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+    }
+
+    #[test]
+    fn create_snapshot_defaults_to_full() {
+        let c: CreateSnapshot = serde_json::from_str("{}").unwrap();
+        assert!(!c.branch);
+        let b: CreateSnapshot = serde_json::from_str(r#"{"branch":true}"#).unwrap();
+        assert!(b.branch);
+    }
+}
