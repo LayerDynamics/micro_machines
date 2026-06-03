@@ -20,6 +20,8 @@ mod config;
 /// Parent↔worker control-channel wire protocol (live snapshot/branch). Pure; the `mm`
 /// CLI uses it as the client and the worker as the server.
 pub mod control_proto;
+/// Client for the worker control channel (shared by the CLI and the cluster agent).
+pub mod control;
 #[cfg(target_os = "linux")]
 mod launch;
 mod worker;

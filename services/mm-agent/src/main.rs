@@ -21,6 +21,7 @@ use mm_agent::actuator::{self, BootRequest, HostConfig};
 use mm_agent::capacity::{self, HostResources, Reservation};
 use mm_agent::exec;
 use mm_agent::local_store::LocalStore;
+use mm_agent::snapshot;
 use mm_proto::host_service_client::HostServiceClient;
 use mm_proto::machine_service_client::MachineServiceClient;
 use mm_proto::{Assignment, Capacity, HostRef, MachineEvent, State};
@@ -227,6 +228,51 @@ async fn serve_once(
         })
     };
     let _exec_guard = AbortOnDrop(exec_handler);
+
+    // Cluster snapshot (FR-14/FR-18): the same reverse-channel pattern as exec, but the
+    // worker (not the agent) allocates the id and one task yields exactly one result.
+    let snapshot_handler = {
+        let mut machines = machines.clone();
+        let store = store.clone();
+        let host = host.clone();
+        let host_id = args.host_id.clone();
+        tokio::spawn(async move {
+            let mut stream = match machines
+                .watch_snapshots(HostRef {
+                    host_id: host_id.clone(),
+                })
+                .await
+            {
+                Ok(s) => s.into_inner(),
+                Err(e) => {
+                    tracing::warn!("opening snapshot stream: {e}");
+                    return;
+                }
+            };
+            loop {
+                match stream.message().await {
+                    Ok(Some(task)) => {
+                        let mut machines = machines.clone();
+                        let store = store.clone();
+                        let host = host.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                snapshot::run_and_report(&mut machines, &store, &host, task).await
+                            {
+                                tracing::warn!("cluster snapshot failed: {e}");
+                            }
+                        });
+                    }
+                    Ok(None) => break, // controller closed the snapshot stream
+                    Err(e) => {
+                        tracing::warn!("snapshot stream error: {e}");
+                        break;
+                    }
+                }
+            }
+        })
+    };
+    let _snapshot_guard = AbortOnDrop(snapshot_handler);
 
     let mut stream = machines
         .watch_assignments(HostRef {

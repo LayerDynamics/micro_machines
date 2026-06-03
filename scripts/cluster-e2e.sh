@@ -160,6 +160,43 @@ if [ "$rc" = 0 ]; then
 fi
 echo "PASS: cluster exec against a missing machine failed fast (rc=$rc)"
 
+# --- 3.6 cluster snapshot: controller -> agent -> worker -> live guest ------
+# (FR-14/FR-18). The REST create routes a SnapshotTask down the WatchSnapshots
+# reverse channel to the agent, which drives the worker's control socket; the
+# worker snapshots the live guest and allocates the id. Synchronous: the 201 is
+# only returned once the snapshot is on disk and recorded.
+echo "testing cluster snapshot (controller -> agent -> worker control channel)..."
+# Capture body + HTTP status (no -f: we want the error body on a 4xx/5xx — the
+# host_id/Running guards in the controller are exercised here for the first time).
+snap_raw="$(curl -sS -w $'\n%{http_code}' -X POST \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{}' "$REST/v1alpha1/namespaces/$NS/machines/c1/snapshots")"
+snap_code="$(printf '%s' "$snap_raw" | tail -n1)"
+snap_resp="$(printf '%s' "$snap_raw" | sed '$d')"
+echo "snapshot create -> HTTP $snap_code: $snap_resp"
+if [ "$snap_code" != 201 ]; then
+  echo "FAIL: cluster snapshot create returned HTTP $snap_code (want 201)" >&2
+  cat "$STATE"/jails/*/console.log 2>/dev/null || true
+  exit 1
+fi
+if ! echo "$snap_resp" | grep -q '"status":"ready"'; then
+  echo "FAIL: cluster snapshot did not complete (status not ready)" >&2
+  cat "$STATE"/jails/*/console.log 2>/dev/null || true
+  exit 1
+fi
+snap_id="$(echo "$snap_resp" | sed -n 's/.*"name":"\([0-9]*\)".*/\1/p')"
+echo "PASS: cluster snapshot created (id=$snap_id)"
+
+# It must appear in the machine's snapshot list (the recorded resource).
+list_resp="$(curl -fsS -H "Authorization: Bearer $TOKEN" \
+  "$REST/v1alpha1/namespaces/$NS/machines/c1/snapshots")"
+echo "snapshot list: $list_resp"
+if ! echo "$list_resp" | grep -q "\"name\":\"$snap_id\""; then
+  echo "FAIL: created snapshot is absent from the snapshot list" >&2
+  exit 1
+fi
+echo "PASS: cluster snapshot appears in the snapshot list"
+
 # --- 4. restart the controller; the running VM must survive (NFR-R2) -------
 kill "$CTRL_PID"; wait "$CTRL_PID" 2>/dev/null || true
 CTRL_PID=""
