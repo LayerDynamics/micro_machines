@@ -23,6 +23,25 @@ service MachineService {
   // and needs no control-plane rpc.
   rpc WatchExec(HostRef) returns (stream ExecTask);        // controller -> agent
   rpc ReportExecResult(stream ExecChunk) returns (Ack);    // agent -> controller
+
+  // Cluster snapshot (controller -> agent -> worker, SPEC-1 FR-14/FR-18), same
+  // reverse-channel shape as exec: the agent opens WatchSnapshots and the controller
+  // pushes a SnapshotTask; the agent drives its local worker's control channel
+  // (SNAPSHOT/BRANCH) and reports the worker-allocated id back via ReportSnapshotResult.
+  // request_id correlates the task with its result for the waiting REST caller.
+  rpc WatchSnapshots(HostRef) returns (stream SnapshotTask); // controller -> agent
+  rpc ReportSnapshotResult(SnapshotResult) returns (Ack);    // agent -> controller
+}
+
+// A snapshot the controller pushes to a host's agent. `branch` = live branch (FR-16)
+// rather than a paused snapshot. The worker allocates the id (the agent has no path to
+// supply one), so no directory is carried.
+message SnapshotTask { string request_id = 1; MachineRef ref = 2; bool branch = 3; }
+// The streamed-back result: the worker-allocated snapshot `id` on success, else
+// `error`. `request_id` echoes the originating SnapshotTask. (The snapshot's memory
+// size is the source machine's RAM, which the controller already knows.)
+message SnapshotResult {
+  string request_id = 1; string id = 2; bool ok = 3; string error = 4;
 }
 
 // An exec command the controller pushes to a host's agent, tagged with a request_id

@@ -15,8 +15,9 @@ use mm_proto::host_service_server::HostService;
 use mm_proto::machine_service_server::MachineService;
 use mm_proto::{
     Ack, Assignment, Capacity, ExecChunk, ExecTask, HostRef, Machine, MachineEvent, MachineRef,
+    SnapshotResult, SnapshotTask,
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -121,17 +122,75 @@ impl ExecDispatcher {
     }
 }
 
+/// Sender to one connected agent's `WatchSnapshots` task stream.
+type SnapshotTaskTx = mpsc::Sender<Result<SnapshotTask, Status>>;
+
+/// Routes a cluster snapshot across the controller↔agent boundary (FR-14/FR-18) — the
+/// snapshot analogue of [`ExecDispatcher`]. Unlike exec's chunk stream a snapshot is
+/// one task → one result, so a `oneshot` carries the result back to the REST caller.
+#[derive(Clone, Default)]
+pub struct SnapshotDispatcher {
+    /// host_id → that agent's open `WatchSnapshots` stream.
+    agents: Arc<Mutex<HashMap<String, SnapshotTaskTx>>>,
+    /// request_id → the one-shot delivering the result to the waiting REST handler.
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<SnapshotResult>>>>,
+}
+
+impl SnapshotDispatcher {
+    /// Register a freshly-connected agent's snapshot channel; return its stream's rx.
+    async fn connect(&self, host_id: String) -> ReceiverStream<Result<SnapshotTask, Status>> {
+        let (tx, rx) = mpsc::channel(16);
+        self.agents.lock().await.insert(host_id, tx);
+        ReceiverStream::new(rx)
+    }
+
+    /// Begin a pending snapshot: register `request_id` and return the receiver the REST
+    /// handler awaits. Call [`finish`](Self::finish) if abandoning it before a result.
+    pub async fn begin(&self, request_id: String) -> oneshot::Receiver<SnapshotResult> {
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(request_id, tx);
+        rx
+    }
+
+    /// Push a snapshot task to a host's agent. Returns `false` if no agent is connected
+    /// for that host or its stream has closed (so the caller can fail fast with 503).
+    pub async fn dispatch(&self, host_id: &str, task: SnapshotTask) -> bool {
+        let tx = self.agents.lock().await.get(host_id).cloned();
+        match tx {
+            Some(tx) => tx.send(Ok(task)).await.is_ok(),
+            None => false,
+        }
+    }
+
+    /// Deliver a reported result to the caller awaiting `result.request_id`. Returns
+    /// `false` if no caller is waiting (it timed out / hung up).
+    async fn complete(&self, result: SnapshotResult) -> bool {
+        let tx = self.pending.lock().await.remove(&result.request_id);
+        match tx {
+            Some(tx) => tx.send(result).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Drop a pending request's routing entry (on timeout) so it does not leak.
+    pub async fn finish(&self, request_id: &str) {
+        self.pending.lock().await.remove(request_id);
+    }
+}
+
 /// `MachineService` implementation: streams assignments + answers machine queries.
 pub struct MachineSvc {
     pub store: Store,
     pub registry: AgentRegistry,
     pub exec: ExecDispatcher,
+    pub snapshots: SnapshotDispatcher,
 }
 
 #[tonic::async_trait]
 impl MachineService for MachineSvc {
     type WatchAssignmentsStream = ReceiverStream<Result<Assignment, Status>>;
     type WatchExecStream = ReceiverStream<Result<ExecTask, Status>>;
+    type WatchSnapshotsStream = ReceiverStream<Result<SnapshotTask, Status>>;
 
     async fn watch_assignments(
         &self,
@@ -167,6 +226,27 @@ impl MachineService for MachineSvc {
                 break;
             }
         }
+        Ok(Response::new(ack()))
+    }
+
+    /// The agent opens this server-stream to receive snapshot tasks for its host (the
+    /// reverse channel into the client-only agent, FR-14/FR-18).
+    async fn watch_snapshots(
+        &self,
+        request: Request<HostRef>,
+    ) -> Result<Response<Self::WatchSnapshotsStream>, Status> {
+        let host_id = request.into_inner().host_id;
+        tracing::info!(host = %host_id, "agent connected; streaming snapshot tasks");
+        Ok(Response::new(self.snapshots.connect(host_id).await))
+    }
+
+    /// The agent reports a finished snapshot (agent → controller); it is routed to the
+    /// REST caller blocked on the matching `request_id`.
+    async fn report_snapshot_result(
+        &self,
+        request: Request<SnapshotResult>,
+    ) -> Result<Response<Ack>, Status> {
+        self.snapshots.complete(request.into_inner()).await;
         Ok(Response::new(ack()))
     }
 
@@ -368,5 +448,50 @@ mod tests {
     async fn chunk_for_unknown_request_is_not_routed() {
         let d = ExecDispatcher::default();
         assert!(!d.route(output("nobody", "x")).await);
+    }
+
+    fn snap_task(request_id: &str) -> SnapshotTask {
+        SnapshotTask {
+            request_id: request_id.to_string(),
+            r#ref: None,
+            branch: false,
+        }
+    }
+
+    fn snap_result(request_id: &str, id: &str) -> SnapshotResult {
+        SnapshotResult {
+            request_id: request_id.to_string(),
+            id: id.to_string(),
+            ok: true,
+            error: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_dispatch_to_unknown_host_fails_fast() {
+        let d = SnapshotDispatcher::default();
+        assert!(!d.dispatch("ghost", snap_task("r1")).await);
+    }
+
+    #[tokio::test]
+    async fn snapshot_task_reaches_agent_and_result_routes_back() {
+        let d = SnapshotDispatcher::default();
+        let mut agent = d.connect("host-1".into()).await;
+        let rx = d.begin("r1".into()).await;
+        assert!(d.dispatch("host-1", snap_task("r1")).await);
+        let got = agent.next().await.expect("a task").expect("ok task");
+        assert_eq!(got.request_id, "r1");
+
+        // The agent's reported result reaches the waiting caller.
+        assert!(d.complete(snap_result("r1", "00000000000000000009")).await);
+        let result = rx.await.expect("a result");
+        assert_eq!(result.id, "00000000000000000009");
+        assert!(result.ok);
+    }
+
+    #[tokio::test]
+    async fn snapshot_result_for_unknown_request_is_not_routed() {
+        let d = SnapshotDispatcher::default();
+        assert!(!d.complete(snap_result("nobody", "x")).await);
     }
 }

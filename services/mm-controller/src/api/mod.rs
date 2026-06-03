@@ -25,6 +25,7 @@ use crate::store::Store;
 
 mod machines;
 mod namespaces;
+mod snapshots;
 
 /// Shared application state handed to every handler.
 #[derive(Clone)]
@@ -35,6 +36,9 @@ pub struct AppState {
     /// Routes cluster exec (FR-13) to the agent owning the target machine's host. The
     /// same [`ExecDispatcher`] instance is shared with the gRPC `MachineService`.
     pub exec: crate::grpc::ExecDispatcher,
+    /// Routes cluster snapshot (FR-14/FR-18) to the owning host's agent. Shared with the
+    /// gRPC `MachineService` like `exec`.
+    pub snapshots: crate::grpc::SnapshotDispatcher,
 }
 
 /// API error → HTTP status. Unauthenticated requests get 401, RBAC denials 403,
@@ -104,6 +108,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1alpha1/namespaces/:ns/machines/:name/exec",
             post(machines::exec),
+        )
+        .route(
+            "/v1alpha1/namespaces/:ns/machines/:name/snapshots",
+            get(snapshots::list).post(snapshots::create),
+        )
+        .route(
+            "/v1alpha1/namespaces/:ns/snapshots/:id",
+            axum::routing::delete(snapshots::delete),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
