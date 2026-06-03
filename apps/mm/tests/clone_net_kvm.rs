@@ -96,10 +96,20 @@ fn mm_branch_clone_is_reachable_at_a_unique_ip_without_colliding_with_the_source
         false
     };
 
-    // 1. Boot the source and wait until its guest exec agent answers; capture its IP.
-    let launch = mm(&["run", "--ssh", "--detach", "--name", src, IMAGE])
-        .output()
-        .expect("spawn `mm run`");
+    // 1. Boot the source --branchable (so `mm branch` exercises the real write-protect
+    //    engine through the jail — the uffd is created+registered as root pre-confine and
+    //    armed at branch time; SPEC-1 FR-16) and wait until its exec agent answers.
+    let launch = mm(&[
+        "run",
+        "--ssh",
+        "--detach",
+        "--branchable",
+        "--name",
+        src,
+        IMAGE,
+    ])
+    .output()
+    .expect("spawn `mm run`");
     assert!(
         launch.status.success(),
         "`mm run` failed: {}\n{}",

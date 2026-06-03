@@ -156,6 +156,15 @@ pub struct Machine {
     /// pthread ids of the running vCPU threads, so `shutdown` can signal them out
     /// of a halted KVM_RUN.
     vcpu_tids: Arc<Mutex<Vec<libc::pthread_t>>>,
+    /// A pre-created, region-registered (WRITE_PROTECT, not yet armed) userfaultfd for
+    /// the running-BRANCH path (SPEC-1 FR-16). Created as root **before** the jailer
+    /// confines the worker (the `userfaultfd(2)` syscall + `/dev/userfaultfd` need
+    /// privilege the confined worker lacks); stashed here so a later `branch` only has to
+    /// `UFFDIO_WRITEPROTECT` (an already-seccomp-allowed ioctl). `branch` consumes it
+    /// (the handler drops it, unregistering) — one branch per booted VM. `None` on a VM
+    /// not booted branchable.
+    #[cfg(feature = "branch")]
+    branch_uffd: Option<userfaultfd::Uffd>,
 }
 
 /// The Machine's half of a device snapshot handle: signal `evt` to ask the device's
@@ -200,6 +209,17 @@ pub struct BranchOutcome {
     pub manifest: crate::snapshot::SnapshotManifest,
     pub copied: u64,
     pub faulted: u64,
+}
+
+/// Guest RAM plus a pre-created, region-registered branch userfaultfd, produced by
+/// [`Machine::prepare_branchable_memory`] **before** the jailer confines the worker and
+/// consumed by [`Machine::boot_jailed_prepared`]. Opaque on purpose: the (privileged,
+/// pre-confine) caller just carries it across `confine()` into the boot — it never needs
+/// to touch the uffd or the mapping directly.
+#[cfg(feature = "branch")]
+pub struct PreparedMemory {
+    guest_memory: GuestMemoryMmap,
+    uffd: userfaultfd::Uffd,
 }
 
 impl Machine {
@@ -279,6 +299,8 @@ impl Machine {
             checkpoint: Arc::new(Checkpoint::default()),
             device_captures: Vec::new(),
             vcpu_tids: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(feature = "branch")]
+            branch_uffd: None,
         })
     }
 
@@ -349,6 +371,65 @@ impl Machine {
         machine.vcpu_hook = vcpu_hook;
         machine.start()?;
         Ok(machine)
+    }
+
+    /// Allocate guest RAM and create+register the running-BRANCH userfaultfd over it
+    /// (SPEC-1 FR-16), returning a [`PreparedMemory`] to be booted by
+    /// [`boot_jailed_prepared`](Self::boot_jailed_prepared). **Must be called before the
+    /// jailer confines the worker** (while still root, with `/dev/userfaultfd` reachable):
+    /// the uffd is created here so the later, confined `branch` only has to arm
+    /// write-protection (an already-seccomp-allowed ioctl). The uffd registers the host
+    /// addresses of the returned mapping; those addresses are stable across the move into
+    /// the booted `Machine`.
+    #[cfg(feature = "branch")]
+    pub fn prepare_branchable_memory(memory_mib: u64) -> Result<PreparedMemory> {
+        use vm_memory::{GuestMemory, GuestMemoryRegion};
+        let guest_memory = Self::allocate_guest_memory(memory_mib)?;
+        let regions: Vec<(usize, usize)> = guest_memory
+            .iter()
+            .map(|r| (r.as_ptr() as usize, r.len() as usize))
+            .collect();
+        let uffd = crate::snapshot::branch::create_registered_uffd(&regions)?;
+        Ok(PreparedMemory { guest_memory, uffd })
+    }
+
+    /// Like [`boot_jailed`](Self::boot_jailed) but boots from a [`PreparedMemory`] (its
+    /// pre-allocated RAM + pre-registered branch uffd), stashing the uffd so a later
+    /// `branch` uses it instead of trying to create one under the worker's seccomp/chroot.
+    /// The branchable boot path (SPEC-1 FR-16).
+    ///
+    /// # Safety
+    /// Same as [`boot_jailed`](Self::boot_jailed): `kvm_fd`, `tap_fds`, and
+    /// `vsock_listener_fd` must be valid open fds whose ownership transfers to this call.
+    #[cfg(feature = "branch")]
+    pub fn boot_jailed_prepared(
+        config: &VmConfig,
+        kvm_fd: RawFd,
+        tap_fds: Vec<RawFd>,
+        vsock_listener_fd: Option<RawFd>,
+        vcpu_hook: Option<VcpuHook>,
+        prepared: PreparedMemory,
+    ) -> Result<Self> {
+        // SAFETY: the caller guarantees `kvm_fd` is an open /dev/kvm fd we now own.
+        let kvm = unsafe { Kvm::from_raw_fd(kvm_fd) };
+        let mut machine = Self::with_resources_memory(config, kvm, tap_fds, prepared.guest_memory)?;
+        machine.branch_uffd = Some(prepared.uffd);
+        if let Some(fd) = vsock_listener_fd {
+            // SAFETY: the caller transfers ownership of an open, bound, listening UDS fd.
+            machine.vsock_listener = Some(unsafe { UnixListener::from_raw_fd(fd) });
+        }
+        machine.vcpu_hook = vcpu_hook;
+        machine.start()?;
+        Ok(machine)
+    }
+
+    /// Whether this VM was booted branchable — i.e. it holds a pre-created branch uffd
+    /// (via [`boot_jailed_prepared`](Self::boot_jailed_prepared)) and so a `branch` will
+    /// use the write-protect engine. The jailed worker checks this to fall back to an
+    /// in-place snapshot when the VM is not branchable (it can't create a uffd post-confine).
+    #[cfg(feature = "branch")]
+    pub fn is_branchable(&self) -> bool {
+        self.branch_uffd.is_some()
     }
 
     /// Wire up devices, load the kernel, and launch the vCPU threads.
@@ -972,10 +1053,23 @@ impl Machine {
             }
         };
 
-        // 2. Arm write-protection over the parent's live RAM and start the fault handler
-        //    BEFORE resuming, so the parent's first post-resume write is serviced.
+        // 2. Source the uffd: a branchable jailed VM created+registered it as root at
+        //    boot (the only way under the worker's seccomp/chroot — see
+        //    `prepare_branchable_memory`); otherwise (in-process/root path) create it now.
+        //    Then arm write-protection and start the fault handler BEFORE resuming, so the
+        //    parent's first post-resume write is serviced.
         let mem_file = out_dir.join("memory.bin");
-        let mut engine = match BranchEngine::arm(&regions, &mem_file) {
+        let uffd = match self.branch_uffd.take() {
+            Some(u) => u,
+            None => match crate::snapshot::branch::create_registered_uffd(&regions) {
+                Ok(u) => u,
+                Err(e) => {
+                    let _ = self.release_barrier();
+                    return Err(e);
+                }
+            },
+        };
+        let mut engine = match BranchEngine::arm(uffd, &regions, &mem_file) {
             Ok(e) => e,
             Err(e) => {
                 let _ = self.release_barrier();

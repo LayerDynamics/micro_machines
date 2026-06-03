@@ -56,6 +56,8 @@ pub fn boot(
         mm_init_path: host.mm_init_path.clone(),
         sshd_path: host.sshd_path.clone(),
         reserved_ips,
+        // Cluster VMs are not branchable in this iteration (cluster BRANCH is a follow-on).
+        branchable: false,
     };
     let outcome = mm_host::launch(&spec)?;
     Ok(LocalMachine {

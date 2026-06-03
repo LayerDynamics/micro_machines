@@ -119,6 +119,7 @@ fn run_jailed_boot(tag: &str, user_namespace: bool) {
             rate_limit: None,
         },
         devices: vec![],
+        branchable: false,
     };
     cfg.validate().unwrap();
     // The worker reads the config *before* chroot, so it lives outside the jail.

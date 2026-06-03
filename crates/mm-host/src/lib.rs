@@ -60,6 +60,11 @@ pub struct LaunchSpec {
     /// IPs already allocated to other machines, used to seed the IPAM pool so the new
     /// machine gets a free address.
     pub reserved_ips: Vec<Ipv4Addr>,
+    /// Boot the VM branchable (SPEC-1 FR-16): the worker prepares the running-BRANCH
+    /// userfaultfd at boot so a later live `mm branch` uses the near-zero-pause
+    /// write-protect engine. `false` = normal boot (branch falls back to in-place
+    /// snapshot).
+    pub branchable: bool,
 }
 
 /// Everything needed to restore a microVM from a snapshot directory into a fresh jail.

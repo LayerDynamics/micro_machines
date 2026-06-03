@@ -31,6 +31,7 @@ fn fixture_config() -> VmConfig {
             rate_limit: None,
         },
         devices: vec![],
+        branchable: false,
     }
 }
 

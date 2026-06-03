@@ -248,6 +248,7 @@ mod tests {
             name: Some("web".into()),
             ssh: true,
             detach: false,
+            branchable: false,
         };
         let body = run_body(&args);
         assert_eq!(body["name"], "web");

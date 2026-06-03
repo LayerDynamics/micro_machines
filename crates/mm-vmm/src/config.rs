@@ -31,6 +31,13 @@ pub struct VmConfig {
     pub kernel_cmdline: String,
     pub rootfs: BlockDevice,
     pub devices: Vec<VirtioDevice>,
+    /// Boot this VM "branchable" (SPEC-1 FR-16): the jailed worker creates + registers the
+    /// running-BRANCH userfaultfd as root *before* confinement, so a later live `mm branch`
+    /// of this VM uses the near-zero-pause write-protect engine instead of an in-place
+    /// snapshot. Defaults false (the uffd has a small per-VM cost; opt in via
+    /// `mm run --branchable`). `#[serde(default)]` so older config JSON still loads.
+    #[serde(default)]
+    pub branchable: bool,
 }
 
 /// A backing block device exposed to the guest as virtio-blk (SPEC-1 FR-3).
@@ -111,6 +118,7 @@ mod tests {
                 rate_limit: None,
             },
             devices: vec![],
+            branchable: false,
         }
     }
     #[test]

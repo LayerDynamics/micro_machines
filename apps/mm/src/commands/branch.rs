@@ -71,9 +71,11 @@ pub fn run(args: BranchArgs) -> Result<()> {
         (internal_ip, clone_index, clone_ip)
     };
 
-    // 1. Snapshot the *live* source in place (brief pause to capture+dump RAM, then the
-    //    source resumes — it keeps running throughout), returning the new snapshot id.
-    let id = crate::commands::snapshot::request_snapshot(&args.name, ControlRequest::Snapshot)
+    // 1. Branch the *live* source. The worker uses the near-zero-pause write-protect
+    //    engine if the source was booted `--branchable` (its uffd was created pre-confine),
+    //    else falls back to a resume-in-place snapshot (brief pause). Either way the source
+    //    keeps running and we get the new image's id.
+    let id = crate::commands::snapshot::request_snapshot(&args.name, ControlRequest::Branch)
         .with_context(|| format!("branching {}", args.name))?;
 
     // 2. Locate the branch dir (in the source's in-jail store) and the source's rootfs —

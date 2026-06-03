@@ -41,6 +41,27 @@ use crate::machine::{Result, VmmError};
 /// stuck handler/copier should fail the branch, not hang the parent forever).
 const COMPLETE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Create a full (non-user-mode-only) userfaultfd and register every guest RAM region in
+/// `WRITE_PROTECT` mode — **without** arming protection (no faults until [`BranchEngine::arm`]
+/// write-protects). A KVM guest's write faults out via EPT in kernel context, so a
+/// `USER_MODE_ONLY` uffd would never see it (proven in Phase 0); creating a full uffd needs
+/// privilege (root) and an accessible `/dev/userfaultfd`, so the jailed worker calls this
+/// **before** it confines (see `Machine::prepare_branchable_memory`), while the in-process
+/// path calls it as root at branch time. `regions` are `(host_base, len_bytes)`.
+pub(crate) fn create_registered_uffd(regions: &[(usize, usize)]) -> Result<Uffd> {
+    let uffd = UffdBuilder::new()
+        .require_features(FeatureFlags::PAGEFAULT_FLAG_WP)
+        .user_mode_only(false)
+        .non_blocking(true)
+        .create()
+        .map_err(|e| VmmError::Device(format!("branch: create uffd: {e}")))?;
+    for &(base, len) in regions {
+        uffd.register_with_mode(base as *mut c_void, len, RegisterMode::WRITE_PROTECT)
+            .map_err(|e| VmmError::Device(format!("branch: register region: {e}")))?;
+    }
+    Ok(uffd)
+}
+
 /// The write-protect branch engine. Built (and the uffd armed) while the parent is
 /// paused; then the handler is spawned, the parent resumed, and the copier run.
 pub(crate) struct BranchEngine {
@@ -52,11 +73,14 @@ pub(crate) struct BranchEngine {
 }
 
 impl BranchEngine {
-    /// Create the uffd, register every guest RAM region in write-protect mode and arm
-    /// protection, and create the branch file sized to hold all pages. Call while the
-    /// parent is paused at the checkpoint barrier (no writers), so arming is atomic
-    /// w.r.t. the guest. `regions` are `(host_base, len_bytes)` in ascending order.
-    pub(crate) fn arm(regions: &[(usize, usize)], branch_path: &Path) -> Result<Self> {
+    /// Arm write-protection over an **already-registered** uffd's regions and create the
+    /// branch file sized to hold all pages. `uffd` must have been registered (WRITE_PROTECT
+    /// mode) over `regions` by [`create_registered_uffd`] — created either at boot, before
+    /// the jailer confines the worker (the privileged-creation path), or just-in-time as
+    /// root by the in-process path. Call while the parent is paused at the checkpoint
+    /// barrier (no writers), so arming is atomic w.r.t. the guest. `regions` are
+    /// `(host_base, len_bytes)` in ascending order.
+    pub(crate) fn arm(uffd: Uffd, regions: &[(usize, usize)], branch_path: &Path) -> Result<Self> {
         let region_map = Arc::new(RegionMap::new(regions));
         let total_pages = region_map.total_pages();
         let preserve = Arc::new(PreserveMap::new(total_pages));
@@ -72,17 +96,9 @@ impl BranchEngine {
             .map_err(VmmError::Io)?;
         let file = Arc::new(file);
 
-        // A full (non-user-mode-only) uffd: a KVM guest's write faults out via EPT in
-        // kernel context, so a USER_MODE_ONLY uffd would never see it (proven in Phase 0).
-        let uffd = UffdBuilder::new()
-            .require_features(FeatureFlags::PAGEFAULT_FLAG_WP)
-            .user_mode_only(false)
-            .non_blocking(true)
-            .create()
-            .map_err(|e| VmmError::Device(format!("branch: create uffd: {e}")))?;
+        // Registration is already done; just arm write-protection so the parent's next
+        // write to each page faults out to the handler.
         for &(base, len) in regions {
-            uffd.register_with_mode(base as *mut c_void, len, RegisterMode::WRITE_PROTECT)
-                .map_err(|e| VmmError::Device(format!("branch: register region: {e}")))?;
             uffd.write_protect(base as *mut c_void, len)
                 .map_err(|e| VmmError::Device(format!("branch: arm write-protection: {e}")))?;
         }
