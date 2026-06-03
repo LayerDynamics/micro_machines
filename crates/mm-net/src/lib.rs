@@ -18,3 +18,10 @@ pub use ipam::{Ipam, IpamError};
 pub mod host;
 #[cfg(target_os = "linux")]
 pub use host::{create_tap, enable_nat, ensure_bridge, teardown_tap, HostNetError, Tap};
+
+// Per-clone netns/veth/NAT executor (privileged, linux-only) — the runtime half of
+// `clone_net` for `mm branch` live clones.
+#[cfg(target_os = "linux")]
+pub mod clone_host;
+#[cfg(target_os = "linux")]
+pub use clone_host::{create_netns, open_tun_in_netns, teardown_clone_net, wire_clone_net};

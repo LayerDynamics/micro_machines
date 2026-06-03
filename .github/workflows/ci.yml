@@ -583,3 +583,20 @@ jobs:
           sudo ip link del mm-test-tap 2>/dev/null
           sudo ip link del mm-test-br 2>/dev/null
           exit 0
+
+  # FR-16 clone-networking Step-0 gate: prove a TAP opened inside a network namespace
+  # yields an fd usable from the root netns (the jailed worker never enters the netns).
+  # Cheap — no KVM/fixtures, just root + iproute2 + /dev/net/tun.
+  clone-net-spike:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the clone-net fd/setns spike
+        run: cargo test -p mm-net --test clone_netns_spike --no-run
+      - name: Run the fd/setns spike as root
+        run: |
+          sudo -E env "PATH=$PATH" \
+            cargo test -p mm-net --test clone_netns_spike -- --ignored --nocapture

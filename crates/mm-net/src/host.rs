@@ -132,7 +132,7 @@ fn link_exists(name: &str) -> bool {
 }
 
 /// Run a command, turning a non-zero exit into a descriptive error.
-fn run(cmd: &str, args: &[&str]) -> Result<(), HostNetError> {
+pub(crate) fn run(cmd: &str, args: &[&str]) -> Result<(), HostNetError> {
     let output = Command::new(cmd)
         .args(args)
         .output()
@@ -146,8 +146,10 @@ fn run(cmd: &str, args: &[&str]) -> Result<(), HostNetError> {
     Ok(())
 }
 
-/// Open `/dev/net/tun` and create TAP `name` with `IFF_TAP | IFF_NO_PI`.
-fn open_tun(name: &str) -> Result<File, HostNetError> {
+/// Open `/dev/net/tun` and create TAP `name` with `IFF_TAP | IFF_NO_PI`. Creates the
+/// device in the **calling thread's** network namespace (see [`crate::clone_host`], which
+/// calls this after `setns`-ing into a clone netns).
+pub(crate) fn open_tun(name: &str) -> Result<File, HostNetError> {
     let path = std::ffi::CString::new("/dev/net/tun").expect("static path has no NUL");
     // SAFETY: `path` is a valid NUL-terminated C string.
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
