@@ -1,8 +1,23 @@
 # Snapshot lifecycle CLI + worker-triggered creation
 
 **Date:** 2026-06-02
-**Status:** Design (foundation landed; creation path pending)
+**Status:** BUILT (2026-06-03) + KVM-green — single-host `mm snapshot create/ls/rm/gc` +
+`mm restore` over a worker control channel. Cluster `Snapshot` REST resource (Phase C) and
+live-clone `mm branch` networking (`docs/plans/2026-06-03-clone-networking-netns.md`) remain.
 **Tracks:** M3 follow-up #6 (snapshot GC/retention + cross-host restore)
+
+## Built 2026-06-03
+
+The creation-path gap is closed: the jailed worker binds a control UDS (`control.sock`, fd
+13) and serves a bare-verb protocol (`SNAPSHOT`/`BRANCH` → `OK <id>`/`ERR`), holding the
+`Machine` behind an `Arc<Mutex>` with a lock-free `Machine::is_powered_off()` so the control
+loop and the reaper don't contend. The worker allocates the snapshot id (it owns the
+in-chroot `/snapshots/<bucket>` dir it writes), so there's no parent path injection or
+cross-uid chown. `mm snapshot create` connects to it; `ls/rm/gc` use `SnapshotStore` over the
+in-jail dir. `mm restore <name> <id> <new>` boots a fresh jailed VM from the snapshot via the
+new `mm_host::restore_launch` (`--restore-dir` → `mm_vmm::snapshot::restore`). Proven by the
+`snapshot-cli-integration` KVM e2e (`apps/mm/tests/snapshot_cli_kvm.rs`): live snapshot →
+restore → exec, with the restored guest's captured net device + IP intact.
 
 ## Goal
 

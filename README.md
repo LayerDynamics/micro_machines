@@ -126,6 +126,25 @@ mm rm demo                 # remove it
 Booting needs root (or the appropriate capabilities) to create the bridge/TAP and jail
 the worker.
 
+### Snapshots & restore
+
+Snapshot a **live** microVM (no full pause — the worker captures it over a control
+channel), list/prune snapshots, and restore one into a fresh machine:
+
+```bash
+mm snapshot create demo            # snapshot the running guest; prints the new id
+mm snapshot ls demo                # list demo's snapshots (id, RAM, kind)
+mm restore demo <id> demo-restored # boot a new machine from that snapshot
+mm exec demo-restored -- uname -a  # the restored guest is live (reach it over vsock)
+mm snapshot gc demo --keep 3       # keep the 3 newest, remove the rest
+mm snapshot rm demo <id>           # remove one snapshot
+```
+
+A restored machine resumes with the IP captured in the snapshot, so restore a *stopped*
+source (or reach the restored guest over its own vsock bridge with `mm exec`). Branching
+a *running* guest into an independently-addressable live clone (`mm branch`) is a
+follow-on (see `docs/plans/2026-06-03-clone-networking-netns.md`).
+
 ## Cluster mode
 
 The control plane is a `mm-controller` (REST API + scheduler + reconciler + gRPC,
