@@ -840,7 +840,9 @@ fn branch_clone_survives_sustained_interrupt_activity() {
             "ALIVE",
             "iteration {i}: clone did not survive sustained timer activity",
         );
-        child.shutdown().unwrap_or_else(|e| panic!("iteration {i}: stop child: {e}"));
+        child
+            .shutdown()
+            .unwrap_or_else(|e| panic!("iteration {i}: stop child: {e}"));
     }
 
     parent.shutdown().expect("stop parent");
