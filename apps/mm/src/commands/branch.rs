@@ -2,12 +2,17 @@
 //! (SPEC-1 FR-16).
 //!
 //! Unlike `mm restore` (which boots from a previously-saved snapshot), `branch` acts on
-//! the *live* source: its worker arms write-protection and materializes a coherent
-//! point-in-time image **without freezing the source for a RAM dump** (the source keeps
-//! running), then a fresh machine is booted from that branch image. The clone resumes
+//! the *live* source: it snapshots the running guest in place (a brief pause to capture +
+//! dump RAM, then the source resumes — see `Machine::snapshot_in_place`) and boots a
+//! fresh machine from that image. The source keeps running throughout. The clone resumes
 //! with the IP captured in the source's RAM, so — exactly like `mm restore` — don't rely
 //! on two machines sharing that IP at once (re-IP-per-clone is a follow-up); reach the
 //! clone over its own vsock bridge with `mm exec`.
+//!
+//! (The near-zero-pause write-protected branch engine — `Machine::branch`, which arms
+//! userfaultfd to copy RAM concurrently — needs the uffd created outside the jailed
+//! worker to stay within the VMM seccomp sandbox; that's a follow-up. The in-place
+//! snapshot path here needs no userfaultfd and works through the jail today.)
 use anyhow::{Context, Result};
 use mm_api_types::{ObjectMeta, State};
 use mm_host::control_proto::ControlRequest;
@@ -38,9 +43,9 @@ pub fn run(args: BranchArgs) -> Result<()> {
         }
     }
 
-    // 1. Branch the *live* source guest: the worker arms WP + copies RAM concurrently and
-    //    returns the new branch id (the source keeps running throughout).
-    let id = crate::commands::snapshot::request_snapshot(&args.name, ControlRequest::Branch)
+    // 1. Snapshot the *live* source in place (brief pause to capture+dump RAM, then the
+    //    source resumes — it keeps running throughout), returning the new snapshot id.
+    let id = crate::commands::snapshot::request_snapshot(&args.name, ControlRequest::Snapshot)
         .with_context(|| format!("branching {}", args.name))?;
 
     // 2. Locate the branch dir (in the source's in-jail store) and the source's rootfs —
