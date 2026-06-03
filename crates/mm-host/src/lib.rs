@@ -66,6 +66,10 @@ pub struct LaunchOutcome {
     /// Host Unix-domain socket the vsock exec bridge listens on; connect here and
     /// speak the `CONNECT <port>\n` handshake to reach a guest vsock port (FR-13).
     pub vsock_path: PathBuf,
+    /// Host Unix-domain socket the worker's control channel listens on; connect here and
+    /// speak the control protocol (`SNAPSHOT`/`BRANCH`) to act on the live guest
+    /// (FR-14/FR-16). See [`control_proto`](crate::control_proto).
+    pub control_path: PathBuf,
     /// Handle to the spawned jailed worker. Wait on it to serve the guest in the
     /// foreground; drop it to leave the detached worker running in its own session.
     pub child: Child,

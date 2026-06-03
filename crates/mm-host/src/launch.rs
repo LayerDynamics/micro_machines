@@ -25,10 +25,11 @@ const BRIDGE: &str = "mm-br0";
 /// Unprivileged uid/gid the jailed worker drops to (nobody/nogroup).
 const WORKER_UID: u32 = 65534;
 const WORKER_GID: u32 = 65534;
-/// Fixed fd numbers the worker inherits the KVM + TAP + vsock-listener fds at.
+/// Fixed fd numbers the worker inherits the KVM + TAP + vsock + control fds at.
 const WORKER_KVM_FD: RawFd = 10;
 const WORKER_TAP_FD: RawFd = 11;
 const WORKER_VSOCK_FD: RawFd = 12;
+const WORKER_CONTROL_FD: RawFd = 13;
 
 /// Encode an argv as the `mm.workload_argv` cmdline value: NUL-join the elements
 /// (NUL can't appear in argv) and hex-encode, so arguments with spaces or commas
@@ -85,6 +86,15 @@ pub fn launch(spec: &LaunchSpec) -> Result<LaunchOutcome> {
     // would hit an opaque "permission denied" deep inside the boot.
     prepare_jail_permissions(&jail, &jail_root, &[&jail_kernel, &jail_rootfs])?;
 
+    // A writable snapshot dir *inside* the chroot (at `/snapshots` for the worker), owned
+    // by the dropped uid so the confined worker can write live snapshots/branches into it
+    // over the control channel (FR-14/FR-16). Unlike the read-only kernel/rootfs, this
+    // must be writable by WORKER_UID.
+    let jail_snapshots = jail_root.join("snapshots");
+    std::fs::create_dir_all(&jail_snapshots)
+        .with_context(|| format!("creating {}", jail_snapshots.display()))?;
+    chown_to_worker(&jail_snapshots)?;
+
     // 6. Worker VM config with chroot-relative paths; serialized for the child.
     // Inject the managed SSH public key so `mm ssh` works with no in-guest setup.
     let authorized_key_hex = ensure_ssh_key(root)?;
@@ -128,7 +138,13 @@ pub fn launch(spec: &LaunchSpec) -> Result<LaunchOutcome> {
     let vsock_path = jail.join("vsock.sock");
     let vsock_listener = bind_vsock_listener(&vsock_path)?;
 
-    // 8. Spawn the jailed worker, passing the KVM + TAP + vsock-listener fds.
+    // Control UDS: the parent↔worker channel for live snapshot/branch (FR-14/FR-16),
+    // bound outside the chroot in the per-VM jail dir (reachable by the launcher/agent)
+    // and passed to the worker, which serves it post-confinement.
+    let control_path = jail.join("control.sock");
+    let control_listener = bind_vsock_listener(&control_path)?;
+
+    // 8. Spawn the jailed worker, passing the KVM + TAP + vsock + control fds.
     let cgroup = format!("micro_machines/{name}");
     let cpu_max = format!("{} 100000", u64::from(spec.cpus) * 100_000);
     let mem_max = spec.memory_mib * 1024 * 1024;
@@ -138,6 +154,7 @@ pub fn launch(spec: &LaunchSpec) -> Result<LaunchOutcome> {
         kvm_fd,
         tap.as_raw_fd(),
         vsock_listener.as_raw_fd(),
+        control_listener.as_raw_fd(),
         &jail_root,
         &cgroup,
         &cpu_max,
@@ -148,11 +165,12 @@ pub fn launch(spec: &LaunchSpec) -> Result<LaunchOutcome> {
     let pid = child.id();
 
     // The child now owns its copies of the fds; the persistent TAP survives the
-    // parent dropping its handle, and the bound UDS survives via the worker's copy.
+    // parent dropping its handle, and the bound UDSes survive via the worker's copies.
     // SAFETY: `kvm_fd` is the fd we opened; the child inherited its own copy.
     unsafe { libc::close(kvm_fd) };
     drop(tap);
     drop(vsock_listener);
+    drop(control_listener);
 
     Ok(LaunchOutcome {
         name,
@@ -161,6 +179,7 @@ pub fn launch(spec: &LaunchSpec) -> Result<LaunchOutcome> {
         pid,
         console_log,
         vsock_path,
+        control_path,
         child,
     })
 }
@@ -176,6 +195,7 @@ fn spawn_worker(
     kvm_fd: RawFd,
     tap_fd: RawFd,
     vsock_fd: RawFd,
+    control_fd: RawFd,
     chroot: &Path,
     cgroup: &str,
     cpu_max: &str,
@@ -194,6 +214,8 @@ fn spawn_worker(
         .arg(WORKER_TAP_FD.to_string())
         .arg("--vsock-fd")
         .arg(WORKER_VSOCK_FD.to_string())
+        .arg("--control-fd")
+        .arg(WORKER_CONTROL_FD.to_string())
         .arg("--chroot")
         .arg(chroot)
         .arg("--uid")
@@ -238,6 +260,9 @@ fn spawn_worker(
                 return Err(std::io::Error::last_os_error());
             }
             if libc::dup2(vsock_fd, WORKER_VSOCK_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(control_fd, WORKER_CONTROL_FD) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             if detach && libc::setsid() < 0 {
@@ -386,6 +411,25 @@ fn verify_path_traversable(path: &Path) -> Result<()> {
             }
         }
         current = dir.parent();
+    }
+    Ok(())
+}
+
+/// chown `path` to the unprivileged worker uid/gid so the confined (dropped) worker can
+/// write into it — used for the in-jail snapshot dir (writable, unlike the read-only
+/// kernel/rootfs).
+fn chown_to_worker(path: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("path has interior NUL: {}", path.display()))?;
+    // SAFETY: `c` is a valid C string path owned for the call; we check the result.
+    let rc = unsafe { libc::chown(c.as_ptr(), WORKER_UID, WORKER_GID) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!(
+            "chown {} to {WORKER_UID}:{WORKER_GID}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(())
 }
