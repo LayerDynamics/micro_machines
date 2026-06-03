@@ -158,8 +158,50 @@ fn mm_branch_clone_is_reachable_at_a_unique_ip_without_colliding_with_the_source
                 eprintln!("--- {who} console ---\n{log}\n--- end ---");
             }
         }
-        eprintln!("--- ip netns ---");
-        let _ = Command::new("ip").args(["netns", "list"]).status();
+        // Dump the full host + clone-netns network state so a networking failure pinpoints
+        // host-side (netns/veth/NAT/route) vs guest-side (the clone's NIC never came up).
+        let netns = format!("mm-clone-{clone}");
+        let diag = |label: &str, prog: &str, args: &[&str]| {
+            let out = Command::new(prog).args(args).output();
+            match out {
+                Ok(o) => eprintln!(
+                    "--- {label} ---\n{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+                Err(e) => eprintln!("--- {label} --- (failed to run: {e})"),
+            }
+        };
+        diag("ip netns list", "ip", &["netns", "list"]);
+        diag("host: ip addr", "ip", &["-br", "addr"]);
+        diag(
+            "host: route to clone_ip",
+            "ip",
+            &["route", "get", &clone_ip],
+        );
+        diag("host: nat table", "iptables", &["-t", "nat", "-S"]);
+        diag(
+            "netns: ip addr",
+            "ip",
+            &["netns", "exec", &netns, "ip", "-br", "addr"],
+        );
+        diag(
+            "netns: ip route",
+            "ip",
+            &["netns", "exec", &netns, "ip", "route"],
+        );
+        diag(
+            "netns: nat table",
+            "ip",
+            &["netns", "exec", &netns, "iptables", "-t", "nat", "-S"],
+        );
+        diag(
+            "netns: ping clone_ip",
+            "ip",
+            &[
+                "netns", "exec", &netns, "ping", "-c", "1", "-W", "2", &clone_ip,
+            ],
+        );
     }
 
     assert!(clone_exec, "clone never became exec-ready");
