@@ -17,6 +17,9 @@ use std::path::PathBuf;
 use std::process::Child;
 
 mod config;
+/// Parent↔worker control-channel wire protocol (live snapshot/branch). Pure; the `mm`
+/// CLI uses it as the client and the worker as the server.
+pub mod control_proto;
 #[cfg(target_os = "linux")]
 mod launch;
 mod worker;
