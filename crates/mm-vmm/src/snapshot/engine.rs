@@ -64,8 +64,9 @@ pub fn snapshot(machine: &mut Machine, out_dir: &Path) -> Result<SnapshotManifes
 
 /// Write the `state.bin` + `manifest.json` of a snapshot. Split out from
 /// [`snapshot`] (which also needs a live VM for the pause + RAM dump) so the
-/// serialization/layout is unit-testable without KVM.
-fn write_snapshot_metadata(
+/// serialization/layout is unit-testable without KVM, and reused by the running-BRANCH
+/// engine (whose `memory.bin` is produced concurrently rather than by a dump).
+pub(crate) fn write_snapshot_metadata(
     out_dir: &Path,
     vm_state: &VmState,
     manifest: &SnapshotManifest,

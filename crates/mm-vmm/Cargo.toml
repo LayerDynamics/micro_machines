@@ -23,6 +23,10 @@ event-manager = { workspace = true }
 virtio-queue = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
+# The FR-16 running-BRANCH write-protect engine. Optional + feature-gated (`branch`) so
+# the lib still cross-checks on the non-Linux dev host — userfaultfd-sys needs Linux
+# kernel headers it can't find when cross-compiling from macOS.
+userfaultfd = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # Enables virtio-queue's MockSplitQueue so device unit tests can build descriptor
@@ -37,5 +41,10 @@ mm-sandbox = { path = "../mm-sandbox" }
 userfaultfd = { workspace = true }
 
 [features]
-# KVM-dependent integration tests, run only on linux+kvm hosts.
-kvm-integration = []
+# KVM-dependent integration tests, run only on linux+kvm hosts. Pulls in `branch` so
+# the running-BRANCH engine and its KVM e2e build under the integration test job.
+kvm-integration = ["branch"]
+# FR-16 running-BRANCH engine (userfaultfd write-protect). Optional so a plain
+# `cargo check`/`clippy` of the lib on a non-Linux host doesn't try to build
+# userfaultfd-sys (which needs Linux kernel headers).
+branch = ["dep:userfaultfd"]

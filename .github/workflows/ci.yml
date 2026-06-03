@@ -21,6 +21,13 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
+      # The FR-16 running-BRANCH engine + its KVM e2e are behind the kvm-integration
+      # feature (which pulls in `branch`/userfaultfd), so the default workspace build
+      # never compiles them — only the slow KVM jobs do. Lint them here on the fast
+      # non-KVM Linux runner (userfaultfd-sys builds fine without /dev/kvm; the tests are
+      # #[ignore]d so nothing runs) so a typo/unused/Send error surfaces in ~2 min
+      # instead of after the KVM queue.
+      - run: cargo clippy -p mm-vmm --features kvm-integration --all-targets
 
   node:
     runs-on: ubuntu-latest

@@ -830,6 +830,118 @@ impl Machine {
         Ok(out)
     }
 
+    /// **Branch** a running microVM into `out_dir` (SPEC-1 FR-16): produce a coherent
+    /// point-in-time snapshot directory (`manifest.json` + `state.bin` + `memory.bin`)
+    /// **without freezing the parent for a RAM dump**. The parent is paused only briefly
+    /// — to capture vCPU/device/clock/irqchip state and arm write-protection — then
+    /// resumes and keeps running while the branch's RAM image is materialized
+    /// concurrently (a parent write to a not-yet-preserved page faults out and its
+    /// pre-write T-version is copied aside first). The resulting directory is layout-
+    /// identical to a frozen [`snapshot`](crate::snapshot::snapshot), so children fork
+    /// from it with the proven `MAP_PRIVATE` path
+    /// ([`fork_children`](crate::snapshot::fork_children)).
+    ///
+    /// Returns the written [`SnapshotManifest`]. Requires the `branch` feature.
+    #[cfg(feature = "branch")]
+    pub fn branch(
+        &mut self,
+        out_dir: &std::path::Path,
+    ) -> Result<crate::snapshot::SnapshotManifest> {
+        use crate::snapshot::branch::BranchEngine;
+
+        std::fs::create_dir_all(out_dir).map_err(VmmError::Io)?;
+
+        // 1. Pause at the checkpoint barrier (vCPUs + device workers) and capture the
+        //    full coherent state — no RAM dump while paused.
+        self.quiesce_at_barrier(true)?;
+        let captured = (|| -> Result<(VmState, Vec<(usize, usize)>)> {
+            let vcpus = self.collect_vcpu_states()?;
+            let devices = self.collect_device_states()?;
+            let clock = self.capture_clock()?;
+            let irqchip = self.capture_irqchip()?;
+            let regions = self.guest_ram_regions();
+            Ok((
+                VmState {
+                    vcpus,
+                    devices,
+                    clock,
+                    irqchip,
+                },
+                regions,
+            ))
+        })();
+        let (vm_state, regions) = match captured {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = self.release_barrier();
+                return Err(e);
+            }
+        };
+
+        // 2. Arm write-protection over the parent's live RAM and start the fault handler
+        //    BEFORE resuming, so the parent's first post-resume write is serviced.
+        let mem_file = out_dir.join("memory.bin");
+        let mut engine = match BranchEngine::arm(&regions, &mem_file) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = self.release_barrier();
+                return Err(e);
+            }
+        };
+        let handler = match engine.spawn_handler() {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = self.release_barrier();
+                return Err(e);
+            }
+        };
+
+        // 3. Resume the parent. Its writes to write-protected pages now fault out and the
+        //    handler preserves the T-version before the write applies.
+        self.release_barrier()?;
+
+        // 4. Materialize the full T-snapshot concurrently with the running parent, then
+        //    tear down the uffd (removing any residual write-protection).
+        let copier = engine.run_copier()?;
+        engine.await_complete()?;
+        let faulted = handler
+            .join()
+            .map_err(|_| VmmError::Device("branch: fault handler thread panicked".into()))??;
+        drop(engine);
+        eprintln!(
+            "branch: T-snapshot complete — {copier} pages copied by the copier, {faulted} preserved by write-fault"
+        );
+
+        // 5. Write the snapshot metadata; memory.bin is already the coherent T-image.
+        let host = HostFingerprint {
+            cpuid_hash: self.cpuid_hash()?,
+            tsc_khz: vm_state.vcpus.first().map_or(0, |v| v.tsc_khz),
+        };
+        let manifest = crate::snapshot::SnapshotManifest {
+            version: crate::snapshot::SnapshotManifest::CURRENT_VERSION,
+            vcpu_count: self.config().vcpus,
+            memory_mib: self.config().memory_mib,
+            memory_file: "memory.bin".into(),
+            state_file: "state.bin".into(),
+            kind: crate::snapshot::SnapshotKind::Full,
+            parent_uid: None,
+            host,
+        };
+        crate::snapshot::engine::write_snapshot_metadata(out_dir, &vm_state, &manifest)?;
+        Ok(manifest)
+    }
+
+    /// The parent's guest RAM regions as `(host_base_addr, len_bytes)` in ascending
+    /// guest-address order — the input the branch write-protect engine arms over.
+    #[cfg(feature = "branch")]
+    fn guest_ram_regions(&self) -> Vec<(usize, usize)> {
+        use vm_memory::{GuestMemory, GuestMemoryRegion};
+        self.guest_memory
+            .iter()
+            .map(|r| (r.as_ptr() as usize, r.len() as usize))
+            .collect()
+    }
+
     /// Create a snapshot pause handle, give one end to `device`, and record the other
     /// for [`pause_devices`](Self::pause_devices). Call once per snapshottable device
     /// before it is activated.

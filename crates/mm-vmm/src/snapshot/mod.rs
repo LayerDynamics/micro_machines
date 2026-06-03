@@ -33,3 +33,10 @@ pub use engine::{load_manifest, load_state, restore, snapshot};
 pub mod fork_engine;
 #[cfg(target_os = "linux")]
 pub use fork_engine::fork_children;
+
+/// Running-BRANCH write-protect engine (SPEC-1 FR-16): materialize a point-in-time copy
+/// of a *running* parent's RAM via userfaultfd write-protect, without freezing it for a
+/// dump. Feature-gated (`branch`) so the lib still cross-compiles where `userfaultfd-sys`
+/// cannot (no Linux kernel headers).
+#[cfg(all(target_os = "linux", feature = "branch"))]
+pub mod branch;
