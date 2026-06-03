@@ -91,17 +91,36 @@ mod linux {
     /// (the caller can loop to drain), `false` if nothing reapable / the front child is
     /// owned (the caller should sleep before retrying).
     pub fn reap_one_orphan() -> bool {
-        let mut status: libc::c_int = 0;
-        // SAFETY: waitpid with WNOWAIT peeks the next ready child without consuming it.
-        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WNOWAIT) };
-        if pid <= 0 {
-            return false; // 0 = none ready yet, -1 = no children (ECHILD)
+        // Peek the next exited child WITHOUT consuming it. WNOWAIT is only honored by
+        // waitid() — the wait4()/waitpid() syscall rejects it with EINVAL — so the peek
+        // must go through waitid, not waitpid.
+        // SAFETY: siginfo_t is a C POD; zeroing is a valid initial state. We must zero it
+        // because with WNOHANG and no ready child, waitid returns 0 and leaves si_pid
+        // untouched — a stale value would be misread as a real pid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: P_ALL ignores the id arg; `info` is a valid, owned siginfo_t.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_ALL,
+                0,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            return false; // -1 = no children (ECHILD) or error
+        }
+        // SAFETY: reading the pid union field, valid after a successful WEXITED waitid.
+        let pid = unsafe { info.si_pid() };
+        if pid == 0 {
+            return false; // WNOHANG: no child in a reapable state yet
         }
         if is_owned(pid) {
-            return false; // the exec agent owns this child and will reap it
+            return false; // the exec agent owns this child and will reap it itself
         }
         // A genuine orphan: actually consume the zombie now.
-        // SAFETY: reaping a specific, non-agent-owned pid that we just observed as ready.
+        // SAFETY: reaping a specific, non-agent-owned pid we just observed as exited.
+        let mut status: libc::c_int = 0;
         unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         true
     }
