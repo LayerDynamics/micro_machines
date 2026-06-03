@@ -96,10 +96,11 @@ async fn rest_crud_roundtrip_and_cross_namespace_is_denied() {
         .expect("pre-clean");
 
     let state = AppState {
-        store,
+        store: store.clone(),
         verifier: Arc::new(JwtVerifier::hs256(SECRET)),
         metrics: Arc::new(mm_controller::metrics::Metrics::new()),
         exec: mm_controller::grpc::ExecDispatcher::default(),
+        snapshots: mm_controller::grpc::SnapshotDispatcher::default(),
     };
     let app = router(state);
 
@@ -249,6 +250,84 @@ async fn rest_crud_roundtrip_and_cross_namespace_is_denied() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "machine gone after delete");
+
+    // --- Snapshot resource (FR-18) ---
+    // The create happy-path needs a connected agent (covered by the cluster e2e); here
+    // we seed a ready snapshot directly and exercise the REST resource + RBAC + CRUD.
+    store
+        .create_snapshot(
+            "team-a",
+            "web",
+            "00000000000000000001",
+            "full",
+            "host-1",
+            512,
+            "ready",
+        )
+        .await
+        .expect("seed snapshot");
+
+    // alice (admin in team-a) lists web's snapshots.
+    let (status, body) = send(
+        &app,
+        Method::GET,
+        "/v1alpha1/namespaces/team-a/machines/web/snapshots",
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "list snapshots: {body:?}");
+    assert_eq!(body["snapshots"][0]["name"], "00000000000000000001");
+
+    // bob has no binding in team-a → forbidden (namespace RBAC).
+    let (status, _) = send(
+        &app,
+        Method::GET,
+        "/v1alpha1/namespaces/team-a/machines/web/snapshots",
+        Some(&bob),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "cross-namespace snapshot list denied"
+    );
+
+    // create against the now-deleted machine is a 404 (validates the machine guard).
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/v1alpha1/namespaces/team-a/machines/web/snapshots",
+        Some(&alice),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "snapshot of a missing machine is 404"
+    );
+
+    // delete the snapshot record; the second delete is a 404.
+    let (status, _) = send(
+        &app,
+        Method::DELETE,
+        "/v1alpha1/namespaces/team-a/snapshots/00000000000000000001",
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "delete snapshot");
+    let (status, _) = send(
+        &app,
+        Method::DELETE,
+        "/v1alpha1/namespaces/team-a/snapshots/00000000000000000001",
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "second delete is 404");
 
     // /metrics (NFR-P4) is public and has recorded the requests above. It returns
     // Prometheus text (not JSON), so read it raw.

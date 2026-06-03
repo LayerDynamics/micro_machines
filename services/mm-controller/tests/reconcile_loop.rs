@@ -78,6 +78,7 @@ async fn reconcile_schedules_boots_and_survives_restart() {
                     store: store.clone(),
                     registry,
                     exec: mm_controller::grpc::ExecDispatcher::default(),
+                    snapshots: mm_controller::grpc::SnapshotDispatcher::default(),
                 }))
                 .add_service(HostServiceServer::new(HostSvc { store }))
                 .serve_with_incoming(TcpListenerStream::new(listener))
