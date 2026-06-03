@@ -580,19 +580,19 @@ fn full_checkpoint_keeps_parent_and_devices_running() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// FR-16 running BRANCH end-to-end (Phase 1b): branch a **running** parent — no freeze
-/// for a RAM dump — then fork a child off the branch and prove three things at once:
-///   1. the parent keeps running through the branch (it serves exec and writes a *new*
-///      marker afterward);
-///   2. the child is a coherent point-in-time (T) snapshot — it reads back the marker
-///      that existed at branch time;
-///   3. no bleed — the parent's post-branch divergence is NOT visible to the child.
+/// FR-16 running BRANCH end-to-end (Phase 1b): branch a **running** parent (no freeze
+/// for a RAM dump), then fork a child off the branch and prove three things at once —
+/// the parent keeps running through the branch (it serves exec and writes a new marker
+/// afterward); the child is a coherent point-in-time (T) snapshot (it reads back the
+/// marker that existed at branch time); and there is no bleed (the parent's post-branch
+/// divergence is not visible to the child).
+///
 /// The write-protect preserve path is exercised by the running guest's background writes
-/// during the branch window — the engine *logs* how many pages it preserved by
-/// write-fault, but this test does not *assert* on that count (an idle guest may not
-/// write during a fast copy, which would make such an assertion flaky). A deterministic
-/// concurrent-writer test that guarantees faults and checks the child sees a coherent
-/// earlier-or-equal value is the immediate follow-up increment.
+/// during the branch window: the engine logs how many pages it preserved by write-fault,
+/// but this test does not assert on that count (an idle guest may not write during a fast
+/// copy, which would make such an assertion flaky). A deterministic concurrent-writer test
+/// that guarantees faults and checks the child sees a coherent earlier-or-equal value is
+/// the immediate follow-up increment.
 #[test]
 #[ignore = "requires /dev/kvm and fixtures; FR-16 running BRANCH"]
 fn branch_of_running_parent_forks_independent_child() {
