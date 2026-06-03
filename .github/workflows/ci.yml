@@ -275,7 +275,12 @@ jobs:
       - name: Fetch test fixtures (kernel + rootfs)
         run: ./scripts/fetch-test-fixtures.sh
       - name: Run KVM CoW fork integration test
-        run: cargo test -p mm-vmm --features kvm-integration --test fork_kvm -- --ignored --nocapture
+        # --test-threads=1: run these tests serially. Several are resource-heavy on the
+        # constrained nested-KVM runner — the FR-16 branch e2e copies 128 MiB and spawns
+        # handler/copier threads, and the isolation test runs 3 live VMs at once. Run in
+        # parallel (cargo's default) they contend for CPU/KVM and a guest's exec can time
+        # out (a flaky "marker read failed"); serial keeps each test's VMs unstarved.
+        run: cargo test -p mm-vmm --features kvm-integration --test fork_kvm -- --ignored --nocapture --test-threads=1
 
   # Real virtio-net integration test (FR-10/11). Boots a microVM with a net
   # device on a host bridge and asserts a guest-originated UDP datagram reaches a

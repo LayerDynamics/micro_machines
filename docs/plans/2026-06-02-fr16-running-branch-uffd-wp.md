@@ -1,8 +1,50 @@
 # FR-16: branch a running sandbox via userfaultfd write-protect (UFFD_WP)
 
-**Date:** 2026-06-02
-**Status:** Phase 0 PASSED — feasibility confirmed on the CI kernel; Phase 1 (engine) unblocked.
+**Date:** 2026-06-02 (Phase 1 built 2026-06-03)
+**Status:** Phase 1 BUILT + KVM-green — running BRANCH works end-to-end. Lazy post-copy
+(no full RAM copy) remains as Phase 2.
 **Tracks:** M3 follow-up #5 (FR-16 running BRANCH) / #7 (UFFD_WP), now in scope by request.
+
+## Phase 1 result (2026-06-03) — running BRANCH works
+
+Built and CI-green (`fork-integration`):
+- **Resume-in-place** (1a/1b.1): a capture-and-continue checkpoint barrier
+  (`crate::checkpoint::Checkpoint`) pauses the vCPU threads **and** device workers at a
+  quiescent point, captures a coherent `VmState`, and resumes them in place — proven by
+  `checkpoint_in_place_keeps_parent_running` and
+  `full_checkpoint_keeps_parent_and_devices_running` (the parent serves exec after the
+  cycle). Pure barrier logic is native-unit-tested (`checkpoint::tests`).
+- **WP branch engine** (1b.2, `snapshot::branch`): a full uffd registered WRITE_PROTECT
+  over the parent's RAM; a sole-uffd-owner fault handler preserves each page's T-version
+  (copy → branch file → remove WP → wake the writer) while a background copier fills
+  untouched pages. Page-claim coordination + region/file math are pure cores
+  (`crate::branch_core`, native-unit-tested incl. an 8-thread claim-exactly-once).
+- **`Machine::branch`**: quiesce barrier → capture `VmState` → arm engine + start handler
+  → resume parent → copier → await completion → write `manifest.json`/`state.bin`. The
+  `memory.bin` is layout-identical to a frozen snapshot, so children fork from it with the
+  proven `MAP_PRIVATE` `fork_children` path.
+
+End-to-end `branch_of_running_parent_forks_independent_child` passes: a branched parent
+keeps running and diverges (writes `POSTBRANCH`), and a child forked off the branch reads
+the point-in-time value (`ATBRANCH`) with no bleed. The engine logged
+`32658 pages copied by the copier, 111 preserved by write-fault` — i.e. the running
+guest's background writes during the branch window genuinely exercised the WP-preserve
+path (111 pages were preserved pre-write).
+
+`userfaultfd` is an optional dep behind the `branch` feature (enabled by
+`kvm-integration`) so the lib still cross-checks on the non-Linux dev host. A fast
+`cargo clippy -p mm-vmm --features kvm-integration --all-targets` step in the `rust` job
+compile-checks the engine without `/dev/kvm`.
+
+### Phase 1 scope honesty + follow-ups
+- Phase 1 materializes a **complete** RAM copy concurrently with the running parent — it
+  buys the "no freeze for the dump" win, **not** lazy memory sharing. The fully-lazy
+  post-copy variant (untouched pages never copied; children read-fault from the parent)
+  is **Phase 2**.
+- The e2e does **not assert** the preserved-by-write-fault count (an idle guest may not
+  write during a fast copy → flaky). A **deterministic concurrent-writer test** (guarantee
+  faults during the branch; assert the child sees a coherent earlier-or-equal value) is
+  the immediate follow-up increment.
 
 ## Phase 0 result (2026-06-02) — FEASIBLE
 
