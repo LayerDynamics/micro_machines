@@ -98,6 +98,9 @@ fn compute(store: &LocalStore, host: &HostConfig, task: SnapshotTask) -> Snapsho
             error: String::new(),
         },
         Ok(ControlResponse::Err { msg }) => err(&rid, msg),
-        Err(e) => err(&rid, format!("control channel to {}: {e}", control.display())),
+        Err(e) => err(
+            &rid,
+            format!("control channel to {}: {e}", control.display()),
+        ),
     }
 }
