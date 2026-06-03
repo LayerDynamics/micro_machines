@@ -194,13 +194,19 @@ fn block_worker(
         if fds[1].revents & libc::POLLIN != 0 {
             if let Some(p) = pause.as_ref() {
                 let _ = p.evt.read();
-                // Final drain so next_avail reaches avail.idx, then capture the cursor
-                // and exit (the VM is frozen for the snapshot).
+                // Final drain so next_avail reaches avail.idx, then capture the cursor.
                 drain(&mut queue, &mut file);
                 if let Ok(mut slot) = p.slot.lock() {
                     *slot = Some(vec![queue.state().into()]);
                 }
+                if p.checkpoint.is_requested() {
+                    // Running BRANCH (FR-16): park at the barrier, then resume serving
+                    // with the queue state intact — do NOT exit.
+                    p.checkpoint.park();
+                    continue;
+                }
             }
+            // Freeze (snapshot, FR-14): the guest is frozen — exit.
             break;
         }
     }
@@ -465,6 +471,9 @@ mod tests {
         let pause = crate::devices::DevicePause {
             evt: pause_evt.try_clone().unwrap(),
             slot: slot.clone(),
+            // No checkpoint requested → the worker takes the freeze path and exits
+            // after capturing, which is what this test asserts.
+            checkpoint: Arc::new(crate::checkpoint::Checkpoint::default()),
         };
 
         let worker = std::thread::spawn(move || {

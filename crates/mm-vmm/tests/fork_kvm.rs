@@ -492,3 +492,90 @@ fn checkpoint_in_place_keeps_parent_running() {
     parent.shutdown().expect("stop parent");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// FR-16 full resume-in-place (Phase 1b.1): `Machine::checkpoint_full_in_place` captures
+/// the WHOLE consistent guest state — vCPUs **and** device workers (block + vsock here)
+/// plus VM clock and irqchip — at one quiescent barrier, and resumes it. This exercises
+/// the device-worker half of the capture-and-continue barrier (the workers drain
+/// in-flight DMA, capture their queue cursors, park, and resume), which the WP branch
+/// engine relies on to quiesce DMA while it arms write-protection. Proven through the
+/// guest: a marker written over the parent's vsock bridge before the full checkpoint is
+/// readable after it — so the vsock + block workers parked and resumed correctly and the
+/// parent kept serving.
+#[test]
+#[ignore = "requires /dev/kvm and fixtures; FR-16 full resume-in-place"]
+fn full_checkpoint_keeps_parent_and_devices_running() {
+    let cfg = fixture_config();
+    cfg.validate().unwrap();
+    let dir = scratch_dir("full-checkpoint");
+
+    let uds = dir.join("parent.sock");
+    let listener = UnixListener::bind(&uds).expect("bind parent vsock bridge");
+    let mut parent = Machine::boot_with_vsock(&cfg, Some(listener)).expect("parent boots bridged");
+    assert!(
+        parent
+            .wait_for_ready(Duration::from_secs(10))
+            .expect("readiness poll"),
+        "parent reached userspace"
+    );
+
+    let write_cmd: Vec<String> = ["/sbin/marker", "write", "FULLCKPT"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let w = run_exec_over_uds_ready(
+        &uds,
+        EXEC_PORT,
+        1,
+        &write_cmd,
+        10_000,
+        FORK_EXEC_READY_TIMEOUT,
+    )
+    .expect("pre-checkpoint exec");
+    assert_eq!(
+        w.exit_code,
+        0,
+        "pre-checkpoint marker write (stderr: {})",
+        String::from_utf8_lossy(&w.stderr)
+    );
+
+    // Full checkpoint of the RUNNING guest: vCPUs + device workers + clock + irqchip,
+    // captured at one barrier, then resumed in place.
+    let state = parent
+        .checkpoint_full_in_place()
+        .expect("full checkpoint in place");
+    assert_eq!(
+        state.vcpus.len(),
+        cfg.vcpus as usize,
+        "captured one vcpu state per vcpu"
+    );
+    assert!(
+        !state.devices.is_empty(),
+        "captured the snapshottable device cursors (block + vsock)"
+    );
+
+    // The parent and its devices must still be running: read the marker back over the
+    // same vsock bridge (the bridge is served by the vsock worker that just parked+resumed).
+    let read_cmd: Vec<String> = ["/sbin/marker", "read"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let r = run_exec_over_uds_ready(
+        &uds,
+        EXEC_PORT,
+        1,
+        &read_cmd,
+        10_000,
+        FORK_EXEC_READY_TIMEOUT,
+    )
+    .expect("post-checkpoint exec");
+    assert_eq!(r.exit_code, 0, "post-checkpoint marker read failed");
+    assert_eq!(
+        String::from_utf8_lossy(&r.stdout),
+        "FULLCKPT",
+        "parent + device workers kept running after the full checkpoint"
+    );
+
+    parent.shutdown().expect("stop parent");
+    let _ = std::fs::remove_dir_all(&dir);
+}

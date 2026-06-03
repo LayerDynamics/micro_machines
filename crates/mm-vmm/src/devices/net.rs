@@ -323,9 +323,9 @@ impl MutEventSubscriber for NetWorker {
                 tracing::error!("net: rx (notify) failed: {e}");
             }
         } else if self.pause.as_ref().is_some_and(|p| fd == p.evt.as_raw_fd()) {
-            // Snapshot pause: drain once, capture rx/tx cursors, signal the loop to
-            // stop (the guest is already frozen, SPEC-1 FR-14). Split the borrows so
-            // the mutable drains don't overlap the immutable `pause` borrow.
+            // Pause: drain once and capture rx/tx cursors (the vCPUs are paused, so the
+            // queues are stable). Split the borrows so the mutable drains don't overlap
+            // the immutable `pause` borrow.
             if let Some(p) = self.pause.as_ref() {
                 let _ = p.evt.read();
             }
@@ -336,8 +336,15 @@ impl MutEventSubscriber for NetWorker {
                 if let Ok(mut slot) = p.slot.lock() {
                     *slot = Some(cursors);
                 }
+                if p.checkpoint.is_requested() {
+                    // Running BRANCH (FR-16): park this epoll thread at the barrier; when
+                    // released, `process` returns and the manager keeps serving events.
+                    p.checkpoint.park();
+                } else {
+                    // Freeze (snapshot, FR-14): signal the detached loop to stop.
+                    self.pause_done.store(true, Ordering::Release);
+                }
             }
-            self.pause_done.store(true, Ordering::Release);
         }
     }
 }

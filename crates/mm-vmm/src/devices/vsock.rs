@@ -432,8 +432,8 @@ impl VsockWorker {
                         }
                     }
                     Source::PauseEvt => {
-                        // Snapshot: capture the rx/tx queue cursors and exit (the VM
-                        // is already frozen, so the queues are stable).
+                        // Capture the rx/tx queue cursors (the vCPUs are paused, so the
+                        // queues are stable), then either freeze or park-and-continue.
                         if let Some(p) = self.pause.as_ref() {
                             let _ = p.evt.read();
                             let cursors =
@@ -441,8 +441,15 @@ impl VsockWorker {
                             if let Ok(mut slot) = p.slot.lock() {
                                 *slot = Some(cursors);
                             }
+                            if p.checkpoint.is_requested() {
+                                // Running BRANCH (FR-16): park at the barrier; when
+                                // released the outer loop re-polls and keeps serving.
+                                p.checkpoint.park();
+                            } else {
+                                // Freeze (snapshot, FR-14): the guest is frozen — exit.
+                                stop = true;
+                            }
                         }
-                        stop = true;
                         break;
                     }
                 }

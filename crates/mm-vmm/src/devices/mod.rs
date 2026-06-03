@@ -86,14 +86,23 @@ const VIRTIO_MMIO_INT_VRING: u32 = 0x01;
 /// Default per-device virtqueue size.
 pub const QUEUE_SIZE: u16 = 256;
 
-/// A snapshot pause handle handed to a snapshottable virtio device (SPEC-1 FR-14).
+/// A pause handle handed to a snapshottable virtio device (SPEC-1 FR-14, FR-16).
 /// The Machine writes `evt` to ask the device's worker to quiesce; the worker drains
-/// to a consistent point, writes each virtqueue's [`QueueCursor`] into `slot` (in
-/// queue-index order), and exits. Capture happens while the guest's vCPUs are already
-/// paused, so the queues are stable.
+/// to a consistent point and writes each virtqueue's [`QueueCursor`] into `slot` (in
+/// queue-index order). What happens next depends on `checkpoint`:
+///
+/// - **freeze** (snapshot, FR-14): `checkpoint.is_requested()` is false, so the worker
+///   **exits** after capturing — the guest is being frozen for a snapshot.
+/// - **capture-and-continue** (running BRANCH, FR-16): the Machine has requested a
+///   `checkpoint`, so the worker **parks** at the barrier after capturing, then resumes
+///   serving when released — the device half of resume-in-place.
+///
+/// Either way capture happens while the guest's vCPUs are paused, so the queues are
+/// stable.
 pub struct DevicePause {
     pub evt: EventFd,
     pub slot: Arc<Mutex<Option<Vec<crate::snapshot::state::QueueCursor>>>>,
+    pub(crate) checkpoint: Arc<crate::checkpoint::Checkpoint>,
 }
 
 /// The guest-visible interrupt line for a virtio device: an eventfd registered

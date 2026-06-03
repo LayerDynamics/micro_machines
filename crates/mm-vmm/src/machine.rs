@@ -690,13 +690,64 @@ impl Machine {
     /// the captured slots. The barrier is released on every exit path so a vCPU is
     /// never stranded parked.
     pub fn checkpoint_in_place(&mut self) -> Result<Vec<VcpuState>> {
-        let n = self.vcpu_states.len();
-        if n == 0 {
-            return Err(VmmError::Vcpu(
-                "checkpoint_in_place: no running vcpus".into(),
-            ));
+        self.quiesce_at_barrier(false)?;
+        let states = self.collect_vcpu_states();
+        // Release before propagating a capture error so a vCPU is never stranded parked.
+        self.release_barrier()?;
+        states
+    }
+
+    /// Capture the **full** consistent state of the running guest — vCPUs, devices, VM
+    /// clock, and in-kernel irqchip/PIT — at one quiescent barrier, and **resume it in
+    /// place** (SPEC-1 FR-16 running BRANCH). Unlike [`pause_and_capture_vcpus`] +
+    /// [`pause_devices`] (freeze-only, for a snapshot), the vCPU threads and device
+    /// workers all park at the barrier and then resume, so the parent keeps running.
+    /// Returns the [`VmState`] a branch's children resume from.
+    pub fn checkpoint_full_in_place(&mut self) -> Result<VmState> {
+        self.quiesce_at_barrier(true)?;
+        // All participants parked at a quiescent point and have filled their slots;
+        // capture everything before releasing so it is one coherent point-in-time.
+        let captured = (|| {
+            let vcpus = self.collect_vcpu_states()?;
+            let devices = self.collect_device_states()?;
+            let clock = self.capture_clock()?;
+            let irqchip = self.capture_irqchip()?;
+            Ok(VmState {
+                vcpus,
+                devices,
+                clock,
+                irqchip,
+            })
+        })();
+        self.release_barrier()?;
+        captured
+    }
+
+    /// Request a checkpoint and quiesce all participants at the barrier: optionally wake
+    /// the device workers (so they drain in-flight DMA, capture their cursors, and park),
+    /// then kick the vCPUs out of `KVM_RUN` until **every** participant has parked. Each
+    /// participant fills its capture slot before parking, so "all parked" ⇒ "all
+    /// captured". On timeout the barrier is released so no participant is stranded.
+    fn quiesce_at_barrier(&self, include_devices: bool) -> Result<()> {
+        let n_vcpu = self.vcpu_states.len();
+        if n_vcpu == 0 {
+            return Err(VmmError::Vcpu("checkpoint: no running vcpus".into()));
         }
+        let n_dev = if include_devices {
+            self.device_captures.len()
+        } else {
+            0
+        };
+        let total = n_vcpu + n_dev;
+
         self.checkpoint.request();
+        // The device workers only consult the checkpoint when their pause eventfd fires,
+        // so wake them explicitly; the vCPUs are kicked out of KVM_RUN below.
+        if include_devices {
+            for cap in &self.device_captures {
+                cap.evt.write(1).map_err(VmmError::Io)?;
+            }
+        }
 
         let tids: Vec<libc::pthread_t> = self
             .vcpu_tids
@@ -704,12 +755,10 @@ impl Machine {
             .map(|guard| guard.clone())
             .unwrap_or_default();
 
-        // Kick the vCPUs out of KVM_RUN until every one has parked at the barrier.
-        // Bounded so a stuck vCPU cannot hang the caller forever.
         let deadline = Instant::now() + Duration::from_secs(10);
         while !self
             .checkpoint
-            .wait_until_parked(n, Duration::from_millis(20))
+            .wait_until_parked(total, Duration::from_millis(20))
         {
             for &tid in &tids {
                 // SAFETY: VCPU_STOP_SIGNAL has a no-op handler; this only interrupts a
@@ -722,22 +771,31 @@ impl Machine {
                 self.checkpoint.release();
                 let _ = self.checkpoint.wait_until_resumed(Duration::from_secs(2));
                 return Err(VmmError::Vcpu(
-                    "vcpus did not reach the checkpoint barrier within the timeout".into(),
+                    "participants did not reach the checkpoint barrier within the timeout".into(),
                 ));
             }
         }
+        Ok(())
+    }
 
-        // All vCPUs are parked at a quiescent point and have captured their state.
-        // Release them to resume; the per-vCPU slots stay stable afterwards (the
-        // request flag is now cleared, so a resumed vCPU will not rewrite its slot).
+    /// Release the checkpoint barrier and wait for every participant to leave it, so the
+    /// guest is fully running again and a subsequent checkpoint starts from a clean slate.
+    fn release_barrier(&self) -> Result<()> {
         self.checkpoint.release();
         if !self.checkpoint.wait_until_resumed(Duration::from_secs(5)) {
             return Err(VmmError::Vcpu(
-                "vcpus did not resume from the checkpoint barrier within the timeout".into(),
+                "participants did not resume from the checkpoint barrier within the timeout".into(),
             ));
         }
+        Ok(())
+    }
 
-        let mut states = Vec::with_capacity(n);
+    /// Drain the per-vCPU capture slots in index order. Call while parked (after
+    /// [`quiesce_at_barrier`](Self::quiesce_at_barrier)); the slots are stable because a
+    /// participant fills its slot before parking and does not touch it again until the
+    /// next checkpoint.
+    fn collect_vcpu_states(&self) -> Result<Vec<VcpuState>> {
+        let mut states = Vec::with_capacity(self.vcpu_states.len());
         for (index, slot) in self.vcpu_states.iter().enumerate() {
             let captured = slot.lock().ok().and_then(|mut g| g.take()).ok_or_else(|| {
                 VmmError::Vcpu(format!(
@@ -749,6 +807,29 @@ impl Machine {
         Ok(states)
     }
 
+    /// Drain the device capture slots in attach order. Call while parked (after a
+    /// device-inclusive [`quiesce_at_barrier`](Self::quiesce_at_barrier)).
+    fn collect_device_states(&self) -> Result<Vec<DeviceState>> {
+        let mut out = Vec::with_capacity(self.device_captures.len());
+        for cap in &self.device_captures {
+            let cursors = cap
+                .slot
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take())
+                .ok_or_else(|| {
+                    VmmError::Device(
+                        "a device did not capture its queue cursors at the checkpoint".into(),
+                    )
+                })?;
+            out.push(DeviceState {
+                device_type: cap.device_type,
+                queues: cursors,
+            });
+        }
+        Ok(out)
+    }
+
     /// Create a snapshot pause handle, give one end to `device`, and record the other
     /// for [`pause_devices`](Self::pause_devices). Call once per snapshottable device
     /// before it is activated.
@@ -758,6 +839,9 @@ impl Machine {
         device.set_pause_handle(DevicePause {
             evt: evt.try_clone().map_err(VmmError::Io)?,
             slot: slot.clone(),
+            // Shared barrier: a checkpoint (FR-16) makes the worker park-and-resume; a
+            // freeze (FR-14) — no checkpoint requested — makes it exit after capturing.
+            checkpoint: self.checkpoint.clone(),
         });
         self.device_captures.push(DeviceCapture {
             device_type: device.device_type(),
