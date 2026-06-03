@@ -288,6 +288,18 @@ impl Vcpu {
         let mut msrs = Msrs::from_entries(&entries)
             .map_err(|e| VmmError::Vcpu(format!("building snapshot MSRs: {e:?}")))?;
         let read = self.fd.get_msrs(&mut msrs).map_err(VmmError::Kvm)?;
+        if read != SNAPSHOT_MSRS.len() {
+            // KVM_GET_MSRS processes the list in order and stops at the first index it
+            // rejects, returning the count read so far. A short read means every MSR
+            // after the offender is silently dropped from the snapshot — restore would
+            // then quietly omit them. Surface it rather than capturing a partial state.
+            tracing::warn!(
+                "get_msrs read {read}/{} snapshot MSRs — index {:#x} rejected; \
+                 trailing MSRs dropped from snapshot",
+                SNAPSHOT_MSRS.len(),
+                SNAPSHOT_MSRS.get(read).copied().unwrap_or(0),
+            );
+        }
         let msrs = msrs.as_slice()[..read]
             .iter()
             .map(|e| MsrEntry {

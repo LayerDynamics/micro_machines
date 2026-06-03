@@ -841,6 +841,75 @@ fn branch_clone_survives_sustained_interrupt_activity() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// CONTROL for [`branch_clone_survives_sustained_interrupt_activity`]. Identical exec
+/// hammer (8 iterations × 15 sustained `/sbin/marker` execs per forked child), but the
+/// children are forked from a **frozen snapshot** — the parent is paused-and-captured
+/// then dropped, so there is no live parent and no UFFD_WP write-protection in play.
+///
+/// This isolates the one variable the WP-branch repro never controlled: is the crash
+/// caused by write-protect branching, or by *any* CoW-forked child under sustained
+/// post-resume exec load? If this control ALSO dies at exec 4, the bug is in
+/// fork/resume generally and every WP-branch hypothesis is misdirected. If it survives
+/// all 120 execs while the branch repro dies, WP-branch is confirmed as the culprit.
+#[test]
+#[ignore = "requires /dev/kvm and fixtures"]
+fn fork_snapshot_survives_sustained_interrupt_activity() {
+    let cfg = fixture_config();
+    cfg.validate().unwrap();
+    let dir = scratch_dir("fork-fidelity");
+
+    // Freeze a warm parent into a snapshot, then drop it: the children below fork from
+    // the frozen image, with no live parent and no write-protection.
+    let mut parent = Machine::boot(&cfg).expect("parent boots");
+    assert!(
+        parent
+            .wait_for_ready(Duration::from_secs(10))
+            .expect("readiness poll"),
+        "parent reached userspace"
+    );
+    let snap_dir = dir.join("snapshot");
+    let manifest = snapshot(&mut parent, &snap_dir).expect("snapshot the warm parent");
+    drop(parent);
+    let state = load_state(&snap_dir, &manifest).expect("load snapshot state");
+    let mem_path = snap_dir.join(&manifest.memory_file);
+
+    const ITERATIONS: usize = 8;
+    const EXECS_PER_CLONE: usize = 15;
+    for i in 0..ITERATIONS {
+        let cuds = dir.join(format!("child-{i}.sock"));
+        let mut child = fork_bridged_child(&cfg, &state, &mem_path, &cuds);
+
+        for j in 0..EXECS_PER_CLONE {
+            let val = format!("IT{i}E{j}");
+            let w = exec_marker(&cuds, &["write", &val]);
+            assert_eq!(
+                w.exit_code,
+                0,
+                "CONTROL iteration {i} exec {j}: marker write exited {} — snapshot-forked \
+                 clone crashed (no WP-branch involved); stderr: {}",
+                w.exit_code,
+                String::from_utf8_lossy(&w.stderr)
+            );
+            let rd = exec_marker(&cuds, &["read"]);
+            assert_eq!(
+                rd.exit_code, 0,
+                "CONTROL iteration {i} exec {j}: marker read exited {}",
+                rd.exit_code
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&rd.stdout).trim(),
+                val,
+                "CONTROL iteration {i} exec {j}: snapshot-forked clone returned wrong data",
+            );
+        }
+        child
+            .shutdown()
+            .unwrap_or_else(|e| panic!("CONTROL iteration {i}: stop child: {e}"));
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Run an exec `cmd` over a child's vsock bridge at `uds` with the fork readiness retry,
 /// returning the result (the generic form of [`exec_marker`]).
 fn exec_marker_on(uds: &Path, cmd: &[String]) -> ExecResult {
