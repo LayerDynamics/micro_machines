@@ -910,6 +910,66 @@ fn fork_snapshot_survives_sustained_interrupt_activity() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// BASELINE control for the two sustained-exec hammers above. A freshly-booted guest —
+/// no snapshot, no fork, no resume of any kind — runs the *identical* 8×15 `/sbin/marker`
+/// hammer directly over its own vsock bridge. This is the one variable neither hammer
+/// controlled: do sustained execs destabilize *any* guest (an exec-agent / vsock leak),
+/// or only a CoW-forked/resumed one?
+///   - FAILS here  -> root cause is the exec agent / vsock under sustained load; fork and
+///                    snapshot are red herrings.
+///   - SURVIVES    -> the destabilization is specific to fork/resume; the agent is fine.
+/// All execs target the same long-lived guest (a real client opens a fresh connection per
+/// exec), so it exercises exactly the per-exec accumulation the forked hammers hit.
+#[test]
+#[ignore = "requires /dev/kvm and fixtures"]
+fn booted_guest_survives_sustained_execs() {
+    let cfg = fixture_config();
+    cfg.validate().unwrap();
+    let dir = scratch_dir("booted-hammer");
+    let puds = dir.join("parent.sock");
+    let listener = UnixListener::bind(&puds).expect("bind parent vsock bridge");
+    let mut guest = Machine::boot_with_vsock(&cfg, Some(listener)).expect("guest boots");
+    assert!(
+        guest
+            .wait_for_ready(Duration::from_secs(10))
+            .expect("readiness poll"),
+        "guest reached userspace"
+    );
+
+    // Same shape as the forked hammers: 8 "iterations" × 15 write/read exec pairs, but all
+    // against this one never-forked guest.
+    const ITERATIONS: usize = 8;
+    const EXECS_PER_ITER: usize = 15;
+    for i in 0..ITERATIONS {
+        for j in 0..EXECS_PER_ITER {
+            let val = format!("IT{i}E{j}");
+            let w = exec_marker(&puds, &["write", &val]);
+            assert_eq!(
+                w.exit_code,
+                0,
+                "BASELINE iteration {i} exec {j}: marker write exited {} on a freshly-booted \
+                 (never-forked) guest — exec-agent/vsock bug, not fork; stderr: {}",
+                w.exit_code,
+                String::from_utf8_lossy(&w.stderr)
+            );
+            let rd = exec_marker(&puds, &["read"]);
+            assert_eq!(
+                rd.exit_code, 0,
+                "BASELINE iteration {i} exec {j}: marker read exited {}",
+                rd.exit_code
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&rd.stdout).trim(),
+                val,
+                "BASELINE iteration {i} exec {j}: booted guest returned wrong data",
+            );
+        }
+    }
+
+    guest.shutdown().expect("stop guest");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Run an exec `cmd` over a child's vsock bridge at `uds` with the fork readiness retry,
 /// returning the result (the generic form of [`exec_marker`]).
 fn exec_marker_on(uds: &Path, cmd: &[String]) -> ExecResult {
