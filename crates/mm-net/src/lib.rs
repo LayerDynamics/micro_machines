@@ -7,8 +7,10 @@
 #![cfg_attr(not(target_os = "linux"), forbid(unsafe_code))]
 
 pub mod bootparam;
+pub mod clone_net;
 pub mod ipam;
 pub use bootparam::ip_cmdline;
+pub use clone_net::{CloneNetPlan, VethLink};
 pub use ipam::{Ipam, IpamError};
 
 // The bridge/TAP host plumbing (privileged, linux-only).
