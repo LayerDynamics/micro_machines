@@ -57,8 +57,8 @@ impl BranchEngine {
     /// parent is paused at the checkpoint barrier (no writers), so arming is atomic
     /// w.r.t. the guest. `regions` are `(host_base, len_bytes)` in ascending order.
     pub(crate) fn arm(regions: &[(usize, usize)], branch_path: &Path) -> Result<Self> {
-        let total_pages: usize = regions.iter().map(|(_, len)| len / PAGE_SIZE).sum();
         let region_map = Arc::new(RegionMap::new(regions));
+        let total_pages = region_map.total_pages();
         let preserve = Arc::new(PreserveMap::new(total_pages));
 
         let file = OpenOptions::new()

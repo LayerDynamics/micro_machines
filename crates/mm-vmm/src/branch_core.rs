@@ -232,6 +232,7 @@ mod tests {
     #[test]
     fn preserve_map_claims_each_page_exactly_once() {
         let map = PreserveMap::new(200);
+        assert_eq!(map.total_pages(), 200);
         // First claim of a page wins; a second claim of the same page loses.
         assert!(map.try_claim(0));
         assert!(!map.try_claim(0));
