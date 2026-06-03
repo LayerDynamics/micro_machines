@@ -23,3 +23,6 @@ dist/
 
 # Reference-only upstreams: inspiration/context, never imported or committed
 /development/reference_only/
+
+# Local Claude Code runtime state (locks, scheduled tasks)
+.claude/
