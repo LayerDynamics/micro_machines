@@ -10,12 +10,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::GuestMemoryMmap;
 use kvm_bindings::{
     kvm_cpuid_entry2, kvm_fpu, kvm_msr_entry, kvm_regs, kvm_segment, kvm_sregs, kvm_vcpu_events,
     kvm_xcrs, CpuId, Msrs, KVM_MAX_CPUID_ENTRIES,
 };
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Address, Bytes, GuestAddress};
 
 use crate::checkpoint::Checkpoint;
 use crate::machine::{IoDispatch, Result, VmmError};

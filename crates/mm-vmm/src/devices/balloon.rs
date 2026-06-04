@@ -9,8 +9,9 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+use crate::GuestMemoryMmap;
 use virtio_queue::{Queue, QueueT};
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryRegion};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::{Interrupt, VirtioDevice, QUEUE_SIZE, TYPE_BALLOON, VIRTIO_F_VERSION_1};

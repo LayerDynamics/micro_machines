@@ -11,8 +11,9 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::GuestMemoryMmap;
 use virtio_queue::{Queue, QueueT};
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::{Interrupt, VirtioDevice, QUEUE_SIZE, TYPE_BLOCK, VIRTIO_F_VERSION_1};

@@ -22,9 +22,9 @@ use kvm_bindings::{
     KVM_MEM_LOG_DIRTY_PAGES, KVM_PIT_SPEAKER_DUMMY,
 };
 use kvm_ioctls::{Kvm, VmFd};
-use vm_memory::{
-    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
-};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryRegion, GuestRegionMmap};
+
+use crate::GuestMemoryMmap;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::checkpoint::Checkpoint;
@@ -1129,23 +1129,43 @@ impl Machine {
         Ok(())
     }
 
-    /// Read and clear the dirty bitmap of every guest RAM memslot, returning the host
-    /// address + `memory.bin` file offset of each page written since logging was enabled
-    /// (or since the last call). `memory.bin` lays regions out in slot order, so the file
-    /// offset is the running byte count of preceding regions plus the page's offset.
+    /// Read and clear the dirty state of every guest RAM region — the UNION of two sources,
+    /// since neither alone is complete — returning the host address + `memory.bin` file
+    /// offset of each page written since the last call. `memory.bin` lays regions out in
+    /// slot order, so the file offset is the running byte count of preceding regions plus
+    /// the page's offset.
+    ///
+    /// The two sources:
+    /// - KVM's per-slot dirty log (`get_dirty_log`): catches writes through the KVM MMU
+    ///   (the guest's vCPUs) AND KVM's own host-side writes to paravirt pages (pvclock,
+    ///   steal-time) via `mark_page_dirty`.
+    /// - vm-memory's per-region `AtomicBitmap` (`get_and_reset`): catches writes through the
+    ///   `Bytes` API — the virtio device workers' DMA into guest RAM (e.g. a block read
+    ///   completion), which go through the host mmap and so are invisible to KVM's log.
+    ///
+    /// Calling this also RESETS both sources, so the post-`set_dirty_logging(true)` call in
+    /// [`branch`](Self::branch) establishes a clean baseline (KVM zeroes its bitmap on
+    /// enable; this clears the device bitmap's pre-branch history).
     fn collect_dirty_pages(&self) -> Result<Vec<DirtyPage>> {
+        use std::ops::Deref;
         use vm_memory::{GuestMemory, GuestMemoryRegion};
         let mut pages = Vec::new();
         let mut file_base = 0u64;
         for (slot, region) in self.guest_memory.iter().enumerate() {
             let len = region.len();
-            let bitmap = self
+            let kvm = self
                 .vm
                 .get_dirty_log(slot as u32, len as usize)
                 .map_err(VmmError::Kvm)?;
+            // The region's `MmapRegion<AtomicBitmap>` (reached past `GuestRegionMmap`'s
+            // Deref; the `GuestMemoryRegion::bitmap()` trait method returns only a slice).
+            let dev = region.deref().bitmap().get_and_reset();
             let host_base = region.as_ptr() as usize;
-            for (word_idx, word) in bitmap.iter().enumerate() {
-                if *word == 0 {
+            let words = kvm.len().max(dev.len());
+            for word_idx in 0..words {
+                let word = kvm.get(word_idx).copied().unwrap_or(0)
+                    | dev.get(word_idx).copied().unwrap_or(0);
+                if word == 0 {
                     continue;
                 }
                 for bit in 0..64 {

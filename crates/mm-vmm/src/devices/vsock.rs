@@ -24,8 +24,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::GuestMemoryMmap;
 use virtio_queue::{Queue, QueueT};
-use vm_memory::{Bytes, GuestMemoryMmap};
+use vm_memory::Bytes;
 use vmm_sys_util::eventfd::EventFd;
 
 use super::{DevicePause, Interrupt, VirtioDevice, QUEUE_SIZE, TYPE_VSOCK, VIRTIO_F_VERSION_1};

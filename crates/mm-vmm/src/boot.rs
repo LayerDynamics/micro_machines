@@ -10,13 +10,14 @@
 use std::fs::File;
 use std::path::Path;
 
+use crate::GuestMemoryMmap;
 use linux_loader::cmdline::Cmdline;
 use linux_loader::configurator::linux::LinuxBootConfigurator;
 use linux_loader::configurator::{BootConfigurator, BootParams};
 use linux_loader::loader::bootparam::boot_params;
 use linux_loader::loader::elf::Elf;
 use linux_loader::loader::{load_cmdline, KernelLoader};
-use vm_memory::{GuestAddress, GuestMemoryMmap};
+use vm_memory::GuestAddress;
 
 use crate::machine::{Result, VmmError};
 

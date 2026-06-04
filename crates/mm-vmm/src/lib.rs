@@ -30,6 +30,15 @@ pub use vsock_proto::{CreditTracker, VsockHeader};
 #[cfg(any(target_os = "linux", test))]
 mod checkpoint;
 
+// Guest RAM is mapped with a per-page dirty bitmap (vm-memory's `AtomicBitmap`): writes
+// through the `Bytes` API — including the virtio device workers' DMA into guest RAM —
+// mark pages dirty, which `Machine::branch` unions with the KVM dirty log so its live
+// copy captures device writes that KVM's own dirty logging cannot see (host-userspace
+// mmap writes bypass the KVM MMU). One crate-wide alias so every guest-memory holder
+// shares the tracked type.
+#[cfg(target_os = "linux")]
+pub type GuestMemoryMmap = vm_memory::GuestMemoryMmap<vm_memory::bitmap::AtomicBitmap>;
+
 // Linux-only KVM machinery (Tasks 5–8), behind `cfg(target_os = "linux")`.
 #[cfg(target_os = "linux")]
 pub mod boot;

@@ -14,9 +14,10 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::GuestMemoryMmap;
 use event_manager::{EventManager, EventOps, EventSet, Events, MutEventSubscriber, SubscriberOps};
 use virtio_queue::{Queue, QueueT};
-use vm_memory::{Bytes, GuestMemoryMmap};
+use vm_memory::Bytes;
 use vmm_sys_util::eventfd::EventFd;
 
 use super::{DevicePause, Interrupt, VirtioDevice, QUEUE_SIZE, TYPE_NET, VIRTIO_F_VERSION_1};
