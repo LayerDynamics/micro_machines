@@ -142,25 +142,18 @@ fn mm_branch_clone_is_reachable_at_a_unique_ip_without_colliding_with_the_source
         false
     };
 
-    // 1. Boot the source `--branchable` and wait until its exec agent answers. This
-    //    exercises the real near-zero-pause write-protect branch path through the full
-    //    jail/netns CLI — `mm branch` of a `--branchable` source uses the WP engine (not
-    //    the resume-in-place snapshot fallback). That path previously had two now-fixed
-    //    bugs: a clone kernel-panic in the IRQ/softirq path (missing FS/GS-base MSRs in the
-    //    snapshot, b39886a) and an `exit -1` after sustained execs (a PID-1 reaper race in
-    //    mm-init, fc36487/f6f14ca). Gating the per-clone NETWORKING (#2) on this path
-    //    confirms both on the exact jailed path where the panic was first observed.
-    let launch = mm(&[
-        "run",
-        "--ssh",
-        "--branchable",
-        "--detach",
-        "--name",
-        src,
-        IMAGE,
-    ])
-    .output()
-    .expect("spawn `mm run`");
+    // 1. Boot the source and wait until its exec agent answers, then loop live branches
+    //    below. `mm branch` materializes the clone via KVM dirty-page logging (a coherent
+    //    point-in-time image of the running source). That path had three now-fixed bugs that
+    //    only surfaced under an *actively running* source: a clone kernel-panic from missing
+    //    FS/GS-base MSRs (b39886a), an `exit -1` after sustained execs from a PID-1 reaper
+    //    race in mm-init (fc36487/f6f14ca), and an intermittent timer-wheel corruption from
+    //    KVM's paravirt-page host writes escaping the old userfaultfd write-protect engine —
+    //    fixed by replacing that engine with dirty-page logging. Looping the branch+exec+ping
+    //    cycle exercises all three on the exact jailed/netns path where they first appeared.
+    let launch = mm(&["run", "--ssh", "--detach", "--name", src, IMAGE])
+        .output()
+        .expect("spawn `mm run`");
     assert!(
         launch.status.success(),
         "`mm run` failed: {}\n{}",

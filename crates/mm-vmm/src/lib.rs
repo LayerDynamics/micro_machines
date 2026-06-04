@@ -30,13 +30,6 @@ pub use vsock_proto::{CreditTracker, VsockHeader};
 #[cfg(any(target_os = "linux", test))]
 mod checkpoint;
 
-// Pure coordination cores for the FR-16 running-BRANCH write-protect engine (claim-once
-// preserve map + region/file-offset math). No userfaultfd/KVM, so it compiles under
-// `test` on the non-Linux dev host where its unit tests run; otherwise only when the
-// `branch` engine that uses it is built (Linux + the `branch` feature).
-#[cfg(any(all(target_os = "linux", feature = "branch"), test))]
-mod branch_core;
-
 // Linux-only KVM machinery (Tasks 5–8), behind `cfg(target_os = "linux")`.
 #[cfg(target_os = "linux")]
 pub mod boot;

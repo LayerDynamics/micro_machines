@@ -112,7 +112,7 @@ pub fn launch(spec: &LaunchSpec) -> Result<LaunchOutcome> {
             .with_context(|| format!("reading the image command for {}", spec.image))?;
         Some(encode_argv(&argv))
     };
-    let mut worker_cfg = build_vm_config(
+    let worker_cfg = build_vm_config(
         spec.cpus,
         spec.memory_mib,
         std::path::PathBuf::from("/vmlinux"),
@@ -127,8 +127,6 @@ pub fn launch(spec: &LaunchSpec) -> Result<LaunchOutcome> {
         authorized_key_hex.as_deref(),
         random_seed_hex.as_deref(),
     );
-    // FR-16: the worker prepares the running-BRANCH uffd at boot when this is set.
-    worker_cfg.branchable = spec.branchable;
     worker_cfg.validate().context("validating VM config")?;
     let cfg_path = jail.join("config.json");
     std::fs::write(&cfg_path, serde_json::to_vec(&worker_cfg)?)

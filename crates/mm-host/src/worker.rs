@@ -150,22 +150,6 @@ mod linux {
         let config: VmConfig =
             serde_json::from_slice(&bytes).context("parsing worker VM config")?;
 
-        // FR-16: if this VM is branchable, create + register the running-BRANCH
-        // userfaultfd NOW — while still root and outside the chroot, so /dev/userfaultfd
-        // is reachable and a full (non-user-mode-only) uffd is permitted. After
-        // confinement the worker could not create one (seccomp denies `userfaultfd`,
-        // the chroot hides the device); a later `branch` only arms it (an allowed ioctl).
-        // Carried across `confine()` into the boot. Cold-boot only (a restore replaces RAM).
-        #[cfg(target_os = "linux")]
-        let prepared = if config.branchable && args.restore_dir.is_none() {
-            Some(
-                Machine::prepare_branchable_memory(config.memory_mib)
-                    .context("preparing branchable guest memory")?,
-            )
-        } else {
-            None
-        };
-
         // Confine: cgroup v2 + namespaces + chroot + no_new_privs + uid/gid drop.
         // After this returns the process is unprivileged and isolated; it relies on
         // the inherited fds for KVM and the TAP.
@@ -207,41 +191,16 @@ mod linux {
                 dir,
             )
             .context("restoring jailed microVM from snapshot")?,
-            None => {
-                #[cfg(target_os = "linux")]
-                {
-                    match prepared {
-                        Some(p) => Machine::boot_jailed_prepared(
-                            &config,
-                            args.kvm_fd,
-                            vec![args.tap_fd],
-                            args.vsock_fd,
-                            Some(hook),
-                            p,
-                        )
-                        .context("booting branchable jailed microVM")?,
-                        None => Machine::boot_jailed(
-                            &config,
-                            args.kvm_fd,
-                            vec![args.tap_fd],
-                            args.vsock_fd,
-                            Some(hook),
-                        )
-                        .context("booting jailed microVM")?,
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    Machine::boot_jailed(
-                        &config,
-                        args.kvm_fd,
-                        vec![args.tap_fd],
-                        args.vsock_fd,
-                        Some(hook),
-                    )
-                    .context("booting jailed microVM")?
-                }
-            }
+            // Cold boot. `mm branch` works on any running VM via KVM dirty-page logging
+            // (it needs no pre-confine userfaultfd), so there is no separate branchable path.
+            None => Machine::boot_jailed(
+                &config,
+                args.kvm_fd,
+                vec![args.tap_fd],
+                args.vsock_fd,
+                Some(hook),
+            )
+            .context("booting jailed microVM")?,
         };
         let ready = machine
             .wait_for_ready(Duration::from_secs(10))
@@ -324,19 +283,11 @@ mod linux {
                                 .snapshot_in_place(&dir)
                                 .map(|_| id)
                                 .map_err(|e| e.to_string()),
-                            // Live branch: if the VM was booted branchable (its uffd was
-                            // created+registered as root pre-confine) use the near-zero-pause
-                            // write-protect engine; otherwise fall back to the resume-in-place
-                            // snapshot (a brief pause) — the jailed worker can't create a uffd
-                            // post-confine, so a non-branchable VM degrades gracefully.
+                            // Live branch: materialize a coherent point-in-time image of the
+                            // running guest via KVM dirty-page logging (the parent keeps
+                            // running, paused only briefly at two barriers).
                             ControlRequest::Branch => {
-                                if m.is_branchable() {
-                                    m.branch(&dir).map(|_| id).map_err(|e| e.to_string())
-                                } else {
-                                    m.snapshot_in_place(&dir)
-                                        .map(|_| id)
-                                        .map_err(|e| e.to_string())
-                                }
+                                m.branch(&dir).map(|_| id).map_err(|e| e.to_string())
                             }
                         }
                     };

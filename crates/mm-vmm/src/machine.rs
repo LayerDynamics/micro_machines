@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use kvm_bindings::{
     kvm_clock_data, kvm_irqchip, kvm_pit_config, kvm_pit_state2, kvm_userspace_memory_region,
     KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_MAX_CPUID_ENTRIES,
-    KVM_PIT_SPEAKER_DUMMY,
+    KVM_MEM_LOG_DIRTY_PAGES, KVM_PIT_SPEAKER_DUMMY,
 };
 use kvm_ioctls::{Kvm, VmFd};
 use vm_memory::{
@@ -156,15 +156,6 @@ pub struct Machine {
     /// pthread ids of the running vCPU threads, so `shutdown` can signal them out
     /// of a halted KVM_RUN.
     vcpu_tids: Arc<Mutex<Vec<libc::pthread_t>>>,
-    /// A pre-created, region-registered (WRITE_PROTECT, not yet armed) userfaultfd for
-    /// the running-BRANCH path (SPEC-1 FR-16). Created as root **before** the jailer
-    /// confines the worker (the `userfaultfd(2)` syscall + `/dev/userfaultfd` need
-    /// privilege the confined worker lacks); stashed here so a later `branch` only has to
-    /// `UFFDIO_WRITEPROTECT` (an already-seccomp-allowed ioctl). `branch` consumes it
-    /// (the handler drops it, unregistering) — one branch per booted VM. `None` on a VM
-    /// not booted branchable.
-    #[cfg(feature = "branch")]
-    branch_uffd: Option<userfaultfd::Uffd>,
 }
 
 /// The Machine's half of a device snapshot handle: signal `evt` to ask the device's
@@ -198,28 +189,71 @@ fn install_vcpu_stop_handler() {
     });
 }
 
-/// The result of [`Machine::branch`]: the written manifest plus how each guest page's
-/// T-version reached the branch file. `copied` is the count the background copier wrote
-/// (untouched pages); `faulted` is the count the write-protect handler serviced (pages the
-/// running parent wrote during materialization). `faulted > 0` is direct evidence the
-/// userfaultfd write-protect path actually ran — the discriminator a deterministic test
-/// asserts so a silent fallback can't pass.
-#[cfg(feature = "branch")]
+/// The result of [`Machine::branch`]: the written manifest plus how the image was
+/// materialized. `copied` is the number of pages written by the live full-RAM copy;
+/// `recopied` is the number re-copied coherently at the final barrier (every page KVM's
+/// dirty log flagged as written since logging began — by the guest's vCPUs or by KVM's own
+/// paravirt-page writes). `recopied` is direct evidence the dirty-log final pass ran.
 pub struct BranchOutcome {
     pub manifest: crate::snapshot::SnapshotManifest,
     pub copied: u64,
-    pub faulted: u64,
+    pub recopied: u64,
 }
 
-/// Guest RAM plus a pre-created, region-registered branch userfaultfd, produced by
-/// [`Machine::prepare_branchable_memory`] **before** the jailer confines the worker and
-/// consumed by [`Machine::boot_jailed_prepared`]. Opaque on purpose: the (privileged,
-/// pre-confine) caller just carries it across `confine()` into the boot — it never needs
-/// to touch the uffd or the mapping directly.
-#[cfg(feature = "branch")]
-pub struct PreparedMemory {
-    guest_memory: GuestMemoryMmap,
-    uffd: userfaultfd::Uffd,
+/// A guest RAM page written since dirty logging was enabled: its host address and the byte
+/// offset of that page within the branch `memory.bin` (regions are laid out in slot order).
+struct DirtyPage {
+    host_addr: usize,
+    file_offset: u64,
+}
+
+/// Guest RAM page size for the branch dirty-log materializer (KVM tracks dirty state and
+/// lays out `memory.bin` in 4 KiB pages).
+const BRANCH_PAGE_SIZE: usize = 4096;
+
+/// Write every guest RAM region into the branch `memory.bin`, in slot order, returning the
+/// total page count. Runs while the parent is executing (a live copy); pages mutated during
+/// the copy are caught by the dirty log and re-copied coherently at the final barrier.
+fn write_branch_image(regions: &[(usize, usize)], path: &std::path::Path) -> Result<u64> {
+    use std::os::unix::fs::FileExt;
+    let total: usize = regions.iter().map(|(_, len)| *len).sum();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(VmmError::Io)?;
+    file.set_len(total as u64).map_err(VmmError::Io)?;
+    let mut offset = 0u64;
+    for &(base, len) in regions {
+        // SAFETY: `base`/`len` is a mapped guest RAM region (from `guest_ram_regions`),
+        // owned by `guest_memory` which outlives this call; valid for `len` bytes of read.
+        let src = unsafe { std::slice::from_raw_parts(base as *const u8, len) };
+        file.write_all_at(src, offset).map_err(VmmError::Io)?;
+        offset += len as u64;
+    }
+    Ok((total / BRANCH_PAGE_SIZE) as u64)
+}
+
+/// Re-copy the given dirtied pages from live guest RAM into the branch `memory.bin` at their
+/// recorded offsets. Called at the final barrier (parent parked), so each page's bytes are
+/// stable; this makes the whole image coherent at that instant. Returns the count.
+fn recopy_branch_pages(path: &std::path::Path, dirty: &[DirtyPage]) -> Result<u64> {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(VmmError::Io)?;
+    for page in dirty {
+        // SAFETY: `host_addr` is a 4 KiB-aligned page base within a mapped guest RAM region
+        // (from `collect_dirty_pages`), valid for `BRANCH_PAGE_SIZE` bytes of read.
+        let src =
+            unsafe { std::slice::from_raw_parts(page.host_addr as *const u8, BRANCH_PAGE_SIZE) };
+        file.write_all_at(src, page.file_offset)
+            .map_err(VmmError::Io)?;
+    }
+    Ok(dirty.len() as u64)
 }
 
 impl Machine {
@@ -299,8 +333,6 @@ impl Machine {
             checkpoint: Arc::new(Checkpoint::default()),
             device_captures: Vec::new(),
             vcpu_tids: Arc::new(Mutex::new(Vec::new())),
-            #[cfg(feature = "branch")]
-            branch_uffd: None,
         })
     }
 
@@ -371,65 +403,6 @@ impl Machine {
         machine.vcpu_hook = vcpu_hook;
         machine.start()?;
         Ok(machine)
-    }
-
-    /// Allocate guest RAM and create+register the running-BRANCH userfaultfd over it
-    /// (SPEC-1 FR-16), returning a [`PreparedMemory`] to be booted by
-    /// [`boot_jailed_prepared`](Self::boot_jailed_prepared). **Must be called before the
-    /// jailer confines the worker** (while still root, with `/dev/userfaultfd` reachable):
-    /// the uffd is created here so the later, confined `branch` only has to arm
-    /// write-protection (an already-seccomp-allowed ioctl). The uffd registers the host
-    /// addresses of the returned mapping; those addresses are stable across the move into
-    /// the booted `Machine`.
-    #[cfg(feature = "branch")]
-    pub fn prepare_branchable_memory(memory_mib: u64) -> Result<PreparedMemory> {
-        use vm_memory::{GuestMemory, GuestMemoryRegion};
-        let guest_memory = Self::allocate_guest_memory(memory_mib)?;
-        let regions: Vec<(usize, usize)> = guest_memory
-            .iter()
-            .map(|r| (r.as_ptr() as usize, r.len() as usize))
-            .collect();
-        let uffd = crate::snapshot::branch::create_registered_uffd(&regions)?;
-        Ok(PreparedMemory { guest_memory, uffd })
-    }
-
-    /// Like [`boot_jailed`](Self::boot_jailed) but boots from a [`PreparedMemory`] (its
-    /// pre-allocated RAM + pre-registered branch uffd), stashing the uffd so a later
-    /// `branch` uses it instead of trying to create one under the worker's seccomp/chroot.
-    /// The branchable boot path (SPEC-1 FR-16).
-    ///
-    /// # Safety
-    /// Same as [`boot_jailed`](Self::boot_jailed): `kvm_fd`, `tap_fds`, and
-    /// `vsock_listener_fd` must be valid open fds whose ownership transfers to this call.
-    #[cfg(feature = "branch")]
-    pub fn boot_jailed_prepared(
-        config: &VmConfig,
-        kvm_fd: RawFd,
-        tap_fds: Vec<RawFd>,
-        vsock_listener_fd: Option<RawFd>,
-        vcpu_hook: Option<VcpuHook>,
-        prepared: PreparedMemory,
-    ) -> Result<Self> {
-        // SAFETY: the caller guarantees `kvm_fd` is an open /dev/kvm fd we now own.
-        let kvm = unsafe { Kvm::from_raw_fd(kvm_fd) };
-        let mut machine = Self::with_resources_memory(config, kvm, tap_fds, prepared.guest_memory)?;
-        machine.branch_uffd = Some(prepared.uffd);
-        if let Some(fd) = vsock_listener_fd {
-            // SAFETY: the caller transfers ownership of an open, bound, listening UDS fd.
-            machine.vsock_listener = Some(unsafe { UnixListener::from_raw_fd(fd) });
-        }
-        machine.vcpu_hook = vcpu_hook;
-        machine.start()?;
-        Ok(machine)
-    }
-
-    /// Whether this VM was booted branchable — i.e. it holds a pre-created branch uffd
-    /// (via [`boot_jailed_prepared`](Self::boot_jailed_prepared)) and so a `branch` will
-    /// use the write-protect engine. The jailed worker checks this to fall back to an
-    /// in-place snapshot when the VM is not branchable (it can't create a uffd post-confine).
-    #[cfg(feature = "branch")]
-    pub fn is_branchable(&self) -> bool {
-        self.branch_uffd.is_some()
     }
 
     /// Wire up devices, load the kernel, and launch the vCPU threads.
@@ -1008,33 +981,73 @@ impl Machine {
 
     /// **Branch** a running microVM into `out_dir` (SPEC-1 FR-16): produce a coherent
     /// point-in-time snapshot directory (`manifest.json` + `state.bin` + `memory.bin`)
-    /// **without freezing the parent for a RAM dump**. The parent is paused only briefly
-    /// — to capture vCPU/device/clock/irqchip state and arm write-protection — then
-    /// resumes and keeps running while the branch's RAM image is materialized
-    /// concurrently (a parent write to a not-yet-preserved page faults out and its
-    /// pre-write T-version is copied aside first). The resulting directory is layout-
-    /// identical to a frozen [`snapshot`](crate::snapshot::snapshot), so children fork
-    /// from it with the proven `MAP_PRIVATE` path
-    /// ([`fork_children`](crate::snapshot::fork_children)).
+    /// **without freezing the parent for a full RAM dump**. The parent is paused only
+    /// briefly twice (at two barriers); in between it keeps running while its RAM is copied.
     ///
-    /// Returns the written [`SnapshotManifest`] plus how the T-image was materialized
-    /// (see [`BranchOutcome`]) — `faulted > 0` proves the write-protect path actually
-    /// serviced the running parent's writes. Requires the `branch` feature.
-    #[cfg(feature = "branch")]
+    /// Uses **KVM dirty-page logging** (the standard live-migration technique) so the image
+    /// is coherent at the *final* barrier (call it T2):
+    ///
+    /// 1. Park at an initial barrier; enable `KVM_MEM_LOG_DIRTY_PAGES` over guest RAM (from
+    ///    a clean baseline); resume.
+    /// 2. Copy all of guest RAM into `memory.bin` while the parent runs. Pages the parent —
+    ///    *or KVM itself* (pvclock/steal-time/PV-EOI host-side writes, which no userspace
+    ///    write-protect can intercept) — touches during the copy are recorded in the dirty
+    ///    log.
+    /// 3. Park at the final barrier (T2); capture vCPU/device/clock/irqchip state **at T2**,
+    ///    re-copy every page KVM marked dirty (now stable, parked) so the whole image is
+    ///    coherent at T2, disable dirty logging, and resume.
+    ///
+    /// Capturing the CPU/device state at the *same* instant the dirtied pages are re-copied
+    /// is what makes the image consistent — re-copying at T2 with CPU state from an earlier
+    /// instant would tear timekeeping/PV state and the clone faults in the kernel timer
+    /// path. The resulting directory is layout-identical to a frozen
+    /// [`snapshot`](crate::snapshot::snapshot), so children fork from it with the proven
+    /// `MAP_PRIVATE` path ([`fork_children`](crate::snapshot::fork_children)).
+    ///
+    /// Returns the written [`SnapshotManifest`] plus how the image was materialized (see
+    /// [`BranchOutcome`]).
     pub fn branch(&mut self, out_dir: &std::path::Path) -> Result<BranchOutcome> {
-        use crate::snapshot::branch::BranchEngine;
-
         std::fs::create_dir_all(out_dir).map_err(VmmError::Io)?;
+        let mem_file = out_dir.join("memory.bin");
+        let regions = self.guest_ram_regions();
 
-        // 1. Pause at the checkpoint barrier (vCPUs + device workers) and capture the
-        //    full coherent state — no RAM dump while paused.
+        // 1. Park, enable dirty logging from a clean baseline, resume. Any write from here
+        //    on (guest vCPU *or* KVM host-side) is recorded for the re-copy at step 3.
         self.quiesce_at_barrier(true)?;
-        let captured = (|| -> Result<(VmState, Vec<(usize, usize)>)> {
+        let armed = (|| -> Result<()> {
+            self.set_dirty_logging(true)?;
+            self.collect_dirty_pages()?; // drain+discard so logging starts clean
+            Ok(())
+        })();
+        if let Err(e) = armed {
+            let _ = self.set_dirty_logging(false);
+            let _ = self.release_barrier();
+            return Err(e);
+        }
+        self.release_barrier()?;
+
+        // 2. Copy all of guest RAM while the parent runs (vCPUs execute on their own
+        //    threads). Pages written during this copy are caught by the dirty log.
+        let copied = match write_branch_image(&regions, &mem_file) {
+            Ok(c) => c,
+            Err(e) => {
+                self.quiesce_at_barrier(true)?;
+                let _ = self.set_dirty_logging(false);
+                let _ = self.release_barrier();
+                return Err(e);
+            }
+        };
+
+        // 3. Final barrier (T2): capture coherent state and re-copy the dirtied pages so the
+        //    whole image matches T2, then stop logging.
+        self.quiesce_at_barrier(true)?;
+        let finished = (|| -> Result<(VmState, u64)> {
             let vcpus = self.collect_vcpu_states()?;
             let devices = self.collect_device_states()?;
             let clock = self.capture_clock()?;
             let irqchip = self.capture_irqchip()?;
-            let regions = self.guest_ram_regions();
+            let dirty = self.collect_dirty_pages()?;
+            let recopied = recopy_branch_pages(&mem_file, &dirty)?;
             Ok((
                 VmState {
                     vcpus,
@@ -1042,65 +1055,24 @@ impl Machine {
                     clock,
                     irqchip,
                 },
-                regions,
+                recopied,
             ))
         })();
-        let (vm_state, regions) = match captured {
+        let _ = self.set_dirty_logging(false);
+        let released = self.release_barrier();
+        let (vm_state, recopied) = match finished {
             Ok(v) => v,
             Err(e) => {
-                let _ = self.release_barrier();
+                let _ = released;
                 return Err(e);
             }
         };
-
-        // 2. Source the uffd: a branchable jailed VM created+registered it as root at
-        //    boot (the only way under the worker's seccomp/chroot — see
-        //    `prepare_branchable_memory`); otherwise (in-process/root path) create it now.
-        //    Then arm write-protection and start the fault handler BEFORE resuming, so the
-        //    parent's first post-resume write is serviced.
-        let mem_file = out_dir.join("memory.bin");
-        let uffd = match self.branch_uffd.take() {
-            Some(u) => u,
-            None => match crate::snapshot::branch::create_registered_uffd(&regions) {
-                Ok(u) => u,
-                Err(e) => {
-                    let _ = self.release_barrier();
-                    return Err(e);
-                }
-            },
-        };
-        let mut engine = match BranchEngine::arm(uffd, &regions, &mem_file) {
-            Ok(e) => e,
-            Err(e) => {
-                let _ = self.release_barrier();
-                return Err(e);
-            }
-        };
-        let handler = match engine.spawn_handler() {
-            Ok(h) => h,
-            Err(e) => {
-                let _ = self.release_barrier();
-                return Err(e);
-            }
-        };
-
-        // 3. Resume the parent. Its writes to write-protected pages now fault out and the
-        //    handler preserves the T-version before the write applies.
-        self.release_barrier()?;
-
-        // 4. Materialize the full T-snapshot concurrently with the running parent, then
-        //    tear down the uffd (removing any residual write-protection).
-        let copier = engine.run_copier()?;
-        engine.await_complete()?;
-        let faulted = handler
-            .join()
-            .map_err(|_| VmmError::Device("branch: fault handler thread panicked".into()))??;
-        drop(engine);
+        released?;
         eprintln!(
-            "branch: T-snapshot complete — {copier} pages copied by the copier, {faulted} preserved by write-fault"
+            "branch: dirty-log snapshot — {copied} pages copied live, {recopied} re-copied coherently at the final barrier"
         );
 
-        // 5. Write the snapshot metadata; memory.bin is already the coherent T-image.
+        // 4. Write the snapshot metadata; memory.bin is now the coherent T2 image.
         let host = HostFingerprint {
             cpuid_hash: self.cpuid_hash()?,
             tsc_khz: vm_state.vcpus.first().map_or(0, |v| v.tsc_khz),
@@ -1118,20 +1090,82 @@ impl Machine {
         crate::snapshot::engine::write_snapshot_metadata(out_dir, &vm_state, &manifest)?;
         Ok(BranchOutcome {
             manifest,
-            copied: copier,
-            faulted,
+            copied,
+            recopied,
         })
     }
 
     /// The parent's guest RAM regions as `(host_base_addr, len_bytes)` in ascending
-    /// guest-address order — the input the branch write-protect engine arms over.
-    #[cfg(feature = "branch")]
+    /// guest-address order (the same order as the KVM memslots and the `memory.bin` layout).
     fn guest_ram_regions(&self) -> Vec<(usize, usize)> {
         use vm_memory::{GuestMemory, GuestMemoryRegion};
         self.guest_memory
             .iter()
             .map(|r| (r.as_ptr() as usize, r.len() as usize))
             .collect()
+    }
+
+    /// Enable (or disable) `KVM_MEM_LOG_DIRTY_PAGES` on every guest RAM memslot by
+    /// re-setting it with the same mapping but new flags. Enabling makes KVM track every
+    /// write to guest RAM — by the guest's vCPUs *and* by KVM's own paravirt writes — in a
+    /// per-slot dirty bitmap; disabling frees the bitmap.
+    fn set_dirty_logging(&self, enable: bool) -> Result<()> {
+        use vm_memory::{GuestMemory, GuestMemoryRegion};
+        let flags = if enable { KVM_MEM_LOG_DIRTY_PAGES } else { 0 };
+        for (slot, region) in self.guest_memory.iter().enumerate() {
+            let memory_region = kvm_userspace_memory_region {
+                slot: slot as u32,
+                guest_phys_addr: region.start_addr().raw_value(),
+                memory_size: region.len(),
+                userspace_addr: region.as_ptr() as u64,
+                flags,
+            };
+            // SAFETY: same mapping the slot was created with (register_memory); only the
+            // flags change. `guest_memory` outlives the VM, so the mapping stays valid.
+            unsafe {
+                self.vm.set_user_memory_region(memory_region)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Read and clear the dirty bitmap of every guest RAM memslot, returning the host
+    /// address + `memory.bin` file offset of each page written since logging was enabled
+    /// (or since the last call). `memory.bin` lays regions out in slot order, so the file
+    /// offset is the running byte count of preceding regions plus the page's offset.
+    fn collect_dirty_pages(&self) -> Result<Vec<DirtyPage>> {
+        use vm_memory::{GuestMemory, GuestMemoryRegion};
+        let mut pages = Vec::new();
+        let mut file_base = 0u64;
+        for (slot, region) in self.guest_memory.iter().enumerate() {
+            let len = region.len();
+            let bitmap = self
+                .vm
+                .get_dirty_log(slot as u32, len as usize)
+                .map_err(VmmError::Kvm)?;
+            let host_base = region.as_ptr() as usize;
+            for (word_idx, word) in bitmap.iter().enumerate() {
+                if *word == 0 {
+                    continue;
+                }
+                for bit in 0..64 {
+                    if word & (1u64 << bit) == 0 {
+                        continue;
+                    }
+                    let page = word_idx * 64 + bit;
+                    let page_off = (page * BRANCH_PAGE_SIZE) as u64;
+                    if page_off >= len {
+                        continue; // bitmap is rounded up to a word; ignore padding bits
+                    }
+                    pages.push(DirtyPage {
+                        host_addr: host_base + page * BRANCH_PAGE_SIZE,
+                        file_offset: file_base + page_off,
+                    });
+                }
+            }
+            file_base += len;
+        }
+        Ok(pages)
     }
 
     /// Create a snapshot pause handle, give one end to `device`, and record the other

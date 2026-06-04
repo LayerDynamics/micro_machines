@@ -71,10 +71,9 @@ pub fn run(args: BranchArgs) -> Result<()> {
         (internal_ip, clone_index, clone_ip)
     };
 
-    // 1. Branch the *live* source. The worker uses the near-zero-pause write-protect
-    //    engine if the source was booted `--branchable` (its uffd was created pre-confine),
-    //    else falls back to a resume-in-place snapshot (brief pause). Either way the source
-    //    keeps running and we get the new image's id.
+    // 1. Branch the *live* source. The worker materializes a coherent point-in-time image
+    //    via KVM dirty-page logging (the source is paused only briefly at two barriers and
+    //    keeps running throughout), and we get the new image's id.
     let id = crate::commands::snapshot::request_snapshot(&args.name, ControlRequest::Branch)
         .with_context(|| format!("branching {}", args.name))?;
 

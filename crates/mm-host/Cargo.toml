@@ -20,7 +20,4 @@ uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
-# Enable the running-BRANCH engine (FR-16) for the jailed worker's control channel.
-# Linux-only (Cargo unions features across target tables) so the cross-platform `mm`
-# build on macOS never pulls userfaultfd-sys, which needs Linux kernel headers.
-mm-vmm = { path = "../mm-vmm", features = ["branch"] }
+mm-vmm = { path = "../mm-vmm" }

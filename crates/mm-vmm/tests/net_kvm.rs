@@ -106,7 +106,6 @@ fn net_config() -> VmConfig {
             mac: GUEST_MAC.into(),
             rate_limit: None,
         }],
-        branchable: false,
     }
 }
 

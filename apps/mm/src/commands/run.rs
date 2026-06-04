@@ -34,12 +34,6 @@ pub struct RunArgs {
     /// capturing the guest console to a per-VM log, instead of staying foreground.
     #[arg(long, short = 'd')]
     pub detach: bool,
-    /// Boot "branchable" (SPEC-1 FR-16): prepare the running-BRANCH userfaultfd at boot so
-    /// a later `mm branch` of this machine uses the near-zero-pause write-protect engine
-    /// instead of an in-place snapshot. The default (non-branchable) `mm branch` falls back
-    /// to the resume-in-place snapshot. Off by default.
-    #[arg(long)]
-    pub branchable: bool,
 }
 
 /// Path to the guest kernel (`MM_KERNEL`, else `<root>/vmlinux`).
@@ -93,7 +87,6 @@ pub fn run(args: RunArgs) -> Result<()> {
         mm_init_path: mm_init_path(),
         sshd_path: mm_sshd_path(),
         reserved_ips,
-        branchable: args.branchable,
     };
     let mut outcome = mm_host::launch(&spec).context("launching microVM")?;
 

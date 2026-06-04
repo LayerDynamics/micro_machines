@@ -65,9 +65,6 @@ pub fn build_vm_config(
             mac,
             rate_limit: None,
         }],
-        // Off by default; the cold-boot caller (`launch`) flips it on for `mm run
-        // --branchable`. Restore/cluster configs leave it false.
-        branchable: false,
     }
 }
 
