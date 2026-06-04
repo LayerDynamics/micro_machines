@@ -223,6 +223,15 @@ fn advise_page(mem: &GuestMemoryMmap, guest_addr: u64, reclaim: bool) {
         let host = region.as_ptr().add(offset);
         libc::madvise(host as *mut libc::c_void, PAGE_SIZE, advice);
     }
+    if reclaim {
+        // MADV_DONTNEED zeroes the page through the host mapping — a raw `madvise`, not a
+        // `Bytes` write, so it bypasses BOTH the KVM dirty log and the per-page dirty
+        // bitmap. Mark it dirty explicitly so a concurrent `Machine::branch` re-copies the
+        // now-zeroed page at its final barrier instead of capturing the stale pre-reclaim
+        // contents. (`(**region)` reaches the `MmapRegion`'s inherent `AtomicBitmap` past
+        // `GuestRegionMmap`'s Deref; the trait `bitmap()` returns only a slice.)
+        (**region).bitmap().set_addr_range(offset, PAGE_SIZE);
+    }
 }
 
 #[cfg(test)]

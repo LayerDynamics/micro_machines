@@ -1108,8 +1108,10 @@ impl Machine {
     /// Enable (or disable) `KVM_MEM_LOG_DIRTY_PAGES` on every guest RAM memslot by
     /// re-setting it with the same mapping but new flags. Enabling makes KVM track every
     /// write to guest RAM — by the guest's vCPUs *and* by KVM's own paravirt writes — in a
-    /// per-slot dirty bitmap; disabling frees the bitmap.
-    fn set_dirty_logging(&self, enable: bool) -> Result<()> {
+    /// per-slot dirty bitmap; disabling frees the bitmap. Public so the dirty-tracking
+    /// union can be exercised directly (see the `branch_dirty_log_unions_*` KVM test); the
+    /// branch engine uses it internally.
+    pub fn set_dirty_logging(&self, enable: bool) -> Result<()> {
         use vm_memory::{GuestMemory, GuestMemoryRegion};
         let flags = if enable { KVM_MEM_LOG_DIRTY_PAGES } else { 0 };
         for (slot, region) in self.guest_memory.iter().enumerate() {
@@ -1186,6 +1188,20 @@ impl Machine {
             file_base += len;
         }
         Ok(pages)
+    }
+
+    /// Read and clear the dirty page set, returning each dirty page's offset into the
+    /// `memory.bin` layout (region order). Public test/diagnostic seam over
+    /// [`collect_dirty_pages`](Self::collect_dirty_pages) — it surfaces the UNION of the KVM
+    /// dirty log and the per-region `AtomicBitmap`, so a host-side `Bytes` write to guest
+    /// RAM (the path virtio device workers' DMA takes, invisible to the KVM log) shows up
+    /// here. Pair with [`set_dirty_logging`](Self::set_dirty_logging).
+    pub fn dirty_page_file_offsets(&self) -> Result<Vec<u64>> {
+        Ok(self
+            .collect_dirty_pages()?
+            .into_iter()
+            .map(|p| p.file_offset)
+            .collect())
     }
 
     /// Create a snapshot pause handle, give one end to `device`, and record the other

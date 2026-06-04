@@ -839,6 +839,60 @@ fn fork_snapshot_survives_sustained_interrupt_activity() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Regression for the branch dirty-tracking UNION (the device-DMA fidelity fix): a write
+/// to guest RAM through the host `Bytes` API — exactly how the virtio device workers DMA
+/// into guest RAM (e.g. a virtio-blk read completion) — must show up in the branch engine's
+/// dirty page set, even though KVM's own dirty log cannot see it (host-userspace mmap writes
+/// don't go through the KVM MMU). Drives the union directly: enable dirty logging, drain the
+/// baseline, do ONE host `write_obj`, and assert that page is reported dirty. If the
+/// per-region `AtomicBitmap` were dropped from `collect_dirty_pages`, this write would be
+/// invisible and the assertion would fail — i.e. a device DMA during a branch's copy window
+/// could leave a stale page in the clone.
+#[test]
+#[ignore = "requires /dev/kvm and fixtures; branch device-DMA dirty-tracking union"]
+fn branch_dirty_log_unions_host_bytes_writes() {
+    let cfg = fixture_config();
+    cfg.validate().unwrap();
+    let mut guest = Machine::boot(&cfg).expect("guest boots");
+    assert!(
+        guest
+            .wait_for_ready(Duration::from_secs(10))
+            .expect("readiness poll"),
+        "guest reached userspace"
+    );
+
+    guest.set_dirty_logging(true).expect("enable dirty logging");
+    // Drain the baseline so only writes after this point count.
+    guest.dirty_page_file_offsets().expect("baseline drain");
+
+    // A host-side `Bytes` write to guest RAM (the device-worker DMA path). `SCRATCH_GPA` is
+    // above what the idle sandbox guest touches, so KVM's own log will not mark it — only
+    // vm-memory's `AtomicBitmap` will, and only if `collect_dirty_pages` unions it in.
+    guest
+        .guest_memory()
+        .write_obj(0xF00D_F00D_u64, GuestAddress(SCRATCH_GPA))
+        .expect("host write into guest RAM");
+
+    let dirty = guest
+        .dirty_page_file_offsets()
+        .expect("collect dirty pages");
+    guest
+        .set_dirty_logging(false)
+        .expect("disable dirty logging");
+
+    // The 128 MiB fixture is a single region at GPA 0, so the file offset equals the GPA.
+    let page_off = SCRATCH_GPA & !(4096u64 - 1);
+    assert!(
+        dirty.contains(&page_off),
+        "the dirty-tracking union must report the host Bytes write at {page_off:#x} that the \
+         KVM dirty log cannot see (device-DMA fidelity); got {} dirty page(s): {:?}",
+        dirty.len(),
+        dirty,
+    );
+
+    guest.shutdown().expect("stop guest");
+}
+
 /// BASELINE control for the two sustained-exec hammers above. A freshly-booted guest —
 /// no snapshot, no fork, no resume of any kind — runs the *identical* 8×15 `/sbin/marker`
 /// hammer directly over its own vsock bridge. This is the one variable neither hammer
