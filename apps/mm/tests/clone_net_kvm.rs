@@ -39,6 +39,53 @@ fn scan_ip(stdout: &str, name: &str) -> Option<String> {
         .map(|ip| ip.trim().to_string())
 }
 
+/// On a networking failure, dump the full host + clone-netns state so the failure pinpoints
+/// host-side (netns/veth/NAT/route) vs guest-side (the clone's NIC never came up): an
+/// in-netns `ping clone_ip` that succeeds while the host ping fails isolates it to the host
+/// route/NAT; an in-netns ping that also fails points at the guest NIC.
+fn dump_net_diag(state: &Path, clone: &str, clone_ip: &str) {
+    let console = state.join(format!("jails/{clone}/console.log"));
+    if let Ok(log) = std::fs::read_to_string(&console) {
+        eprintln!("--- {clone} console ---\n{log}\n--- end ---");
+    }
+    let netns = format!("mm-clone-{clone}");
+    let diag = |label: &str, prog: &str, args: &[&str]| match Command::new(prog).args(args).output()
+    {
+        Ok(o) => eprintln!(
+            "--- {label} ---\n{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        ),
+        Err(e) => eprintln!("--- {label} --- (failed to run: {e})"),
+    };
+    diag("ip netns list", "ip", &["netns", "list"]);
+    diag("host: ip addr", "ip", &["-br", "addr"]);
+    diag("host: route to clone_ip", "ip", &["route", "get", clone_ip]);
+    diag("host: nat table", "iptables", &["-t", "nat", "-S"]);
+    diag(
+        "netns: ip addr",
+        "ip",
+        &["netns", "exec", &netns, "ip", "-br", "addr"],
+    );
+    diag(
+        "netns: ip route",
+        "ip",
+        &["netns", "exec", &netns, "ip", "route"],
+    );
+    diag(
+        "netns: nat table",
+        "ip",
+        &["netns", "exec", &netns, "iptables", "-t", "nat", "-S"],
+    );
+    diag(
+        "netns: ping clone_ip",
+        "ip",
+        &[
+            "netns", "exec", &netns, "ping", "-c", "1", "-W", "2", clone_ip,
+        ],
+    );
+}
+
 #[test]
 #[ignore = "requires /dev/kvm, root, skopeo/umoci, network, fixtures, ip_forward"]
 fn mm_branch_clone_is_reachable_at_a_unique_ip_without_colliding_with_the_source() {
@@ -57,7 +104,6 @@ fn mm_branch_clone_is_reachable_at_a_unique_ip_without_colliding_with_the_source
     std::fs::create_dir_all(&state).expect("create state root");
     let mm_bin = env!("CARGO_BIN_EXE_mm");
     let src = "cn-src";
-    let clone = "cn-clone";
 
     let mm = |args: &[&str]| {
         let mut c = Command::new(mm_bin);
@@ -125,137 +171,104 @@ fn mm_branch_clone_is_reachable_at_a_unique_ip_without_colliding_with_the_source
         .expect("mm run printed the source IP");
     assert!(wait_exec(src, 90), "source never became exec-ready");
 
-    // 2. Branch a live clone; capture its (distinct, host-routable) clone_ip.
-    let branch = mm(&["branch", src, clone]).output().expect("mm branch");
-    assert!(
-        branch.status.success(),
-        "`mm branch` failed: {}\n{}",
-        String::from_utf8_lossy(&branch.stdout),
-        String::from_utf8_lossy(&branch.stderr),
-    );
-    let clone_ip = scan_ip(&String::from_utf8_lossy(&branch.stdout), clone)
-        .expect("mm branch printed the clone IP");
-    assert_ne!(
-        clone_ip, src_ip,
-        "the clone must get a unique IP, not the source's"
-    );
+    // 2. Loop the full live-branch cycle several times. The WP-branch clone networking was
+    //    INTERMITTENTLY failing (the clone came up exec-able over vsock but unreachable at
+    //    its NAT'd clone_ip) — a single branch is far too weak a gate for an intermittent
+    //    bug, so branch → exec → ping → sustained-exec → teardown repeatedly and require
+    //    EVERY round to pass. Each round tears the clone down (freeing veth slot 0 + its
+    //    netns) so the next round starts clean and residue leaks surface immediately.
+    const ROUNDS: usize = 6;
+    for round in 0..ROUNDS {
+        let clone = format!("cn-clone-{round}");
 
-    // 3. Both are independently alive over their own vsock bridges (the source kept
-    //    running through the branch; the clone is a live copy).
-    let clone_exec = wait_exec(clone, 90);
-    let src_still = wait_exec(src, 30);
-
-    // 4. The whole point: the clone is reachable at its clone_ip from the host, AND the
-    //    source is still reachable at its own IP — no collision.
-    let clone_reachable = ping(&clone_ip);
-    let src_reachable = ping(&src_ip);
-
-    // Diagnostics before assertions so a failure self-explains.
-    if !clone_exec || !src_still || !clone_reachable || !src_reachable {
-        for who in [clone, src] {
-            let console = state.join(format!("jails/{who}/console.log"));
-            if let Ok(log) = std::fs::read_to_string(&console) {
-                eprintln!("--- {who} console ---\n{log}\n--- end ---");
-            }
-        }
-        // Dump the full host + clone-netns network state so a networking failure pinpoints
-        // host-side (netns/veth/NAT/route) vs guest-side (the clone's NIC never came up).
-        let netns = format!("mm-clone-{clone}");
-        let diag = |label: &str, prog: &str, args: &[&str]| {
-            let out = Command::new(prog).args(args).output();
-            match out {
-                Ok(o) => eprintln!(
-                    "--- {label} ---\n{}{}",
-                    String::from_utf8_lossy(&o.stdout),
-                    String::from_utf8_lossy(&o.stderr)
-                ),
-                Err(e) => eprintln!("--- {label} --- (failed to run: {e})"),
-            }
-        };
-        diag("ip netns list", "ip", &["netns", "list"]);
-        diag("host: ip addr", "ip", &["-br", "addr"]);
-        diag(
-            "host: route to clone_ip",
-            "ip",
-            &["route", "get", &clone_ip],
-        );
-        diag("host: nat table", "iptables", &["-t", "nat", "-S"]);
-        diag(
-            "netns: ip addr",
-            "ip",
-            &["netns", "exec", &netns, "ip", "-br", "addr"],
-        );
-        diag(
-            "netns: ip route",
-            "ip",
-            &["netns", "exec", &netns, "ip", "route"],
-        );
-        diag(
-            "netns: nat table",
-            "ip",
-            &["netns", "exec", &netns, "iptables", "-t", "nat", "-S"],
-        );
-        diag(
-            "netns: ping clone_ip",
-            "ip",
-            &[
-                "netns", "exec", &netns, "ping", "-c", "1", "-W", "2", &clone_ip,
-            ],
-        );
-    }
-
-    assert!(clone_exec, "clone never became exec-ready");
-    assert!(src_still, "source stopped serving exec after the branch");
-    assert!(
-        clone_reachable,
-        "clone not reachable at its clone_ip {clone_ip} (per-clone netns NAT broken)"
-    );
-    assert!(
-        src_reachable,
-        "source not reachable at {src_ip} after the clone came up (collision/regression)"
-    );
-
-    // 4b. Hammer the live WP-branch clone with sustained execs — the exact load that
-    //     surfaced the PID-1 reaper race (`exit -1`) on the jailed exec path. Each must
-    //     exit 0 AND echo its own value back: the race corrupted the EXIT CODE (the agent
-    //     sent Exit{-1} when PID 1 stole its child) even though stdout still streamed, so
-    //     asserting `status.success()` — not just the token — is what catches a regression.
-    for i in 0..15 {
-        let val = format!("HAMMER{i}");
-        let out = mm(&["exec", clone, "--", "echo", &val])
-            .output()
-            .expect("run `mm exec` on the clone");
+        // Branch a live clone; capture its (distinct, host-routable) clone_ip.
+        let branch = mm(&["branch", src, &clone]).output().expect("mm branch");
         assert!(
-            out.status.success() && String::from_utf8_lossy(&out.stdout).contains(&val),
-            "clone exec #{i} failed (reaper-race regression?): status={:?}\nstdout={}\nstderr={}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
+            branch.status.success(),
+            "round {round}: `mm branch` failed: {}\n{}",
+            String::from_utf8_lossy(&branch.stdout),
+            String::from_utf8_lossy(&branch.stderr),
+        );
+        let clone_ip = scan_ip(&String::from_utf8_lossy(&branch.stdout), &clone)
+            .unwrap_or_else(|| panic!("round {round}: mm branch printed no clone IP"));
+        assert_ne!(
+            clone_ip, src_ip,
+            "round {round}: the clone must get a unique IP, not the source's"
+        );
+
+        // The clone is alive over its own vsock bridge AND reachable at its clone_ip from
+        // the host (the per-clone netns NAT). Dump the full network state on any failure.
+        let clone_exec = wait_exec(&clone, 90);
+        let clone_reachable = clone_exec && ping(&clone_ip);
+        if !clone_exec || !clone_reachable {
+            dump_net_diag(&state, &clone, &clone_ip);
+        }
+        assert!(clone_exec, "round {round}: clone never became exec-ready");
+        assert!(
+            clone_reachable,
+            "round {round}: clone not reachable at its clone_ip {clone_ip} \
+             (per-clone netns NAT broken)"
+        );
+
+        // Sustained-exec hammer on the live WP-branch clone — the exact load that surfaced
+        // the PID-1 reaper race (`exit -1`) on the jailed exec path. Each must exit 0 AND
+        // echo its value: the race corrupted the EXIT CODE (Exit{-1} when PID 1 stole the
+        // child) even though stdout still streamed, so asserting `status.success()` — not
+        // just the token — is what catches a regression.
+        for i in 0..15 {
+            let val = format!("R{round}E{i}");
+            let out = mm(&["exec", &clone, "--", "echo", &val])
+                .output()
+                .expect("run `mm exec` on the clone");
+            assert!(
+                out.status.success() && String::from_utf8_lossy(&out.stdout).contains(&val),
+                "round {round} exec #{i} failed (reaper-race regression?): status={:?}\n\
+                 stdout={}\nstderr={}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+
+        // The source kept running through the branch.
+        assert!(
+            wait_exec(src, 30),
+            "round {round}: source stopped serving exec after the branch"
+        );
+
+        // Teardown leaves no residue: removing the clone deletes its netns + host veth.
+        let _ = mm(&["stop", &clone]).output();
+        let rm = mm(&["rm", "--force", &clone])
+            .output()
+            .expect("mm rm clone");
+        assert!(
+            rm.status.success(),
+            "round {round}: `mm rm` failed: {}",
+            String::from_utf8_lossy(&rm.stderr)
+        );
+        let netns_list = Command::new("ip")
+            .args(["netns", "list"])
+            .output()
+            .expect("ip netns list");
+        let listed = String::from_utf8_lossy(&netns_list.stdout);
+        assert!(
+            !listed.contains(&format!("mm-clone-{clone}")),
+            "round {round}: clone netns must be gone after `mm rm`; still listed:\n{listed}"
+        );
+        // Each round's clone takes the smallest free veth slot — 0 once the prior round was
+        // torn down → host end `mmvh0`; it must be gone after `mm rm`.
+        let veth = Command::new("ip").args(["link", "show", "mmvh0"]).output();
+        assert!(
+            veth.map(|o| !o.status.success()).unwrap_or(true),
+            "round {round}: host veth mmvh0 must be gone after `mm rm`"
         );
     }
 
-    // 5. Teardown leaves no residue: removing the clone deletes its netns + host veth.
-    let _ = mm(&["stop", clone]).output();
-    let rm = mm(&["rm", "--force", clone]).output().expect("mm rm clone");
+    // 3. After all the branch/teardown churn, the source is still reachable at its own IP
+    //    (no collision or leaked NAT left it stranded).
     assert!(
-        rm.status.success(),
-        "`mm rm` failed: {}",
-        String::from_utf8_lossy(&rm.stderr)
-    );
-    let netns_list = Command::new("ip")
-        .args(["netns", "list"])
-        .output()
-        .expect("ip netns list");
-    let listed = String::from_utf8_lossy(&netns_list.stdout);
-    assert!(
-        !listed.contains(&format!("mm-clone-{clone}")),
-        "clone netns must be gone after `mm rm`; still listed:\n{listed}"
-    );
-    // The first clone gets veth slot 0 → host end `mmvh0`.
-    let veth = Command::new("ip").args(["link", "show", "mmvh0"]).output();
-    assert!(
-        veth.map(|o| !o.status.success()).unwrap_or(true),
-        "host veth mmvh0 must be gone after `mm rm`"
+        ping(&src_ip),
+        "source not reachable at {src_ip} after {ROUNDS} branch cycles (collision/regression)"
     );
 
     // Cleanup the source.
